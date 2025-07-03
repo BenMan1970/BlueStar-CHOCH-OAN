@@ -4,13 +4,10 @@ from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 import time as time_module
 
-# --- CONFIGURATION DES PARAMETRES DU SCANNER ---
+# --- CONFIGURATION ---
 INSTRUMENTS_TO_SCAN = [
-    "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD",
-    "XAU_USD",    # Or
-    "US30_USD",   # Dow Jones
-    "NAS100_USD", # Nasdaq 100
-    "SPX500_USD"  # S&P 500
+    "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "NZD_USD",
+    "XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD"
 ]
 TIME_FRAMES = {
     "H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"
@@ -35,29 +32,71 @@ def get_oanda_data(api_client, instrument, granularity, count=250):
     except Exception:
         return None
 
+# --- FONCTION DE DÉTECTION ENTIÈREMENT RÉÉCRITE ---
 def detect_choch(df, length=5):
+    """
+    Traduction haute-fidélité de la logique Pine Script de LuxAlgo.
+    Gère l'état des fractales de manière persistante pour une précision maximale.
+    """
     if df is None or len(df) < length: return None, None
+    
     p = length // 2
+    
+    # Détection de fractale (équivalent à la logique Pine Script)
     df['is_bull_fractal'] = (df['high'] == df['high'].rolling(window=length, center=True, min_periods=length).max())
     df['is_bear_fractal'] = (df['low'] == df['low'].rolling(window=length, center=True, min_periods=length).min())
-    os, upper_fractal_value, lower_fractal_value = 0, None, None
-    choch_signal, choch_time, choch_bar_index = None, None, -1
-    for i in range(p, len(df)):
-        if df['is_bull_fractal'].iloc[i-p]: upper_fractal_value = df['high'].iloc[i-p]
-        if df['is_bear_fractal'].iloc[i-p]: lower_fractal_value = df['low'].iloc[i-p]
-        current_close, previous_close = df['close'].iloc[i], df['close'].iloc[i-1]
-        if upper_fractal_value is not None and current_close > upper_fractal_value and previous_close <= upper_fractal_value:
-            if os == -1: choch_signal, choch_time, choch_bar_index = "Bullish CHoCH", df['time'].iloc[i], i
-            os, upper_fractal_value = 1, None
-        if lower_fractal_value is not None and current_close < lower_fractal_value and previous_close >= lower_fractal_value:
-            if os == 1: choch_signal, choch_time, choch_bar_index = "Bearish CHoCH", df['time'].iloc[i], i
-            os, lower_fractal_value = -1, None
+    
+    # Simulation des variables "var" de Pine Script
+    # Ces dictionnaires conserveront leur état à travers les itérations de la boucle
+    upper_fractal = {'value': None, 'iscrossed': True}
+    lower_fractal = {'value': None, 'iscrossed': True}
+    os = 0  # Orderflow Switch: 0=neutre, 1=haussier, -1=baissier
+    
+    choch_signal = None
+    choch_time = None
+    choch_bar_index = -1
+
+    for i in range(length, len(df)):
+        # --- Détection de nouvelles fractales ---
+        # Si une fractale est détectée à l'indice i-p, on met à jour la variable
+        if df['is_bull_fractal'].iloc[i - p]:
+            upper_fractal = {'value': df['high'].iloc[i - p], 'iscrossed': False}
+        
+        if df['is_bear_fractal'].iloc[i - p]:
+            lower_fractal = {'value': df['low'].iloc[i - p], 'iscrossed': False}
+            
+        current_close = df['close'].iloc[i]
+        previous_close = df['close'].iloc[i - 1]
+
+        # --- Structure de Marché Haussière ---
+        if upper_fractal['value'] is not None and not upper_fractal['iscrossed']:
+            if current_close > upper_fractal['value'] and previous_close <= upper_fractal['value']:
+                if os == -1: # Un CHoCH haussier ne peut se produire qu'après une tendance baissière
+                    choch_signal = "Bullish CHoCH"
+                    choch_time = df['time'].iloc[i]
+                    choch_bar_index = i
+                
+                os = 1 # Met à jour l'état du marché à haussier
+                upper_fractal['iscrossed'] = True # "Consomme" la fractale
+
+        # --- Structure de Marché Baissière ---
+        if lower_fractal['value'] is not None and not lower_fractal['iscrossed']:
+            if current_close < lower_fractal['value'] and previous_close >= lower_fractal['value']:
+                if os == 1: # Un CHoCH baissier ne peut se produire qu'après une tendance haussière
+                    choch_signal = "Bearish CHoCH"
+                    choch_time = df['time'].iloc[i]
+                    choch_bar_index = i
+
+                os = -1 # Met à jour l'état du marché à baissier
+                lower_fractal['iscrossed'] = True # "Consomme" la fractale
+
+    # On retourne le signal seulement s'il est apparu récemment
     if choch_signal and (len(df) - 1 - choch_bar_index) < RECENT_BARS_THRESHOLD:
         return choch_signal, choch_time
+        
     return None, None
 
 def main():
-    """Fonction principale de l'application Streamlit."""
     st.set_page_config(page_title="Scanner de CHoCH", layout="wide")
 
     st.markdown("""
@@ -115,7 +154,7 @@ def main():
             
             if results:
                 column_order = ["Instrument", "Timeframe", "Ordre", "Signal", "Heure (UTC)"]
-                results_df = pd.DataFrame(results)[column_order]
+                results_df = pd.DataFrame(results).sort_values(by=["Timeframe", "Instrument"])
 
                 def color_signal(val): return f'color: {"#089981" if "Bullish" in val else "#f23645"}; font-weight: bold;'
                 def style_order(val): return f'background-color: {"#089981" if val == "Achat" else "#f23645"}; color: white; border-radius: 5px; text-align: center; font-weight: bold;'
@@ -123,7 +162,6 @@ def main():
                 styled_df = results_df.style.applymap(color_signal, subset=['Signal'])\
                                             .applymap(style_order, subset=['Ordre'])
 
-                # AFFICHE LE TABLEAU STYLISÉ SANS LE BOUTON D'EXPORT
                 table_html = styled_df.to_html(index=False)
                 results_placeholder.markdown(table_html, unsafe_allow_html=True)
             else:
