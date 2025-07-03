@@ -1,8 +1,13 @@
-import streamlit as st
+import streamlit as st 
 import pandas as pd
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 import time as time_module
+from datetime import datetime
+import io
+from fpdf import FPDF
+from PIL import Image
+import dataframe_image as dfi
 
 # --- CONFIGURATION ---
 INSTRUMENTS_TO_SCAN = [
@@ -21,9 +26,9 @@ TIME_FRAMES = {
     "H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"
 }
 FRACTAL_LENGTH = 5
-RECENT_BARS_THRESHOLD = 10 
+RECENT_BARS_THRESHOLD = 10
 
-# --- Fonctions (logique de détection inchangée) ---
+# --- Fonctions ---
 def get_oanda_data(api_client, instrument, granularity, count=250):
     params = {"count": count, "granularity": granularity}
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
@@ -76,15 +81,15 @@ def main():
             <h1 style="margin: 0;">Scanner de Change of Character (CHoCH)</h1>
         </div>
     """, unsafe_allow_html=True)
-    
+
     try:
         OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
     except KeyError:
         st.error("Erreur : Veuillez configurer OANDA_ACCESS_TOKEN dans les secrets de Streamlit.")
         st.stop()
-    
+
     results_placeholder = st.empty()
-    
+
     if st.button('Lancer le Scan'):
         results_placeholder.empty()
         try:
@@ -95,7 +100,6 @@ def main():
 
         with st.spinner('Scan en cours...'):
             results = []
-            # ... (logique de scan inchangée) ...
             total_scans = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
             progress_bar = st.progress(0)
             progress_status = st.empty()
@@ -113,47 +117,63 @@ def main():
                                 "Instrument": instrument.replace("_", "/"), "Timeframe": tf_name, "Ordre": action,
                                 "Signal": signal, "Heure (UTC)": signal_time
                             })
-                    else: st.warning(f"Données non disponibles pour {instrument} sur {tf_name}.")
+                    else:
+                        st.warning(f"Données non disponibles pour {instrument} sur {tf_name}.")
                     time_module.sleep(0.25)
             progress_status.success("Scan terminé !")
-            
-            # --- NOUVELLE LOGIQUE D'AFFICHAGE GROUPÉE ---
+
             with results_placeholder.container():
                 if not results:
                     st.success("✅ Aucun signal de CHoCH récent détecté.")
                 else:
                     full_df = pd.DataFrame(results)
-                    # On convertit explicitement en datetime pour le tri
                     full_df['Heure (UTC)'] = pd.to_datetime(full_df['Heure (UTC)'])
 
+                    # --- Export PDF, PNG, CSV ---
+                    st.markdown("### 📤 Exporter les résultats")
+                    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
+
+                    csv = full_df.to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 Télécharger en CSV", csv, f"choch_signaux_{timestamp}.csv", "text/csv")
+
+                    try:
+                        image_buf = io.BytesIO()
+                        dfi.export(full_df, image_buf, table_conversion='matplotlib')
+                        image_buf.seek(0)
+                        st.download_button("🖼 Télécharger en PNG", image_buf, f"choch_signaux_{timestamp}.png", "image/png")
+                    except Exception as e:
+                        st.warning(f"Erreur lors de l'export PNG : {e}")
+
+                    try:
+                        pdf_buf = io.BytesIO()
+                        img_temp = "temp_table_img.png"
+                        dfi.export(full_df, img_temp, table_conversion='matplotlib')
+                        pdf = FPDF()
+                        pdf.add_page()
+                        pdf.image(img_temp, x=10, y=10, w=190)
+                        pdf.output(pdf_buf)
+                        pdf_buf.seek(0)
+                        st.download_button("📄 Télécharger en PDF", pdf_buf, f"choch_signaux_{timestamp}.pdf", "application/pdf")
+                    except Exception as e:
+                        st.warning(f"Erreur lors de l'export PDF : {e}")
+
+                    # --- Affichage par timeframe ---
                     for tf_name, tf_code in TIME_FRAMES.items():
-                        # Filtrer les résultats pour le timeframe actuel
                         tf_df = full_df[full_df['Timeframe'] == tf_name].copy()
-
                         if not tf_df.empty:
-                            # Trier par date pour avoir le plus récent en premier
                             tf_df = tf_df.sort_values(by='Heure (UTC)', ascending=False)
-                            
-                            # Ajouter une colonne "⭐" pour le plus récent
                             tf_df.insert(0, ' ', ['⭐'] + [''] * (len(tf_df) - 1))
-
-                            # Formatter la date en string pour l'affichage
                             tf_df['Heure (UTC)'] = tf_df['Heure (UTC)'].dt.strftime('%Y-%m-%d %H:%M')
 
-                            # Afficher le titre pour ce groupe
                             st.subheader(f"--- Signaux {tf_name} ---")
-                            
-                            # Définir les styles
+
                             def color_signal(val): return f'color: {"#089981" if "Bullish" in val else "#f23645"}; font-weight: bold;'
                             def style_order(val): return f'background-color: {"#089981" if val == "Achat" else "#f23645"}; color: white; border-radius: 5px; text-align: center; font-weight: bold;'
 
-                            # Appliquer les styles au DataFrame
-                            # On enlève la colonne Timeframe qui est maintenant dans le titre
                             styled_df = tf_df.drop(columns=['Timeframe']).style\
                                 .applymap(color_signal, subset=['Signal'])\
                                 .applymap(style_order, subset=['Ordre'])
 
-                            # Afficher le tableau stylisé
                             st.dataframe(styled_df, hide_index=True, use_container_width=True)
 
 if __name__ == "__main__":
