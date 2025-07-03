@@ -60,7 +60,6 @@ def main():
     """Fonction principale de l'application Streamlit."""
     st.set_page_config(page_title="Scanner de CHoCH", layout="wide")
 
-    # Titre principal de l'application
     st.markdown("""
         <div style="display: flex; align-items: center; margin-bottom: 25px;">
             <svg width="40" height="40" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-right: 10px;">
@@ -72,21 +71,16 @@ def main():
         </div>
     """, unsafe_allow_html=True)
     
-    # --- SUPPRESSION des textes descriptifs ---
-    # st.write(f"Ce scanner recherche...")
-    # st.info("Avertissement : Basé sur...")
-
     try:
         OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
     except KeyError:
         st.error("Erreur : Veuillez configurer OANDA_ACCESS_TOKEN dans les secrets de Streamlit.")
         st.stop()
 
-    # On utilise un seul placeholder pour les résultats et le bouton
     results_placeholder = st.empty()
     
     if st.button('Lancer le Scan'):
-        results_placeholder.empty() # On nettoie l'ancien tableau avant un nouveau scan
+        results_placeholder.empty()
         try:
             api_client = API(access_token=OANDA_ACCESS_TOKEN)
         except Exception as e:
@@ -95,10 +89,10 @@ def main():
 
         with st.spinner('Scan en cours...'):
             results = []
+            # ... (la logique de scan est inchangée) ...
             total_scans = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
             progress_bar = st.progress(0)
             progress_status = st.empty()
-            
             for i, instrument in enumerate(INSTRUMENTS_TO_SCAN):
                 for tf_name, tf_code in TIME_FRAMES.items():
                     progress_value = (i * len(TIME_FRAMES) + list(TIME_FRAMES.keys()).index(tf_name) + 1) / total_scans
@@ -113,13 +107,11 @@ def main():
                                 "Instrument": instrument.replace("_", "/"), "Timeframe": tf_name, "Ordre": action,
                                 "Signal": signal, "Heure (UTC)": signal_time.strftime('%Y-%m-%d %H:%M')
                             })
-                    else: 
-                        st.warning(f"Données non disponibles pour {instrument} sur {tf_name}.")
+                    else: st.warning(f"Données non disponibles pour {instrument} sur {tf_name}.")
                     time_module.sleep(0.2)
             
             progress_status.success("Scan terminé !")
             
-            # --- CORRECTION DE L'AFFICHAGE ET DU BOUTON ---
             if results:
                 column_order = ["Instrument", "Timeframe", "Ordre", "Signal", "Heure (UTC)"]
                 results_df = pd.DataFrame(results)[column_order]
@@ -130,28 +122,49 @@ def main():
                 styled_df = results_df.style.applymap(color_signal, subset=['Signal'])\
                                             .applymap(style_order, subset=['Ordre'])
 
-                # On construit un seul bloc HTML contenant le tableau ET le bouton
                 table_html = styled_df.to_html(index=False)
-                export_button_html = """
+                
+                # --- CORRECTION FINALE ET ROBUSTE DU BOUTON ---
+                
+                # 1. On donne un ID au bouton pour que le script puisse le trouver
+                button_html = '<button id="export-btn">Exporter en Image</button>'
+                
+                # 2. On crée le script qui va s'attacher au bouton
+                script_html = """
                 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
                 <script>
-                function exportTableToImage() {
-                    const tableElement = document.getElementById('results-table-container');
-                    html2canvas(tableElement, {scale: 2, useCORS: true, backgroundColor: '#0E1117'}).then(canvas => {
-                        const link = document.createElement('a');
-                        link.download = 'choch_scanner_results.png';
-                        link.href = canvas.toDataURL('image/png');
-                        link.click();
-                    });
-                }
+                    // On attend que le bouton existe, puis on lui attache l'événement 'click'
+                    const exportButton = document.getElementById('export-btn');
+                    if (exportButton) {
+                        exportButton.addEventListener('click', function() {
+                            const tableElement = document.getElementById('results-table-container');
+                            if (tableElement) {
+                                html2canvas(tableElement, {scale: 2, useCORS: true, backgroundColor: '#0E1117'}).then(canvas => {
+                                    const link = document.createElement('a');
+                                    link.download = 'choch_scanner_results.png';
+                                    link.href = canvas.toDataURL('image/png');
+                                    link.click();
+                                });
+                            }
+                        });
+                    }
                 </script>
-                <button onclick="exportTableToImage()" style="padding: 8px 12px; border-radius: 8px; border: 1px solid #4A4A4A; background-color: #0E1117; color: white; cursor: pointer; margin-top: 20px;">
-                    Exporter en Image
-                </button>
+                <style>
+                    #export-btn {
+                        padding: 8px 12px;
+                        border-radius: 8px;
+                        border: 1px solid #4A4A4A;
+                        background-color: #0E1117;
+                        color: white;
+                        cursor: pointer;
+                        margin-top: 20px;
+                        display: block;
+                    }
+                </style>
                 """
 
-                # On injecte le tout dans le placeholder
-                full_html = f'<div id="results-table-container">{table_html}</div>{export_button_html}'
+                # 3. On injecte le tout dans le placeholder
+                full_html = f'<div id="results-table-container">{table_html}</div>{button_html}{script_html}'
                 results_placeholder.markdown(full_html, unsafe_allow_html=True)
             else:
                 results_placeholder.success("✅ Aucun signal de CHoCH récent détecté.")
