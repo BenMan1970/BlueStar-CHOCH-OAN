@@ -60,8 +60,9 @@ def main():
     """Fonction principale de l'application Streamlit."""
     st.set_page_config(page_title="Scanner de CHoCH", layout="wide")
 
+    # Titre principal de l'application
     st.markdown("""
-        <div style="display: flex; align-items: center; margin-bottom: 10px;">
+        <div style="display: flex; align-items: center; margin-bottom: 25px;">
             <svg width="40" height="40" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-right: 10px;">
                 <path d="M4 4V8H8" stroke="#f23645" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                 <path d="M4 12V20H20V4H12" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -70,27 +71,27 @@ def main():
             <h1 style="margin: 0;">Scanner de Change of Character (CHoCH)</h1>
         </div>
     """, unsafe_allow_html=True)
-
-    st.write(f"Ce scanner recherche des signaux de CHoCH survenus dans les **{RECENT_BARS_THRESHOLD}** dernières bougies.")
-    st.info("Avertissement : Basé sur l'indicateur 'Market Structure' de LuxAlgo (Licence CC BY-NC-SA 4.0). Cet outil est à but éducatif.")
     
+    # --- SUPPRESSION des textes descriptifs ---
+    # st.write(f"Ce scanner recherche...")
+    # st.info("Avertissement : Basé sur...")
+
     try:
         OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
     except KeyError:
         st.error("Erreur : Veuillez configurer OANDA_ACCESS_TOKEN dans les secrets de Streamlit.")
         st.stop()
 
+    # On utilise un seul placeholder pour les résultats et le bouton
     results_placeholder = st.empty()
-    export_button_placeholder = st.empty()
-
+    
     if st.button('Lancer le Scan'):
-        # --- PARTIE CORRIGÉE : L'INITIALISATION DE L'API EST REMISE ICI ---
+        results_placeholder.empty() # On nettoie l'ancien tableau avant un nouveau scan
         try:
             api_client = API(access_token=OANDA_ACCESS_TOKEN)
         except Exception as e:
             st.error(f"Erreur d'initialisation de l'API Oanda: {e}")
             st.stop()
-        # -----------------------------------------------------------------
 
         with st.spinner('Scan en cours...'):
             results = []
@@ -103,10 +104,7 @@ def main():
                     progress_value = (i * len(TIME_FRAMES) + list(TIME_FRAMES.keys()).index(tf_name) + 1) / total_scans
                     progress_bar.progress(progress_value)
                     progress_status.text(f"Scan de {instrument} sur {tf_name}...")
-                    
-                    # Maintenant, la variable 'api_client' existe et l'appel fonctionne
                     df = get_oanda_data(api_client, instrument, tf_code)
-                    
                     if df is not None:
                         signal, signal_time = detect_choch(df, length=FRACTAL_LENGTH)
                         if signal:
@@ -121,6 +119,7 @@ def main():
             
             progress_status.success("Scan terminé !")
             
+            # --- CORRECTION DE L'AFFICHAGE ET DU BOUTON ---
             if results:
                 column_order = ["Instrument", "Timeframe", "Ordre", "Signal", "Heure (UTC)"]
                 results_df = pd.DataFrame(results)[column_order]
@@ -131,9 +130,8 @@ def main():
                 styled_df = results_df.style.applymap(color_signal, subset=['Signal'])\
                                             .applymap(style_order, subset=['Ordre'])
 
+                # On construit un seul bloc HTML contenant le tableau ET le bouton
                 table_html = styled_df.to_html(index=False)
-                results_placeholder.markdown(f'<div id="results-table-container">{table_html}</div>', unsafe_allow_html=True)
-                
                 export_button_html = """
                 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
                 <script>
@@ -151,7 +149,10 @@ def main():
                     Exporter en Image
                 </button>
                 """
-                export_button_placeholder.markdown(export_button_html, unsafe_allow_html=True)
+
+                # On injecte le tout dans le placeholder
+                full_html = f'<div id="results-table-container">{table_html}</div>{export_button_html}'
+                results_placeholder.markdown(full_html, unsafe_allow_html=True)
             else:
                 results_placeholder.success("✅ Aucun signal de CHoCH récent détecté.")
 
