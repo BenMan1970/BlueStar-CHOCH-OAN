@@ -13,24 +13,17 @@ INSTRUMENTS_TO_SCAN = [
     # Paires Mineures (Croisées GBP)
     "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
     # Paires Mineures (Autres)
-    "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD",
-    "CAD_JPY", "CAD_CHF",
-    "CHF_JPY",
-    "NZD_JPY", "NZD_CAD", "NZD_CHF",
+    "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY", "NZD_JPY", "NZD_CAD", "NZD_CHF",
     # Indices et Métaux
     "XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD"
 ]
-
 TIME_FRAMES = {
     "H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"
 }
 FRACTAL_LENGTH = 5
-
-# --- AJUSTEMENT DE LA SOLUTION ---
-# On augmente le seuil pour être moins restrictif et ne pas filtrer les signaux un peu plus anciens.
 RECENT_BARS_THRESHOLD = 10 
 
-# --- Fonctions (la logique de détection reste la même et est correcte) ---
+# --- Fonctions (logique de détection inchangée) ---
 def get_oanda_data(api_client, instrument, granularity, count=250):
     params = {"count": count, "granularity": granularity}
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
@@ -42,6 +35,7 @@ def get_oanda_data(api_client, instrument, granularity, count=250):
             {"time": pd.to_datetime(c['time']), "open": float(c['mid']['o']), "high": float(c['mid']['h']), "low": float(c['mid']['l']), "close": float(c['mid']['c'])}
             for c in data if c['complete']
         ])
+        df['time'] = pd.to_datetime(df['time'])
         return df
     except Exception: return None
 
@@ -60,13 +54,11 @@ def detect_choch(df, length=5):
         current_close, previous_close = df['close'].iloc[i], df['close'].iloc[i - 1]
         if upper_fractal['value'] is not None and not upper_fractal['iscrossed']:
             if current_close > upper_fractal['value'] and previous_close <= upper_fractal['value']:
-                if os == -1:
-                    choch_signal, choch_time, choch_bar_index = "Bullish CHoCH", df['time'].iloc[i], i
+                if os == -1: choch_signal, choch_time, choch_bar_index = "Bullish CHoCH", df['time'].iloc[i], i
                 os, upper_fractal['iscrossed'] = 1, True
         if lower_fractal['value'] is not None and not lower_fractal['iscrossed']:
             if current_close < lower_fractal['value'] and previous_close >= lower_fractal['value']:
-                if os == 1:
-                    choch_signal, choch_time, choch_bar_index = "Bearish CHoCH", df['time'].iloc[i], i
+                if os == 1: choch_signal, choch_time, choch_bar_index = "Bearish CHoCH", df['time'].iloc[i], i
                 os, lower_fractal['iscrossed'] = -1, True
     if choch_signal and (len(df) - 1 - choch_bar_index) < RECENT_BARS_THRESHOLD:
         return choch_signal, choch_time
@@ -90,7 +82,9 @@ def main():
     except KeyError:
         st.error("Erreur : Veuillez configurer OANDA_ACCESS_TOKEN dans les secrets de Streamlit.")
         st.stop()
+    
     results_placeholder = st.empty()
+    
     if st.button('Lancer le Scan'):
         results_placeholder.empty()
         try:
@@ -98,8 +92,10 @@ def main():
         except Exception as e:
             st.error(f"Erreur d'initialisation de l'API Oanda: {e}")
             st.stop()
+
         with st.spinner('Scan en cours...'):
             results = []
+            # ... (logique de scan inchangée) ...
             total_scans = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
             progress_bar = st.progress(0)
             progress_status = st.empty()
@@ -115,23 +111,50 @@ def main():
                             action = "Achat" if "Bullish" in signal else "Vente"
                             results.append({
                                 "Instrument": instrument.replace("_", "/"), "Timeframe": tf_name, "Ordre": action,
-                                "Signal": signal, "Heure (UTC)": signal_time.strftime('%Y-%m-%d %H:%M')
+                                "Signal": signal, "Heure (UTC)": signal_time
                             })
                     else: st.warning(f"Données non disponibles pour {instrument} sur {tf_name}.")
                     time_module.sleep(0.25)
             progress_status.success("Scan terminé !")
-            if results:
-                column_order = ["Instrument", "Timeframe", "Ordre", "Signal", "Heure (UTC)"]
-                results_df = pd.DataFrame(results).sort_values(by=["Timeframe", "Instrument"])
-                def color_signal(val): return f'color: {"#089981" if "Bullish" in val else "#f23645"}; font-weight: bold;'
-                def style_order(val): return f'background-color: {"#089981" if val == "Achat" else "#f23645"}; color: white; border-radius: 5px; text-align: center; font-weight: bold;'
-                styled_df = results_df.style.applymap(color_signal, subset=['Signal'])\
-                                            .applymap(style_order, subset=['Ordre'])
-                table_html = styled_df.to_html(index=False)
-                results_placeholder.markdown(table_html, unsafe_allow_html=True)
-            else:
-                results_placeholder.success("✅ Aucun signal de CHoCH récent détecté.")
+            
+            # --- NOUVELLE LOGIQUE D'AFFICHAGE GROUPÉE ---
+            with results_placeholder.container():
+                if not results:
+                    st.success("✅ Aucun signal de CHoCH récent détecté.")
+                else:
+                    full_df = pd.DataFrame(results)
+                    # On convertit explicitement en datetime pour le tri
+                    full_df['Heure (UTC)'] = pd.to_datetime(full_df['Heure (UTC)'])
+
+                    for tf_name, tf_code in TIME_FRAMES.items():
+                        # Filtrer les résultats pour le timeframe actuel
+                        tf_df = full_df[full_df['Timeframe'] == tf_name].copy()
+
+                        if not tf_df.empty:
+                            # Trier par date pour avoir le plus récent en premier
+                            tf_df = tf_df.sort_values(by='Heure (UTC)', ascending=False)
+                            
+                            # Ajouter une colonne "⭐" pour le plus récent
+                            tf_df.insert(0, ' ', ['⭐'] + [''] * (len(tf_df) - 1))
+
+                            # Formatter la date en string pour l'affichage
+                            tf_df['Heure (UTC)'] = tf_df['Heure (UTC)'].dt.strftime('%Y-%m-%d %H:%M')
+
+                            # Afficher le titre pour ce groupe
+                            st.subheader(f"--- Signaux {tf_name} ---")
+                            
+                            # Définir les styles
+                            def color_signal(val): return f'color: {"#089981" if "Bullish" in val else "#f23645"}; font-weight: bold;'
+                            def style_order(val): return f'background-color: {"#089981" if val == "Achat" else "#f23645"}; color: white; border-radius: 5px; text-align: center; font-weight: bold;'
+
+                            # Appliquer les styles au DataFrame
+                            # On enlève la colonne Timeframe qui est maintenant dans le titre
+                            styled_df = tf_df.drop(columns=['Timeframe']).style\
+                                .applymap(color_signal, subset=['Signal'])\
+                                .applymap(style_order, subset=['Ordre'])
+
+                            # Afficher le tableau stylisé
+                            st.dataframe(styled_df, hide_index=True, use_container_width=True)
 
 if __name__ == "__main__":
     main()
-           
