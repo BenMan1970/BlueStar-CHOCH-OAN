@@ -1,3 +1,7 @@
 streamlit
-pandas
 oandapyV20
+pandas
+fpdf
+pillow
+matplotlib
+dataframe-image
