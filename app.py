@@ -6,20 +6,15 @@ import time as time_module
 from datetime import datetime
 import io
 from fpdf import FPDF
-from PIL import Image
 import dataframe_image as dfi
+import os
 
 # --- CONFIGURATION ---
 INSTRUMENTS_TO_SCAN = [
-    # Paires Majeures
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
-    # Paires Mineures (Croisées EUR)
     "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
-    # Paires Mineures (Croisées GBP)
     "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
-    # Paires Mineures (Autres)
     "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY", "NZD_JPY", "NZD_CAD", "NZD_CHF",
-    # Indices et Métaux
     "XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD"
 ]
 TIME_FRAMES = {
@@ -129,13 +124,15 @@ def main():
                     full_df = pd.DataFrame(results)
                     full_df['Heure (UTC)'] = pd.to_datetime(full_df['Heure (UTC)'])
 
-                    # --- Export PDF, PNG, CSV ---
+                    # --- EXPORT SECTION ---
                     st.markdown("### 📤 Exporter les résultats")
                     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
 
+                    # CSV Export
                     csv = full_df.to_csv(index=False).encode('utf-8')
                     st.download_button("📥 Télécharger en CSV", csv, f"choch_signaux_{timestamp}.csv", "text/csv")
 
+                    # PNG Export
                     try:
                         image_buf = io.BytesIO()
                         dfi.export(full_df, image_buf, table_conversion='matplotlib')
@@ -144,20 +141,26 @@ def main():
                     except Exception as e:
                         st.warning(f"Erreur lors de l'export PNG : {e}")
 
+                    # PDF Export
                     try:
-                        pdf_buf = io.BytesIO()
-                        img_temp = "temp_table_img.png"
+                        img_temp = f"temp_table_img_{timestamp}.png"
                         dfi.export(full_df, img_temp, table_conversion='matplotlib')
                         pdf = FPDF()
                         pdf.add_page()
                         pdf.image(img_temp, x=10, y=10, w=190)
-                        pdf.output(pdf_buf)
-                        pdf_buf.seek(0)
-                        st.download_button("📄 Télécharger en PDF", pdf_buf, f"choch_signaux_{timestamp}.pdf", "application/pdf")
+                        pdf_path = f"choch_signaux_{timestamp}.pdf"
+                        pdf.output(pdf_path)
+
+                        with open(pdf_path, "rb") as f:
+                            st.download_button("📄 Télécharger en PDF", f.read(), pdf_path, "application/pdf")
+
+                        # Clean up temporary file
+                        os.remove(img_temp)
+                        os.remove(pdf_path)
                     except Exception as e:
                         st.warning(f"Erreur lors de l'export PDF : {e}")
 
-                    # --- Affichage par timeframe ---
+                    # --- AFFICHAGE PAR TIMEFRAME ---
                     for tf_name, tf_code in TIME_FRAMES.items():
                         tf_df = full_df[full_df['Timeframe'] == tf_name].copy()
                         if not tf_df.empty:
@@ -178,3 +181,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
