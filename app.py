@@ -67,16 +67,12 @@ def main():
     st.write(f"Ce scanner recherche des signaux de CHoCH survenus dans les **{RECENT_BARS_THRESHOLD}** dernières bougies.")
     st.info("Avertissement : Basé sur l'indicateur 'Market Structure' de LuxAlgo (Licence CC BY-NC-SA 4.0). Cet outil est à but éducatif. Faites toujours vos propres analyses.")
 
-    # --- PARTIE MODIFIÉE ---
-    # Vérification et assignation des secrets aux variables souhaitées
     try:
-        OANDA_ACCOUNT_ID = st.secrets["OANDA_ACCOUNT_ID"]
         OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
     except KeyError:
-        st.error("Erreur de configuration : Veuillez configurer vos identifiants OANDA dans les secrets de Streamlit.")
+        st.error("Erreur de configuration : Veuillez configurer OANDA_ACCESS_TOKEN dans les secrets de Streamlit.")
         st.code("""
 # Exemple de format pour vos secrets de déploiement :
-OANDA_ACCOUNT_ID = "YOUR-ACCOUNT-ID"
 OANDA_ACCESS_TOKEN = "YOUR-ACCESS-TOKEN"
         """)
         st.stop()
@@ -85,7 +81,6 @@ OANDA_ACCESS_TOKEN = "YOUR-ACCESS-TOKEN"
     
     if st.button('Lancer le Scan'):
         try:
-            # Utilisation de la variable OANDA_ACCESS_TOKEN pour l'initialisation
             api_client = API(access_token=OANDA_ACCESS_TOKEN)
         except Exception as e:
             st.error(f"Erreur d'initialisation de l'API Oanda. Vérifiez votre token d'accès. Erreur: {e}")
@@ -108,8 +103,15 @@ OANDA_ACCESS_TOKEN = "YOUR-ACCESS-TOKEN"
                     if df is not None:
                         signal, signal_time = detect_choch(df, length=FRACTAL_LENGTH)
                         if signal:
+                            # --- MODIFICATION ICI ---
+                            # Détermination de l'ordre (Achat/Vente)
+                            action = "Achat" if "Bullish" in signal else "Vente"
+                            
                             results.append({
-                                "Instrument": instrument.replace("_", "/"), "Timeframe": tf_name, "Signal": signal,
+                                "Instrument": instrument.replace("_", "/"), 
+                                "Timeframe": tf_name, 
+                                "Ordre": action,  # Ajout de la nouvelle colonne
+                                "Signal": signal,
                                 "Heure (UTC)": signal_time.strftime('%Y-%m-%d %H:%M')
                             })
                     else:
@@ -118,12 +120,24 @@ OANDA_ACCESS_TOKEN = "YOUR-ACCESS-TOKEN"
             
             progress_status.success("Scan terminé !")
             if results:
-                results_df = pd.DataFrame(results).sort_values(by="Timeframe")
+                # Définir l'ordre des colonnes pour l'affichage
+                column_order = ["Instrument", "Timeframe", "Ordre", "Signal", "Heure (UTC)"]
+                results_df = pd.DataFrame(results)[column_order]
+
+                # Fonctions de style pour les colonnes
                 def color_signal(val):
-                    color = '#089981' if 'Bullish' in val else '#f23645' # Couleurs de LuxAlgo
+                    color = '#089981' if 'Bullish' in val else '#f23645'
                     return f'color: {color}; font-weight: bold;'
-                styled_df = results_df.style.applymap(color_signal, subset=['Signal'])
-                results_placeholder.dataframe(styled_df, use_container_width=True)
+
+                def style_order(val):
+                    color = '#089981' if val == 'Achat' else '#f23645'
+                    return f'background-color: {color}; color: white; border-radius: 5px; text-align: center; font-weight: bold;'
+                
+                # Appliquer le style au DataFrame
+                styled_df = results_df.style.applymap(color_signal, subset=['Signal'])\
+                                            .applymap(style_order, subset=['Ordre'])
+                
+                results_placeholder.dataframe(styled_df, use_container_width=True, hide_index=True)
             else:
                 results_placeholder.success("✅ Aucun signal de CHoCH récent détecté.")
 
