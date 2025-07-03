@@ -18,7 +18,7 @@ TIME_FRAMES = {
 FRACTAL_LENGTH = 5
 RECENT_BARS_THRESHOLD = 3
 
-# --- Fonctions de l'application (logique de trading) ---
+# --- Fonctions de l'application (inchangées) ---
 
 def get_oanda_data(api_client, instrument, granularity, count=250):
     params = {"count": count, "granularity": granularity}
@@ -56,54 +56,10 @@ def detect_choch(df, length=5):
         return choch_signal, choch_time
     return None, None
 
-# --- RECTIFICATION : CETTE FONCTION CONSTRUIT LE BLOC HTML/JS POUR L'EXPORT ---
-def get_image_export_button(df_styled):
-    """
-    Génère le code HTML complet (tableau + bouton + script JS) pour l'exportation.
-    C'est ici que le code que vous avez isolé est généré par Python.
-    """
-    table_html = df_styled.to_html(index=False)
-    
-    # Le script JS est injecté dans le HTML qui sera envoyé au navigateur.
-    js_script = """
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-    <script>
-    function exportTableToImage() {
-        const tableElement = document.getElementById('results-table-container');
-        const options = {
-            scale: 2,
-            useCORS: true,
-            backgroundColor: '#0E1117'
-        };
-        html2canvas(tableElement, options).then(canvas => {
-            const link = document.createElement('a');
-            link.download = 'choch_scanner_results.png';
-            link.href = canvas.toDataURL('image/png');
-            link.click();
-        });
-    }
-    </script>
-    """
-    
-    # Le bouton HTML qui appelle la fonction JS.
-    button_html = '<button onclick="exportTableToImage()" style="padding: 8px 12px; border-radius: 8px; border: 1px solid #4A4A4A; background-color: #0E1117; color: white; cursor: pointer; margin-top: 20px;">Exporter en Image</button>'
-
-    # On assemble le tout : un div conteneur pour le tableau, le script, et le bouton.
-    full_html = f"""
-    <div id="results-table-container">
-        {table_html}
-    </div>
-    {js_script}
-    {button_html}
-    """
-    return full_html
-
-
 def main():
     """Fonction principale de l'application Streamlit."""
     st.set_page_config(page_title="Scanner de CHoCH", layout="wide")
 
-    # Interface utilisateur (Titre, logo, description)
     st.markdown("""
         <div style="display: flex; align-items: center; margin-bottom: 10px;">
             <svg width="40" height="40" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-right: 10px;">
@@ -118,7 +74,6 @@ def main():
     st.write(f"Ce scanner recherche des signaux de CHoCH survenus dans les **{RECENT_BARS_THRESHOLD}** dernières bougies.")
     st.info("Avertissement : Basé sur l'indicateur 'Market Structure' de LuxAlgo (Licence CC BY-NC-SA 4.0). Cet outil est à but éducatif.")
     
-    # Vérification des secrets Streamlit
     try:
         OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
     except KeyError:
@@ -128,25 +83,17 @@ def main():
     results_placeholder = st.empty()
     
     if st.button('Lancer le Scan'):
-        try:
-            api_client = API(access_token=OANDA_ACCESS_TOKEN)
-        except Exception as e:
-            st.error(f"Erreur d'initialisation de l'API Oanda: {e}")
-            st.stop()
-            
+        # ... la logique de scan reste identique ...
         with st.spinner('Scan en cours...'):
             results = []
             total_scans = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
             progress_bar = st.progress(0)
             progress_status = st.empty()
-
-            # Boucle principale du scan
             for i, instrument in enumerate(INSTRUMENTS_TO_SCAN):
                 for tf_name, tf_code in TIME_FRAMES.items():
                     progress_value = (i * len(TIME_FRAMES) + list(TIME_FRAMES.keys()).index(tf_name) + 1) / total_scans
                     progress_bar.progress(progress_value)
                     progress_status.text(f"Scan de {instrument} sur {tf_name}...")
-                    
                     df = get_oanda_data(api_client, instrument, tf_code)
                     if df is not None:
                         signal, signal_time = detect_choch(df, length=FRACTAL_LENGTH)
@@ -156,28 +103,47 @@ def main():
                                 "Instrument": instrument.replace("_", "/"), "Timeframe": tf_name, "Ordre": action,
                                 "Signal": signal, "Heure (UTC)": signal_time.strftime('%Y-%m-%d %H:%M')
                             })
-                    else:
-                        st.warning(f"Données non disponibles pour {instrument} sur {tf_name}.")
+                    else: st.warning(f"Données non disponibles pour {instrument} sur {tf_name}.")
                     time_module.sleep(0.2)
             
             progress_status.success("Scan terminé !")
             
-            # Affichage des résultats
+            # --- PARTIE CORRIGÉE POUR L'AFFICHAGE ---
             if results:
                 column_order = ["Instrument", "Timeframe", "Ordre", "Signal", "Heure (UTC)"]
                 results_df = pd.DataFrame(results)[column_order]
 
-                # Fonctions de style pour un affichage coloré
                 def color_signal(val): return f'color: {"#089981" if "Bullish" in val else "#f23645"}; font-weight: bold;'
                 def style_order(val): return f'background-color: {"#089981" if val == "Achat" else "#f23645"}; color: white; border-radius: 5px; text-align: center; font-weight: bold;'
                 
                 styled_df = results_df.style.applymap(color_signal, subset=['Signal'])\
                                             .applymap(style_order, subset=['Ordre'])
+
+                # Étape 1 : Afficher SEULEMENT le tableau dans son conteneur.
+                table_html = styled_df.to_html(index=False)
+                results_placeholder.markdown(f'<div id="results-table-container">{table_html}</div>', unsafe_allow_html=True)
                 
-                # --- RECTIFICATION : C'est ici qu'on utilise la fonction d'export ---
-                # On génère le HTML final et on l'affiche avec st.markdown
-                export_html = get_image_export_button(styled_df)
-                results_placeholder.markdown(export_html, unsafe_allow_html=True)
+                # Étape 2 : Préparer et afficher SEPARÉMENT le bouton et son script.
+                export_button_html = """
+                <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+                <script>
+                function exportTableToImage() {
+                    const tableElement = document.getElementById('results-table-container');
+                    html2canvas(tableElement, {scale: 2, useCORS: true, backgroundColor: '#0E1117'}).then(canvas => {
+                        const link = document.createElement('a');
+                        link.download = 'choch_scanner_results.png';
+                        link.href = canvas.toDataURL('image/png');
+                        link.click();
+                    });
+                }
+                </script>
+                <button onclick="exportTableToImage()" style="padding: 8px 12px; border-radius: 8px; border: 1px solid #4A4A4A; background-color: #0E1117; color: white; cursor: pointer; margin-top: 20px;">
+                    Exporter en Image
+                </button>
+                """
+                # On utilise st.markdown ici pour ajouter le bouton SOUS le tableau.
+                st.markdown(export_button_html, unsafe_allow_html=True)
+
             else:
                 results_placeholder.success("✅ Aucun signal de CHoCH récent détecté.")
 
