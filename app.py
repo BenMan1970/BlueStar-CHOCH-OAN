@@ -81,20 +81,32 @@ def main():
         st.stop()
 
     results_placeholder = st.empty()
-    
+    export_button_placeholder = st.empty()
+
     if st.button('Lancer le Scan'):
-        # ... la logique de scan reste identique ...
+        # --- PARTIE CORRIGÉE : L'INITIALISATION DE L'API EST REMISE ICI ---
+        try:
+            api_client = API(access_token=OANDA_ACCESS_TOKEN)
+        except Exception as e:
+            st.error(f"Erreur d'initialisation de l'API Oanda: {e}")
+            st.stop()
+        # -----------------------------------------------------------------
+
         with st.spinner('Scan en cours...'):
             results = []
             total_scans = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
             progress_bar = st.progress(0)
             progress_status = st.empty()
+            
             for i, instrument in enumerate(INSTRUMENTS_TO_SCAN):
                 for tf_name, tf_code in TIME_FRAMES.items():
                     progress_value = (i * len(TIME_FRAMES) + list(TIME_FRAMES.keys()).index(tf_name) + 1) / total_scans
                     progress_bar.progress(progress_value)
                     progress_status.text(f"Scan de {instrument} sur {tf_name}...")
+                    
+                    # Maintenant, la variable 'api_client' existe et l'appel fonctionne
                     df = get_oanda_data(api_client, instrument, tf_code)
+                    
                     if df is not None:
                         signal, signal_time = detect_choch(df, length=FRACTAL_LENGTH)
                         if signal:
@@ -103,12 +115,12 @@ def main():
                                 "Instrument": instrument.replace("_", "/"), "Timeframe": tf_name, "Ordre": action,
                                 "Signal": signal, "Heure (UTC)": signal_time.strftime('%Y-%m-%d %H:%M')
                             })
-                    else: st.warning(f"Données non disponibles pour {instrument} sur {tf_name}.")
+                    else: 
+                        st.warning(f"Données non disponibles pour {instrument} sur {tf_name}.")
                     time_module.sleep(0.2)
             
             progress_status.success("Scan terminé !")
             
-            # --- PARTIE CORRIGÉE POUR L'AFFICHAGE ---
             if results:
                 column_order = ["Instrument", "Timeframe", "Ordre", "Signal", "Heure (UTC)"]
                 results_df = pd.DataFrame(results)[column_order]
@@ -119,11 +131,9 @@ def main():
                 styled_df = results_df.style.applymap(color_signal, subset=['Signal'])\
                                             .applymap(style_order, subset=['Ordre'])
 
-                # Étape 1 : Afficher SEULEMENT le tableau dans son conteneur.
                 table_html = styled_df.to_html(index=False)
                 results_placeholder.markdown(f'<div id="results-table-container">{table_html}</div>', unsafe_allow_html=True)
                 
-                # Étape 2 : Préparer et afficher SEPARÉMENT le bouton et son script.
                 export_button_html = """
                 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
                 <script>
@@ -141,9 +151,7 @@ def main():
                     Exporter en Image
                 </button>
                 """
-                # On utilise st.markdown ici pour ajouter le bouton SOUS le tableau.
-                st.markdown(export_button_html, unsafe_allow_html=True)
-
+                export_button_placeholder.markdown(export_button_html, unsafe_allow_html=True)
             else:
                 results_placeholder.success("✅ Aucun signal de CHoCH récent détecté.")
 
