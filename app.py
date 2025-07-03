@@ -3,7 +3,6 @@ import pandas as pd
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 import time as time_module
-import base64 # Utilisé pour l'encodage de l'image du logo
 
 # --- CONFIGURATION DES PARAMETRES DU SCANNER ---
 INSTRUMENTS_TO_SCAN = [
@@ -19,7 +18,7 @@ TIME_FRAMES = {
 FRACTAL_LENGTH = 5
 RECENT_BARS_THRESHOLD = 3
 
-# --- Fonctions de l'application (inchangées) ---
+# --- Fonctions de l'application (logique de trading) ---
 
 def get_oanda_data(api_client, instrument, granularity, count=250):
     params = {"count": count, "granularity": granularity}
@@ -57,29 +56,26 @@ def detect_choch(df, length=5):
         return choch_signal, choch_time
     return None, None
 
-# --- NOUVELLE FONCTION POUR L'EXPORT ---
+# --- RECTIFICATION : CETTE FONCTION CONSTRUIT LE BLOC HTML/JS POUR L'EXPORT ---
 def get_image_export_button(df_styled):
-    """Génère le HTML/JS pour un bouton d'exportation d'image."""
+    """
+    Génère le code HTML complet (tableau + bouton + script JS) pour l'exportation.
+    C'est ici que le code que vous avez isolé est généré par Python.
+    """
     table_html = df_styled.to_html(index=False)
     
-    # Bouton et script JS pour la capture d'écran
-    # Utilise la bibliothèque html2canvas pour "photographier" le div du tableau
-    js_code = """
+    # Le script JS est injecté dans le HTML qui sera envoyé au navigateur.
+    js_script = """
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script>
     function exportTableToImage() {
-        // Cible le div qui contient le tableau
         const tableElement = document.getElementById('results-table-container');
-        
-        // Options pour html2canvas pour une meilleure qualité
         const options = {
-            scale: 2, // Augmente la résolution de l'image
-            useCORS: true, // Permet de charger des images cross-origin si nécessaire
-            backgroundColor: '#0E1117' // Fond sombre du thème Streamlit
+            scale: 2,
+            useCORS: true,
+            backgroundColor: '#0E1117'
         };
-
         html2canvas(tableElement, options).then(canvas => {
-            // Crée un lien de téléchargement temporaire
             const link = document.createElement('a');
             link.download = 'choch_scanner_results.png';
             link.href = canvas.toDataURL('image/png');
@@ -89,66 +85,68 @@ def get_image_export_button(df_styled):
     </script>
     """
     
-    # Bouton HTML stylisé
+    # Le bouton HTML qui appelle la fonction JS.
     button_html = '<button onclick="exportTableToImage()" style="padding: 8px 12px; border-radius: 8px; border: 1px solid #4A4A4A; background-color: #0E1117; color: white; cursor: pointer; margin-top: 20px;">Exporter en Image</button>'
 
-    # Structure HTML finale
-    # On encapsule le tableau dans un div avec un ID pour que le JS puisse le trouver
+    # On assemble le tout : un div conteneur pour le tableau, le script, et le bouton.
     full_html = f"""
     <div id="results-table-container">
         {table_html}
     </div>
-    {js_code}
+    {js_script}
     {button_html}
     """
     return full_html
 
 
 def main():
+    """Fonction principale de l'application Streamlit."""
     st.set_page_config(page_title="Scanner de CHoCH", layout="wide")
 
-    # Logo (optionnel, mais ajoute une touche pro)
-    logo_html = """
-    <div style="display: flex; align-items: center; margin-bottom: 10px;">
-        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-right: 10px;">
-            <path d="M4 4V8H8" stroke="#f23645" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M4 12V20H20V4H12" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M8 4L4 8" stroke="#089981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <h1 style="margin: 0;">Scanner de Change of Character (CHoCH)</h1>
-    </div>
-    """
-    st.markdown(logo_html, unsafe_allow_html=True)
+    # Interface utilisateur (Titre, logo, description)
+    st.markdown("""
+        <div style="display: flex; align-items: center; margin-bottom: 10px;">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-right: 10px;">
+                <path d="M4 4V8H8" stroke="#f23645" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M4 12V20H20V4H12" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M8 4L4 8" stroke="#089981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <h1 style="margin: 0;">Scanner de Change of Character (CHoCH)</h1>
+        </div>
+    """, unsafe_allow_html=True)
 
     st.write(f"Ce scanner recherche des signaux de CHoCH survenus dans les **{RECENT_BARS_THRESHOLD}** dernières bougies.")
-    st.info("Avertissement : Basé sur l'indicateur 'Market Structure' de LuxAlgo (Licence CC BY-NC-SA 4.0). Cet outil est à but éducatif. Faites toujours vos propres analyses.")
+    st.info("Avertissement : Basé sur l'indicateur 'Market Structure' de LuxAlgo (Licence CC BY-NC-SA 4.0). Cet outil est à but éducatif.")
     
+    # Vérification des secrets Streamlit
     try:
         OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
     except KeyError:
-        st.error("Erreur de configuration : Veuillez configurer OANDA_ACCESS_TOKEN dans les secrets de Streamlit.")
+        st.error("Erreur : Veuillez configurer OANDA_ACCESS_TOKEN dans les secrets de Streamlit.")
         st.stop()
 
     results_placeholder = st.empty()
     
-    if st.button('Lancer le Scan', key='scan_button'):
+    if st.button('Lancer le Scan'):
         try:
             api_client = API(access_token=OANDA_ACCESS_TOKEN)
         except Exception as e:
-            st.error(f"Erreur d'initialisation de l'API Oanda. Erreur: {e}")
+            st.error(f"Erreur d'initialisation de l'API Oanda: {e}")
             st.stop()
             
-        with st.spinner('Scan en cours... Ceci peut prendre une minute.'):
+        with st.spinner('Scan en cours...'):
             results = []
-            # ... (Le reste de la logique de scan reste identique) ...
             total_scans = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
             progress_bar = st.progress(0)
             progress_status = st.empty()
+
+            # Boucle principale du scan
             for i, instrument in enumerate(INSTRUMENTS_TO_SCAN):
                 for tf_name, tf_code in TIME_FRAMES.items():
                     progress_value = (i * len(TIME_FRAMES) + list(TIME_FRAMES.keys()).index(tf_name) + 1) / total_scans
                     progress_bar.progress(progress_value)
                     progress_status.text(f"Scan de {instrument} sur {tf_name}...")
+                    
                     df = get_oanda_data(api_client, instrument, tf_code)
                     if df is not None:
                         signal, signal_time = detect_choch(df, length=FRACTAL_LENGTH)
@@ -169,13 +167,15 @@ def main():
                 column_order = ["Instrument", "Timeframe", "Ordre", "Signal", "Heure (UTC)"]
                 results_df = pd.DataFrame(results)[column_order]
 
+                # Fonctions de style pour un affichage coloré
                 def color_signal(val): return f'color: {"#089981" if "Bullish" in val else "#f23645"}; font-weight: bold;'
                 def style_order(val): return f'background-color: {"#089981" if val == "Achat" else "#f23645"}; color: white; border-radius: 5px; text-align: center; font-weight: bold;'
                 
                 styled_df = results_df.style.applymap(color_signal, subset=['Signal'])\
                                             .applymap(style_order, subset=['Ordre'])
                 
-                # Utiliser la nouvelle fonction pour afficher le tableau ET le bouton d'export
+                # --- RECTIFICATION : C'est ici qu'on utilise la fonction d'export ---
+                # On génère le HTML final et on l'affiche avec st.markdown
                 export_html = get_image_export_button(styled_df)
                 results_placeholder.markdown(export_html, unsafe_allow_html=True)
             else:
