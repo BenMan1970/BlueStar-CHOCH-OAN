@@ -89,27 +89,17 @@ def main():
         st.error("Erreur : Veuillez configurer OANDA_ACCESS_TOKEN dans les secrets de Streamlit.")
         st.stop()
     
-    # --- MODIFICATION CLÉ : Logique du bouton de scan ---
-    # Le bouton va maintenant lancer le scan ET stocker les résultats dans st.session_state
     if st.button('Lancer un nouveau Scan'):
-        # On nettoie les anciens résultats s'ils existent
-        if 'scan_results' in st.session_state:
-            del st.session_state['scan_results']
-        if 'failed_scans' in st.session_state:
-            del st.session_state['failed_scans']
+        if 'scan_results' in st.session_state: del st.session_state['scan_results']
+        if 'failed_scans' in st.session_state: del st.session_state['failed_scans']
             
-        try:
-            api_client = API(access_token=OANDA_ACCESS_TOKEN)
-        except Exception as e:
-            st.error(f"Erreur d'initialisation de l'API Oanda: {e}")
-            st.stop()
+        try: api_client = API(access_token=OANDA_ACCESS_TOKEN)
+        except Exception as e: st.error(f"Erreur d'initialisation de l'API Oanda: {e}"); st.stop()
 
         with st.spinner('Scan en cours...'):
-            results = []
-            failed = []
+            results, failed = [], []
             total_scans = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
-            progress_bar = st.progress(0)
-            progress_status = st.empty()
+            progress_bar, progress_status = st.progress(0), st.empty()
             
             for i, instrument in enumerate(INSTRUMENTS_TO_SCAN):
                 for j, (tf_name, tf_code) in enumerate(TIME_FRAMES.items()):
@@ -122,20 +112,16 @@ def main():
                         if signal:
                             action = "Achat" if "Bullish" in signal else "Vente"
                             results.append({"Instrument": instrument.replace("_", "/"), "Timeframe": tf_name, "Ordre": action, "Signal": signal, "Heure (UTC)": signal_time})
-                    else:
-                        failed.append(f"- **{instrument} ({tf_name})**: {status_message}")
+                    else: failed.append(f"- **{instrument} ({tf_name})**: {status_message}")
                     time_module.sleep(0.5)
             
             progress_status.success("Scan terminé !")
-            
-            # NOUVEAU : On sauvegarde les résultats dans la session
             st.session_state['scan_results'] = pd.DataFrame(results) if results else None
             st.session_state['failed_scans'] = failed if failed else None
-            st.experimental_rerun() # On force la ré-exécution pour afficher les résultats proprement
+            
+            # MODIFIÉ : Utilisation de la nouvelle fonction st.rerun()
+            st.rerun()
 
-    # --- MODIFICATION CLÉ : Logique d'affichage ---
-    # On affiche les résultats s'ils sont présents dans st.session_state
-    # Cela fonctionnera même après un téléchargement
     if 'scan_results' in st.session_state:
         full_df = st.session_state['scan_results']
 
@@ -143,26 +129,20 @@ def main():
             st.success("✅ Aucun signal de CHoCH récent détecté.")
         else:
             full_df['Heure (UTC)'] = pd.to_datetime(full_df['Heure (UTC)'])
-
-            # --- EXPORT SECTION ---
             st.markdown("### 📤 Exporter les résultats")
             timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
-            df_to_export = full_df.copy() # On utilise une copie pour l'export
+            df_to_export = full_df.copy()
 
-            # CSV Export
             csv = df_to_export.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Télécharger en CSV", csv, f"choch_signaux_{timestamp}.csv", "text/csv")
 
-            # PNG Export
             try:
                 image_buf = io.BytesIO()
                 dfi.export(df_to_export, image_buf, table_conversion='matplotlib')
                 image_buf.seek(0)
                 st.download_button("🖼️ Télécharger en PNG", image_buf, f"choch_signaux_{timestamp}.png", "image/png")
-            except Exception as e:
-                st.warning(f"Erreur lors de l'export PNG : {e}")
+            except Exception as e: st.warning(f"Erreur lors de l'export PNG : {e}")
 
-            # PDF Export (CORRIGÉ POUR GERER PLUSIEURS PAGES)
             try:
                 pdf = FPDF(orientation='L', unit='mm', format='A4')
                 pdf.set_auto_page_break(auto=True, margin=15)
@@ -170,32 +150,18 @@ def main():
                 pdf.set_font("Arial", 'B', 16)
                 pdf.cell(0, 10, "Rapport des Signaux CHoCH", 0, 1, 'C')
                 pdf.set_font("Arial", size=10)
-                
-                rows_per_page = 20 # Ajustez ce nombre selon vos préférences
+                rows_per_page = 20
                 for i in range(0, len(df_to_export), rows_per_page):
-                    if i > 0: # Si ce n'est pas la première page, on en ajoute une nouvelle
-                        pdf.add_page()
-                    
+                    if i > 0: pdf.add_page()
                     chunk = df_to_export.iloc[i:i+rows_per_page]
-                    
-                    # Générer une image temporaire pour ce morceau de tableau
                     img_temp_path = f"temp_chunk_{i}.png"
                     dfi.export(chunk, img_temp_path, table_conversion='matplotlib')
-                    
-                    # Ajouter l'image au PDF
-                    pdf.image(img_temp_path, x=10, y=pdf.get_y(), w=277) # w=297mm - 2*10mm de marge
-                    
-                    # Supprimer l'image temporaire
+                    pdf.image(img_temp_path, x=10, y=pdf.get_y(), w=277)
                     os.remove(img_temp_path)
-                
-                # Sauvegarder le PDF
                 pdf_output = pdf.output(dest='S').encode('latin-1')
                 st.download_button("📄 Télécharger en PDF", pdf_output, f"choch_signaux_{timestamp}.pdf", "application/pdf")
+            except Exception as e: st.warning(f"Erreur lors de l'export PDF : {e}")
 
-            except Exception as e:
-                st.warning(f"Erreur lors de l'export PDF : {e}")
-
-            # --- AFFICHAGE PAR TIMEFRAME ---
             for tf_name in TIME_FRAMES.keys():
                 tf_df = full_df[full_df['Timeframe'] == tf_name].copy()
                 if not tf_df.empty:
@@ -208,12 +174,10 @@ def main():
                     styled_df = tf_df.drop(columns=['Timeframe']).style.applymap(color_signal, subset=['Signal']).applymap(style_order, subset=['Ordre'])
                     st.dataframe(styled_df, hide_index=True, use_container_width=True)
 
-        # Affichage des scans échoués
         if 'failed_scans' in st.session_state and st.session_state['failed_scans']:
             with st.expander("⚠️ Voir le rapport des scans ayant échoué"):
                 st.markdown("\n".join(st.session_state['failed_scans']))
 
 if __name__ == "__main__":
     main()
-
 
