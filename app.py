@@ -10,7 +10,7 @@ from fpdf import FPDF
 import dataframe_image as dfi
 import os
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION (inchangée) ---
 INSTRUMENTS_TO_SCAN = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
     "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
@@ -18,13 +18,11 @@ INSTRUMENTS_TO_SCAN = [
     "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY", "NZD_JPY", "NZD_CAD", "NZD_CHF",
     "XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD"
 ]
-TIME_FRAMES = {
-    "H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"
-}
+TIME_FRAMES = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
 FRACTAL_LENGTH = 5
 RECENT_BARS_THRESHOLD = 10
 
-# --- Fonctions ---
+# --- Fonctions (inchangées) ---
 def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3, retry_delay=5):
     params = {"count": count, "granularity": granularity}
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
@@ -38,7 +36,6 @@ def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3
                 for c in data if c['complete']
             ])
             if df.empty: return None, f"DataFrame vide après traitement pour {instrument} sur {granularity}."
-            df['time'] = pd.to_datetime(df['time'])
             return df, "Succès"
         except oandapyV20.exceptions.V20Error as e:
             error_message = f"Erreur API OANDA (tentative {attempt + 1}/{max_retries}): {e}"
@@ -55,9 +52,7 @@ def detect_choch(df, length=5):
     p = length // 2
     df['is_bull_fractal'] = (df['high'] == df['high'].rolling(window=length, center=True, min_periods=length).max())
     df['is_bear_fractal'] = (df['low'] == df['low'].rolling(window=length, center=True, min_periods=length).min())
-    upper_fractal = {'value': None, 'iscrossed': True}
-    lower_fractal = {'value': None, 'iscrossed': True}
-    os = 0
+    upper_fractal, lower_fractal, os = {'value': None, 'iscrossed': True}, {'value': None, 'iscrossed': True}, 0
     choch_signal, choch_time, choch_bar_index = None, None, -1
     for i in range(length, len(df)):
         if df['is_bull_fractal'].iloc[i - p]: upper_fractal = {'value': df['high'].iloc[i - p], 'iscrossed': False}
@@ -93,11 +88,16 @@ def main():
     except (KeyError, FileNotFoundError):
         st.error("Erreur : Veuillez configurer OANDA_ACCESS_TOKEN dans les secrets de Streamlit.")
         st.stop()
-
-    results_placeholder = st.empty()
-
-    if st.button('Lancer le Scan'):
-        results_placeholder.empty()
+    
+    # --- MODIFICATION CLÉ : Logique du bouton de scan ---
+    # Le bouton va maintenant lancer le scan ET stocker les résultats dans st.session_state
+    if st.button('Lancer un nouveau Scan'):
+        # On nettoie les anciens résultats s'ils existent
+        if 'scan_results' in st.session_state:
+            del st.session_state['scan_results']
+        if 'failed_scans' in st.session_state:
+            del st.session_state['failed_scans']
+            
         try:
             api_client = API(access_token=OANDA_ACCESS_TOKEN)
         except Exception as e:
@@ -106,7 +106,7 @@ def main():
 
         with st.spinner('Scan en cours...'):
             results = []
-            failed_scans = []
+            failed = []
             total_scans = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
             progress_bar = st.progress(0)
             progress_status = st.empty()
@@ -116,102 +116,102 @@ def main():
                     progress_value = (i * len(TIME_FRAMES) + j + 1) / total_scans
                     progress_bar.progress(progress_value)
                     progress_status.text(f"Scan de {instrument} sur {tf_name}...")
-                    
                     df, status_message = get_oanda_data(api_client, instrument, tf_code)
-                    
                     if df is not None:
                         signal, signal_time = detect_choch(df, length=FRACTAL_LENGTH)
                         if signal:
                             action = "Achat" if "Bullish" in signal else "Vente"
-                            results.append({
-                                "Instrument": instrument.replace("_", "/"), "Timeframe": tf_name, "Ordre": action,
-                                "Signal": signal, "Heure (UTC)": signal_time
-                            })
+                            results.append({"Instrument": instrument.replace("_", "/"), "Timeframe": tf_name, "Ordre": action, "Signal": signal, "Heure (UTC)": signal_time})
                     else:
-                        failed_scans.append(f"- **{instrument} ({tf_name})**: {status_message}")
-                    
+                        failed.append(f"- **{instrument} ({tf_name})**: {status_message}")
                     time_module.sleep(0.5)
             
             progress_status.success("Scan terminé !")
+            
+            # NOUVEAU : On sauvegarde les résultats dans la session
+            st.session_state['scan_results'] = pd.DataFrame(results) if results else None
+            st.session_state['failed_scans'] = failed if failed else None
+            st.experimental_rerun() # On force la ré-exécution pour afficher les résultats proprement
 
-            with results_placeholder.container():
-                if not results:
-                    st.success("✅ Aucun signal de CHoCH récent détecté.")
-                else:
-                    full_df = pd.DataFrame(results)
-                    full_df['Heure (UTC)'] = pd.to_datetime(full_df['Heure (UTC)'])
+    # --- MODIFICATION CLÉ : Logique d'affichage ---
+    # On affiche les résultats s'ils sont présents dans st.session_state
+    # Cela fonctionnera même après un téléchargement
+    if 'scan_results' in st.session_state:
+        full_df = st.session_state['scan_results']
 
-                    # <<< CORRECTION : Le code d'exportation a été réintégré ici >>>
-                    st.markdown("### 📤 Exporter les résultats")
-                    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
+        if full_df is None or full_df.empty:
+            st.success("✅ Aucun signal de CHoCH récent détecté.")
+        else:
+            full_df['Heure (UTC)'] = pd.to_datetime(full_df['Heure (UTC)'])
 
-                    # CSV Export
-                    csv = full_df.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 Télécharger en CSV", csv, f"choch_signaux_{timestamp}.csv", "text/csv")
+            # --- EXPORT SECTION ---
+            st.markdown("### 📤 Exporter les résultats")
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
+            df_to_export = full_df.copy() # On utilise une copie pour l'export
 
-                    # PNG Export
-                    try:
-                        image_buf = io.BytesIO()
-                        # On retire la colonne vide ' ' pour un export plus propre
-                        df_to_export = full_df.drop(columns=[' '], errors='ignore')
-                        dfi.export(df_to_export, image_buf, table_conversion='matplotlib')
-                        image_buf.seek(0)
-                        st.download_button("🖼 Télécharger en PNG", image_buf, f"choch_signaux_{timestamp}.png", "image/png")
-                    except Exception as e:
-                        st.warning(f"Erreur lors de l'export PNG : {e}")
+            # CSV Export
+            csv = df_to_export.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Télécharger en CSV", csv, f"choch_signaux_{timestamp}.csv", "text/csv")
 
-                    # PDF Export
-                    try:
-                        img_temp_path = f"temp_table_img_{timestamp}.png"
-                        # On retire la colonne vide ' ' pour un export plus propre
-                        df_to_export = full_df.drop(columns=[' '], errors='ignore')
-                        dfi.export(df_to_export, img_temp_path, table_conversion='matplotlib')
-                        
-                        pdf = FPDF(orientation='L', unit='mm', format='A4') # 'L' for landscape
-                        pdf.add_page()
-                        pdf.set_font("Arial", size=12)
-                        pdf.cell(280, 10, txt="Rapport des Signaux CHoCH", ln=True, align='C')
-                        
-                        # Placer l'image en s'assurant qu'elle ne dépasse pas les marges
-                        pdf.image(img_temp_path, x=10, y=25, w=277) # w=297-10-10
-                        
-                        pdf_output_path = f"choch_signaux_{timestamp}.pdf"
-                        pdf.output(pdf_output_path)
+            # PNG Export
+            try:
+                image_buf = io.BytesIO()
+                dfi.export(df_to_export, image_buf, table_conversion='matplotlib')
+                image_buf.seek(0)
+                st.download_button("🖼️ Télécharger en PNG", image_buf, f"choch_signaux_{timestamp}.png", "image/png")
+            except Exception as e:
+                st.warning(f"Erreur lors de l'export PNG : {e}")
 
-                        with open(pdf_output_path, "rb") as f:
-                            st.download_button("📄 Télécharger en PDF", f.read(), f"choch_signaux_{timestamp}.pdf", "application/pdf")
-
-                        # Nettoyage des fichiers temporaires
-                        if os.path.exists(img_temp_path):
-                            os.remove(img_temp_path)
-                        if os.path.exists(pdf_output_path):
-                            os.remove(pdf_output_path)
-                    except Exception as e:
-                        st.warning(f"Erreur lors de l'export PDF : {e}")
-                    # <<< FIN DE LA SECTION CORRIGÉE >>>
-
-                    # --- AFFICHAGE PAR TIMEFRAME ---
-                    for tf_name, tf_code in TIME_FRAMES.items():
-                        tf_df = full_df[full_df['Timeframe'] == tf_name].copy()
-                        if not tf_df.empty:
-                            tf_df = tf_df.sort_values(by='Heure (UTC)', ascending=False)
-                            tf_df.insert(0, ' ', ['⭐'] + [''] * (len(tf_df) - 1))
-                            tf_df['Heure (UTC)'] = tf_df['Heure (UTC)'].dt.strftime('%Y-%m-%d %H:%M')
-
-                            st.subheader(f"--- Signaux {tf_name} ---")
-
-                            def color_signal(val): return f'color: {"#089981" if "Bullish" in val else "#f23645"}; font-weight: bold;'
-                            def style_order(val): return f'background-color: {"#089981" if val == "Achat" else "#f23645"}; color: white; border-radius: 5px; text-align: center; font-weight: bold;'
-
-                            styled_df = tf_df.drop(columns=['Timeframe']).style\
-                                .applymap(color_signal, subset=['Signal'])\
-                                .applymap(style_order, subset=['Ordre'])
-
-                            st.dataframe(styled_df, hide_index=True, use_container_width=True)
+            # PDF Export (CORRIGÉ POUR GERER PLUSIEURS PAGES)
+            try:
+                pdf = FPDF(orientation='L', unit='mm', format='A4')
+                pdf.set_auto_page_break(auto=True, margin=15)
+                pdf.add_page()
+                pdf.set_font("Arial", 'B', 16)
+                pdf.cell(0, 10, "Rapport des Signaux CHoCH", 0, 1, 'C')
+                pdf.set_font("Arial", size=10)
                 
-                if failed_scans:
-                    with st.expander("⚠️ Voir le rapport des scans ayant échoué"):
-                        st.markdown("\n".join(failed_scans))
+                rows_per_page = 20 # Ajustez ce nombre selon vos préférences
+                for i in range(0, len(df_to_export), rows_per_page):
+                    if i > 0: # Si ce n'est pas la première page, on en ajoute une nouvelle
+                        pdf.add_page()
+                    
+                    chunk = df_to_export.iloc[i:i+rows_per_page]
+                    
+                    # Générer une image temporaire pour ce morceau de tableau
+                    img_temp_path = f"temp_chunk_{i}.png"
+                    dfi.export(chunk, img_temp_path, table_conversion='matplotlib')
+                    
+                    # Ajouter l'image au PDF
+                    pdf.image(img_temp_path, x=10, y=pdf.get_y(), w=277) # w=297mm - 2*10mm de marge
+                    
+                    # Supprimer l'image temporaire
+                    os.remove(img_temp_path)
+                
+                # Sauvegarder le PDF
+                pdf_output = pdf.output(dest='S').encode('latin-1')
+                st.download_button("📄 Télécharger en PDF", pdf_output, f"choch_signaux_{timestamp}.pdf", "application/pdf")
+
+            except Exception as e:
+                st.warning(f"Erreur lors de l'export PDF : {e}")
+
+            # --- AFFICHAGE PAR TIMEFRAME ---
+            for tf_name in TIME_FRAMES.keys():
+                tf_df = full_df[full_df['Timeframe'] == tf_name].copy()
+                if not tf_df.empty:
+                    tf_df = tf_df.sort_values(by='Heure (UTC)', ascending=False)
+                    tf_df.insert(0, ' ', ['⭐'] + [''] * (len(tf_df) - 1))
+                    tf_df['Heure (UTC)'] = tf_df['Heure (UTC)'].dt.strftime('%Y-%m-%d %H:%M')
+                    st.subheader(f"--- Signaux {tf_name} ---")
+                    def color_signal(val): return f'color: {"#089981" if "Bullish" in val else "#f23645"}; font-weight: bold;'
+                    def style_order(val): return f'background-color: {"#089981" if val == "Achat" else "#f23645"}; color: white; border-radius: 5px; text-align: center; font-weight: bold;'
+                    styled_df = tf_df.drop(columns=['Timeframe']).style.applymap(color_signal, subset=['Signal']).applymap(style_order, subset=['Ordre'])
+                    st.dataframe(styled_df, hide_index=True, use_container_width=True)
+
+        # Affichage des scans échoués
+        if 'failed_scans' in st.session_state and st.session_state['failed_scans']:
+            with st.expander("⚠️ Voir le rapport des scans ayant échoué"):
+                st.markdown("\n".join(st.session_state['failed_scans']))
 
 if __name__ == "__main__":
     main()
