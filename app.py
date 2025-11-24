@@ -186,27 +186,24 @@ def detect_choch_optimized(df, instrument, tf_code, length=None):
 
 def scan_instrument_timeframe(api_client, instrument, tf_name, tf_code):
     """Fonction pour scanner un couple instrument/timeframe"""
-    try:
-        df, status_message = get_oanda_data(api_client, instrument, tf_code)
-        
-        if df is not None:
-            signal, signal_time, confirmation = detect_choch_optimized(df, instrument, tf_code)
-            if signal and signal_time is not None and confirmation is not None:
-                action = "Achat" if "Bullish" in signal else "Vente"
-                volatility = VOLATILITY_LEVELS.get(instrument, "Inconnue")
-                return {
-                    "Instrument": instrument.replace("_", "/"),
-                    "Timeframe": tf_name,
-                    "Ordre": action,
-                    "Signal": signal,
-                    "Volatilité": volatility,
-                    "Force": confirmation,
-                    "Heure (UTC)": signal_time
-                }
-        
-        return {"error": True, "instrument": instrument, "tf": tf_name, "message": status_message}
-    except Exception as e:
-        return {"error": True, "instrument": instrument, "tf": tf_name, "message": str(e)}
+    df, status_message = get_oanda_data(api_client, instrument, tf_code)
+    
+    if df is not None:
+        signal, signal_time, confirmation = detect_choch_optimized(df, instrument, tf_code)
+        if signal:
+            action = "Achat" if "Bullish" in signal else "Vente"
+            volatility = VOLATILITY_LEVELS.get(instrument, "Inconnue")
+            return {
+                "Instrument": instrument.replace("_", "/"),
+                "Timeframe": tf_name,
+                "Ordre": action,
+                "Signal": signal,
+                "Volatilité": volatility,
+                "Force": confirmation,
+                "Heure (UTC)": signal_time
+            }
+    
+    return {"error": True, "instrument": instrument, "tf": tf_name, "message": status_message}
 
 def main():
     st.set_page_config(page_title="Scanner de CHoCH", layout="wide")
@@ -343,7 +340,7 @@ def main():
                         .applymap(style_order, subset=['Ordre']) \
                         .applymap(style_volatility, subset=['Volatilité']) \
                         .applymap(style_force, subset=['Force'])
-                    st.dataframe(styled_df, hide_index=True, use_container_width=True, height=35 + len(tf_df) * 35)
+                    st.dataframe(styled_df, hide_index=True, use_container_width=True)
 
         if 'failed_scans' in st.session_state and st.session_state['failed_scans']:
             with st.expander("⚠️ Voir le rapport des scans ayant échoué"):
