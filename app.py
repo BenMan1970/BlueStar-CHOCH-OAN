@@ -1,5 +1,5 @@
-# APP.PY — VERSION RÉPARÉE 100% OANDA (PDF inclus) 
-# Aucun module Binance utilisé — plus aucune erreur de type ModuleNotFoundError
+# APP.PY — VERSION RÉPARÉE 100% OANDA (PDF inclus)
+# Correction de la syntaxe et cohérence générale
 
 import streamlit as st
 import pandas as pd
@@ -28,16 +28,39 @@ INSTRUMENTS_TO_SCAN = [
 ]
 
 VOLATILITY_LEVELS = {
-    "EUR_USD": "Basse", "GBP_USD": "Basse", "USD_JPY": "Basse", "USD_CHF": "Basse",
-    "USD_CAD": "Basse", "AUD_USD": "Moyenne", "NZD_USD": "Moyenne",
-    "EUR_GBP": "Moyenne", "EUR_JPY": "Moyenne", "EUR_CHF": "Moyenne",
-    "EUR_AUD": "Moyenne", "EUR_CAD": "Moyenne", "EUR_NZD": "Moyenne",
-    "GBP_JPY": "Haute", "GBP_CHF": "Haute", "GBP_AUD": "Haute", "GBP_CAD": "Haute", "GBP_NZD": "Haute",
-    "AUD_JPY": "Haute", "AUD_CAD": "Moyenne", "AUD_CHF": "Haute", "AUD_NZD": "Moyenne",
-    "CAD_JPY": "Haute", "CAD_CHF": "Haute", "CHF_JPY": "Haute", "NZD_JPY": "Haute",
-    "NZD_CAD": "Moyenne", "NZD_CHF": "Haute",
-    "XAU_USD": "Très Haute", "US30_USD": "Très Haute", "NAS100_USD": "Très Haute", "SPX500_USD": "Très Haute"
-]
+    "EUR_USD": "Basse",
+    "GBP_USD": "Basse",
+    "USD_JPY": "Basse",
+    "USD_CHF": "Basse",
+    "USD_CAD": "Basse",
+    "AUD_USD": "Moyenne",
+    "NZD_USD": "Moyenne",
+    "EUR_GBP": "Moyenne",
+    "EUR_JPY": "Moyenne",
+    "EUR_CHF": "Moyenne",
+    "EUR_AUD": "Moyenne",
+    "EUR_CAD": "Moyenne",
+    "EUR_NZD": "Moyenne",
+    "GBP_JPY": "Haute",
+    "GBP_CHF": "Haute",
+    "GBP_AUD": "Haute",
+    "GBP_CAD": "Haute",
+    "GBP_NZD": "Haute",
+    "AUD_JPY": "Haute",
+    "AUD_CAD": "Moyenne",
+    "AUD_CHF": "Haute",
+    "AUD_NZD": "Moyenne",
+    "CAD_JPY": "Haute",
+    "CAD_CHF": "Haute",
+    "CHF_JPY": "Haute",
+    "NZD_JPY": "Haute",
+    "NZD_CAD": "Moyenne",
+    "NZD_CHF": "Haute",
+    "XAU_USD": "Très Haute",
+    "US30_USD": "Très Haute",
+    "NAS100_USD": "Très Haute",
+    "SPX500_USD": "Très Haute"
+}
 
 TIME_FRAMES = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
 FRACTAL_LENGTHS_BY_TF = {"H1": 5, "H4": 6, "D": 7, "W": 8}
@@ -60,7 +83,7 @@ def calculate_atr(df, period=14):
     l = df['low'].values
     c = df['close'].values
     prev_c = np.roll(c, 1)
-    tr = np.maximum(h - l, np.maximum(abs(h - prev_c), abs(l - prev_c)))[1:]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))[1:]
     return tr[-period:].mean() if len(tr) >= period else None
 
 # ───────────────────────────────────────────
@@ -76,14 +99,16 @@ def get_oanda_data(instrument, granularity):
             candles = r.response.get('candles', [])
             data = []
             for c in candles:
-                if c['complete']:
-                    m = c['mid']
-                    data.append([
-                        pd.to_datetime(c['time']), float(m['o']), float(m['h']), float(m['l']), float(m['c'])
-                    ])
+                if c.get('complete'):
+                    m = c.get('mid', {})
+                    if all(k in m for k in ('o','h','l','c')):
+                        data.append([
+                            pd.to_datetime(c['time']),
+                            float(m['o']), float(m['h']), float(m['l']), float(m['c'])
+                        ])
             if data:
                 return pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close'])
-        except:
+        except Exception:
             time_module.sleep(1)
     return None
 
@@ -97,17 +122,20 @@ def detect_choch(df, tf_code):
     length = FRACTAL_LENGTHS_BY_TF.get(tf_code, 5)
     p = length // 2
 
-    high = df.high.values
-    low = df.low.values
-    close = df.close.values
+    high = df['high'].values
+    low = df['low'].values
+    close = df['close'].values
 
-    is_bull = np.zeros(len(df), bool)
-    is_bear = np.zeros(len(df), bool)
+    is_bull = np.zeros(len(df), dtype=bool)
+    is_bear = np.zeros(len(df), dtype=bool)
 
     for i in range(p, len(df) - p):
-        w = slice(i-p, i+p+1)
-        is_bull[i] = high[i] == np.max(high[w])
-        is_bear[i] = low[i] == np.min(low[w])
+        window_high = high[i-p:i+p+1]
+        window_low = low[i-p:i+p+1]
+        if high[i] == np.max(window_high):
+            is_bull[i] = True
+        if low[i] == np.min(window_low):
+            is_bear[i] = True
 
     upper_fr = None
     lower_fr = None
@@ -123,29 +151,58 @@ def detect_choch(df, tf_code):
     bar_idx = None
 
     for i in range(len(df)):
-        if is_bull[i]: upper_fr = high[i]
-        if is_bear[i]: lower_fr = low[i]
+        if is_bull[i]:
+            upper_fr = high[i]
+        if is_bear[i]:
+            lower_fr = low[i]
 
-        if order_state == -1 and upper_fr and close[i] > upper_fr:
+        if order_state == -1 and upper_fr is not None and close[i] > upper_fr:
             bar_idx = i
             move = close[i] - upper_fr
-            strength = "Fort" if atr and move > atr*0.5 else "Moyen"
+            strength = "Fort" if (atr is not None and move > atr * 0.5) else "Moyen"
             signal = "Bullish CHoCH"
-            time_sig = df.time.iloc[i]
+            time_sig = df['time'].iloc[i]
             order_state = 1
 
-        if order_state == 1 and lower_fr and close[i] < lower_fr:
+        if order_state == 1 and lower_fr is not None and close[i] < lower_fr:
             bar_idx = i
             move = lower_fr - close[i]
-            strength = "Fort" if atr and move > atr*0.5 else "Moyen"
+            strength = "Fort" if (atr is not None and move > atr * 0.5) else "Moyen"
             signal = "Bearish CHoCH"
-            time_sig = df.time.iloc[i]
+            time_sig = df['time'].iloc[i]
             order_state = -1
 
-    if signal and bar_idx and (len(df) - bar_idx) < RECENT_BARS_THRESHOLD:
+    if signal and bar_idx is not None and (len(df) - 1 - bar_idx) <= RECENT_BARS_THRESHOLD:
         return signal, time_sig, strength
 
     return None, None, None
+
+# ───────────────────────────────────────────
+# PDF helper
+class PDF(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 12)
+        self.cell(0, 10, 'Rapport CHoCH', 0, 1, 'C')
+        self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+
+
+def create_pdf(df):
+    pdf = PDF()
+    pdf.add_page()
+    pdf.set_font('Arial', size=12)
+    pdf.cell(0, 10, 'Signaux CHoCH', ln=True)
+    pdf.ln(4)
+    for idx, row in df.iterrows():
+        pdf.cell(0, 8, f"{row['Instrument']} | {row['Timeframe']} | {row['Ordre']} | {row['Signal']} | {row['Force']} | {row['Heure (UTC)']}", ln=True)
+    out = io.BytesIO()
+    pdf.output(out)
+    out.seek(0)
+    return out
 
 # ───────────────────────────────────────────
 # STREAMLIT UI
@@ -153,49 +210,44 @@ st.set_page_config(page_title="Scanner CHoCH", layout="wide")
 st.markdown("<h1 style='text-align:center;'>Scanner CHoCH (OANDA)</h1>", unsafe_allow_html=True)
 
 try:
-    OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
-except:
-    st.error("OANDA_ACCESS_TOKEN manquant dans Secrets")
+    OANDA_ACCESS_TOKEN = st.secrets['OANDA_ACCESS_TOKEN']
+except Exception:
+    st.error('OANDA_ACCESS_TOKEN manquant dans Secrets')
     st.stop()
 
 api_client = API(access_token=OANDA_ACCESS_TOKEN)
 
-if st.button("Lancer un Scan", type="primary"):
+if st.button('Lancer un Scan', type='primary'):
     st.session_state.clear()
-    with st.spinner("Scan en cours..."):
+    with st.spinner('Scan en cours...'):
         results = []
-
         for instrument in INSTRUMENTS_TO_SCAN:
             for tf_name, tf_code in TIME_FRAMES.items():
                 df = get_oanda_data(instrument, tf_code)
                 sig, t, f = detect_choch(df, tf_code)
                 if sig:
                     results.append({
-                        "Instrument": instrument.replace("_", "/"),
-                        "Timeframe": tf_name,
-                        "Ordre": "Achat" if "Bullish" in sig else "Vente",
-                        "Signal": sig,
-                        "Volatilité": VOLATILITY_LEVELS.get(instrument, "Inconnue"),
-                        "Force": f,
-                        "Heure (UTC)": t
+                        'Instrument': instrument.replace('_', '/'),
+                        'Timeframe': tf_name,
+                        'Ordre': 'Achat' if 'Bullish' in sig else 'Vente',
+                        'Signal': sig,
+                        'Volatilité': VOLATILITY_LEVELS.get(instrument, 'Inconnue'),
+                        'Force': f or 'Moyen',
+                        'Heure (UTC)': t
                     })
-
         st.session_state.results = pd.DataFrame(results)
-
     st.rerun()
 
-# ───────────────────────────────────────────
 # AFFICHAGE
-if "results" in st.session_state:
+if 'results' in st.session_state:
     df = st.session_state.results
     if df.empty:
-        st.success("Aucun signal trouvé")
+        st.success('Aucun signal trouvé')
     else:
-        df["Heure (UTC)"] = pd.to_datetime(df["Heure (UTC)"]).dt.strftime("%d/%m %H:%M")
+        df['Heure (UTC)'] = pd.to_datetime(df['Heure (UTC)']).dt.strftime('%d/%m %H:%M')
         st.dataframe(df, use_container_width=True)
-
         csv = df.to_csv(index=False).encode()
-        st.download_button("Télécharger CSV", csv, "signals.csv")
+        st.download_button('Télécharger CSV', csv, 'signals.csv', 'text/csv')
 
-
-               
+        pdf_bytes = create_pdf(df)
+        st.download_button('Télécharger PDF', pdf_bytes, 'signals.pdf', 'application/pdf')
