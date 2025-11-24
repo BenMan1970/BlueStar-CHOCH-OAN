@@ -1,4 +1,4 @@
-# app.py → VERSION FINALE RÉPARÉE (24/11/2025)
+# app.py → VERSION FINALE (LOGIQUE CHOCH RÉPARÉE)
 
 import streamlit as st
 import pandas as pd
@@ -15,10 +15,10 @@ import numpy as np
 import threading
 import warnings
 
-# ─── SUPPRESSION DES WARNINGS JAUNES (Python 3.13+) ─────────────────────
+# ─── SUPPRESSION DES WARNINGS JAUNES ────────────────────────────────────
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="oandapyV20")
 
-# ─── CONFIGURATION (exactement comme ton premier code) ──────────────────
+# ─── CONFIGURATION ──────────────────────────────────────────────────────
 INSTRUMENTS_TO_SCAN = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
     "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
@@ -43,6 +43,7 @@ VOLATILITY_LEVELS = {
 
 TIME_FRAMES = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
 FRACTAL_LENGTHS_BY_TF = {"H1": 5, "H4": 6, "D": 7, "W": 8}
+
 RECENT_BARS_THRESHOLD = 10
 MAX_WORKERS = 5
 REQUEST_DELAY = 0.09
@@ -53,23 +54,24 @@ def delay():
     with lock:
         time_module.sleep(REQUEST_DELAY)
 
-# ─── CHARGEMENT TOKEN ────────────────────────────────────────────────
+# ─── CHARGEMENT TOKEN ──────────────────────────────────────────────────
 try:
     OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
 except:
     st.error("OANDA_ACCESS_TOKEN manquant dans Secrets")
     st.stop()
 
-# FIX : api_client doit être créé avant tout appel
 api_client = API(access_token=OANDA_ACCESS_TOKEN)
 
-# ─── ATR + DONNÉES ─────────────────────────────────────────────────────
+# ─── ATR ────────────────────────────────────────────────────────────────
 def calculate_atr(df, period=14):
-    if len(df) < period + 5: return None
+    if len(df) < period + 5:
+        return None
     h, l, c = df['high'].values, df['low'].values, df['close'].values
     tr = np.maximum(h-l, np.maximum(np.abs(h - np.roll(c,1)), np.abs(l - np.roll(c,1))))[1:]
     return np.mean(tr[-period:]) if len(tr) >= period else None
 
+# ─── DONNÉES OANDA ─────────────────────────────────────────────────────
 def get_oanda_data(instrument, granularity):
     params = {"count": 260, "granularity": granularity}
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
@@ -83,72 +85,90 @@ def get_oanda_data(instrument, granularity):
             for c in candles:
                 if c['complete']:
                     m = c['mid']
-                    data.append([pd.to_datetime(c['time']), float(m['o']), float(m['h']), float(m['l']), float(m['c'])])
+                    data.append([
+                        pd.to_datetime(c['time']),
+                        float(m['o']), float(m['h']),
+                        float(m['l']), float(m['c'])
+                    ])
             if data:
-                df = pd.DataFrame(data, columns=['time','open','high','low','close'])
-                return df
+                return pd.DataFrame(data, columns=['time','open','high','low','close'])
         except:
             time_module.sleep(1)
+
     return None
 
-# ─── DÉTECTION CHOCH ──────────────────────────────────────────────────
+# ─── LOGIQUE CHOCH RÉPARÉE ─────────────────────────────────────────────
 def detect_choch(df, tf_code):
-    if df is None or len(df) < 30:
+    if df is None or len(df) < 40:
         return None, None, None
 
     length = FRACTAL_LENGTHS_BY_TF.get(tf_code, 5)
     p = length // 2
-    if len(df) <= length + p:
-        return None, None, None
 
-    high = df['high'].values
-    low = df['low'].values
-    close = df['close'].values
-    atr = calculate_atr(df)
+    high = df["high"].values
+    low = df["low"].values
+    close = df["close"].values
 
     is_bull = np.zeros(len(df), bool)
     is_bear = np.zeros(len(df), bool)
 
-    for i in range(p, len(df)-p):
-        if high[i] == np.max(high[i-p:i+p+1]): is_bull[i] = True
-        if low[i]  == np.min(low[i-p:i+p+1]):  is_bear[i] = True
+    for i in range(p, len(df) - p):
+        if high[i] == np.max(high[i-p:i+p+1]):
+            is_bull[i] = True
+        if low[i] == np.min(low[i-p:i+p+1]):
+            is_bear[i] = True
 
-    upper_fr = lower_fr = None
-    order_state = 0
-    signal = time_sig = strength = bar_idx = None
+    # -------- Structure initiale --------
+    if close[-1] > close[-10]:
+        order_state = 1   # haussier
+    else:
+        order_state = -1  # baissier
 
-    for i in range(length, len(df)):
-        if is_bull[i-p]: upper_fr = high[i-p]
-        if is_bear[i-p]: lower_fr = low[i-p]
+    upper_fr = None
+    lower_fr = None
+    signal = None
+    bar_idx = None
+    time_sig = None
 
-        if order_state == -1 and upper_fr is not None and close[i] > upper_fr >= close[i-1]:
+    atr = calculate_atr(df)
+
+    for i in range(len(df)):
+        if is_bull[i]:
+            upper_fr = high[i]
+        if is_bear[i]:
+            lower_fr = low[i]
+
+        # BULLISH CHoCH
+        if order_state == -1 and upper_fr and close[i] > upper_fr:
             bar_idx = i
             move = close[i] - upper_fr
-            strength = "Fort" if atr and move > atr*0.5 else "Moyen"
+            strength = "Fort" if atr and move > atr * 0.5 else "Moyen"
             signal = "Bullish CHoCH"
-            time_sig = df['time'].iloc[i]
+            time_sig = df["time"].iloc[i]
             order_state = 1
 
-        if order_state == 1 and lower_fr is not None and close[i] < lower_fr <= close[i-1]:
+        # BEARISH CHoCH
+        if order_state == 1 and lower_fr and close[i] < lower_fr:
             bar_idx = i
             move = lower_fr - close[i]
-            strength = "Fort" if atr and move > atr*0.5 else "Moyen"
+            strength = "Fort" if atr and move > atr * 0.5 else "Moyen"
             signal = "Bearish CHoCH"
-            time_sig = df['time'].iloc[i]
+            time_sig = df["time"].iloc[i]
             order_state = -1
 
-    if signal and bar_idx is not None and (len(df) - 1 - bar_idx) < RECENT_BARS_THRESHOLD:
+    if signal and bar_idx is not None and (len(df) - 1 - bar_idx) <= RECENT_BARS_THRESHOLD:
         return signal, time_sig, strength
 
     return None, None, None
 
-# ─── SCAN PAR PAIRE/TF ────────────────────────────────────────────────
+# ─── SCAN PAR PAIRE ────────────────────────────────────────────────────
 def scan_pair_tf(instrument, tf_name, tf_code):
     df = get_oanda_data(instrument, tf_code)
     if df is None:
         return {"error": f"Pas de données pour {instrument} {tf_name}"}
 
     sig, t, force = detect_choch(df, tf_code)
+
     if sig:
         return {
             "Instrument": instrument.replace("_", "/"),
@@ -159,6 +179,7 @@ def scan_pair_tf(instrument, tf_name, tf_code):
             "Force": force or "Moyen",
             "Heure (UTC)": t
         }
+
     return None
 
 # ─── STREAMLIT UI ──────────────────────────────────────────────────────
@@ -168,6 +189,7 @@ st.markdown("<h1 style='text-align:center;'>Scanner Change of Character (CHoCH)<
 if st.button("Lancer un nouveau Scan", type="primary"):
     st.session_state.clear()
     with st.spinner("Scan en cours..."):
+
         results = []
         failed = []
         total = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
@@ -175,57 +197,7 @@ if st.button("Lancer un nouveau Scan", type="primary"):
         status = st.empty()
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(scan_pair_tf, i, n, c): (i, n)
-                for i in INSTRUMENTS_TO_SCAN
-                for n, c in TIME_FRAMES.items()
-            }
+            futures
 
-            done = 0
-            for f in as_completed(futures):
-                done += 1
-                bar.progress(done / total)
-                status.text(f"{done}/{total}")
-                res = f.result()
-                if isinstance(res, dict) and "error" in res:
-                    failed.append(res["error"])
-                elif res:
-                    results.append(res)
 
-        df_results = pd.DataFrame(results) if results else pd.DataFrame()
-        st.session_state.results = df_results
-        st.session_state.failed = failed
-
-    st.rerun()
-
-# ─── AFFICHAGE ─────────────────────────────────────────────────────────
-if "results" in st.session_state:
-    df = st.session_state.results
-
-    if df.empty:
-        st.success("Aucun signal CHoCH récent détecté")
-    else:
-        df["Heure (UTC)"] = pd.to_datetime(df["Heure (UTC)"]).dt.strftime("%d/%m %H:%M")
-        csv = df.to_csv(index=False).encode()
-        st.download_button("Télécharger CSV", csv, "choch_signaux.csv", "text/csv")
-
-        for tf in TIME_FRAMES:
-            sub = df[df["Timeframe"] == tf]
-            if sub.empty:
-                continue
-
-            sub = sub[["Instrument", "Ordre", "Signal", "Volatilité", "Force", "Heure (UTC)"]].copy()
-
-            st.subheader(f"--- {tf} ---")
-            st.dataframe(
-                sub.style
-                .map(lambda x: "color:#089981;font-weight:bold" if "Bullish" in str(x) else "color:#f23645;font-weight:bold", subset=["Signal"])
-                .map(lambda x: "background:#089981;color:white" if x == "Achat" else "background:#f23645;color:white", subset=["Ordre"]),
-                hide_index=True,
-                use_container_width=True
-            )
-
-    if st.session_state.get("failed"):
-        with st.expander("Erreurs (voir détails)"):
-            for e in st.session_state.failed:
-                st.write(f"- {e}")
+               
