@@ -244,12 +244,13 @@ if 'results' in st.session_state:
     if df.empty:
         st.success('Aucun signal trouvé')
     else:
-        df['Heure (UTC)'] = pd.to_datetime(df['Heure (UTC)']).dt.strftime('%d/%m %H:%M')
+        df['Heure (UTC)'] = pd.to_datetime(df['Heure (UTC)'], errors='coerce').dt.strftime('%d/%m %H:%M')
         st.dataframe(df, use_container_width=True)
         csv = df.to_csv(index=False).encode()
         st.download_button('Télécharger CSV', csv, 'signals.csv', 'text/csv')
 
         pdf_bytes = create_pdf(df)
         st.download_button('Télécharger PDF', pdf_bytes, 'signals.pdf', 'application/pdf')
+
 
       
