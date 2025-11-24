@@ -111,16 +111,43 @@ def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3
     
     return None, "Échec après plusieurs tentatives."
 
+def get_trend_and_levels(df):
+    """Détecte la tendance et les niveaux clés (simple et léger)"""
+    if df is None or len(df) < 20:
+        return None, None, None
+    
+    closes = df['close'].values
+    highs = df['high'].values
+    lows = df['low'].values
+    
+    # Tendance : comparer MA20 vs MA50 simplifié
+    ma_short = np.mean(closes[-20:])
+    ma_long = np.mean(closes[-50:]) if len(closes) >= 50 else np.mean(closes)
+    
+    if ma_short > ma_long * 1.002:
+        trend = "📈 Haussier"
+    elif ma_short < ma_long * 0.998:
+        trend = "📉 Baissier"
+    else:
+        trend = "↔️ Neutre"
+    
+    # Niveaux clés (résistance et support récents sur les 50 dernières bougies)
+    recent_high = np.max(highs[-50:])
+    recent_low = np.min(lows[-50:])
+    current_price = closes[-1]
+    
+    return trend, recent_high, recent_low
+
 def detect_choch_optimized(df, instrument, tf_code, length=None):
     """Détection CHoCH optimisée avec fractales adaptatives"""
     if df is None or len(df) < 10:
-        return None, None, None
+        return None, None, None, None, None
     
     if length is None:
         length = FRACTAL_LENGTHS_BY_TF.get(tf_code, FRACTAL_LENGTH)
     
     if len(df) < length:
-        return None, None, None
+        return None, None, None, None, None
     
     p = length // 2
     highs = df['high'].values
@@ -128,6 +155,7 @@ def detect_choch_optimized(df, instrument, tf_code, length=None):
     closes = df['close'].values
     
     atr = calculate_atr(df)
+    trend, resistance, support = get_trend_and_levels(df)
     
     is_bull_fractal = np.zeros(len(df), dtype=bool)
     is_bear_fractal = np.zeros(len(df), dtype=bool)
@@ -177,19 +205,20 @@ def detect_choch_optimized(df, instrument, tf_code, length=None):
                 os, lower_fractal['iscrossed'] = -1, True
     
     if choch_signal and choch_bar_index >= 0 and (len(df) - 1 - choch_bar_index) < RECENT_BARS_THRESHOLD:
-        return choch_signal, choch_time, confirmation_strength
+        return choch_signal, choch_time, confirmation_strength, trend, (resistance, support)
     
-    return None, None, None
+    return None, None, None, None, None
 
 def scan_instrument_timeframe(api_client, instrument, tf_name, tf_code):
     """Fonction pour scanner un couple instrument/timeframe"""
     df, status_message = get_oanda_data(api_client, instrument, tf_code)
     
     if df is not None and len(df) > 0:
-        signal, signal_time, confirmation = detect_choch_optimized(df, instrument, tf_code)
+        signal, signal_time, confirmation, trend, levels = detect_choch_optimized(df, instrument, tf_code)
         if signal:
             action = "Achat" if "Bullish" in signal else "Vente"
             volatility = VOLATILITY_LEVELS.get(instrument, "Inconnue")
+            resistance, support = levels if levels else (None, None)
             return {
                 "Instrument": instrument.replace("_", "/"),
                 "Timeframe": tf_name,
@@ -197,6 +226,9 @@ def scan_instrument_timeframe(api_client, instrument, tf_name, tf_code):
                 "Signal": signal,
                 "Volatilité": volatility,
                 "Force": confirmation,
+                "Tendance": trend,
+                "Résistance": round(resistance, 5) if resistance else "-",
+                "Support": round(support, 5) if support else "-",
                 "Heure (UTC)": signal_time
             }
     
@@ -359,4 +391,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-       
