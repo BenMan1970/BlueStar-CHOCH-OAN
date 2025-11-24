@@ -78,7 +78,7 @@ def delay():
 
 def calculate_atr(df, period=14):
     if len(df) < period + 5:
-        return None
+        return pdf_bytes
     h = df['high'].values
     l = df['low'].values
     c = df['close'].values
@@ -200,7 +200,7 @@ def create_pdf(df):
     for idx, row in df.iterrows():
         pdf.cell(0, 8, f"{row['Instrument']} | {row['Timeframe']} | {row['Ordre']} | {row['Signal']} | {row['Force']} | {row['Heure (UTC)']}", ln=True)
     out = io.BytesIO()
-    pdf.output(out)
+    pdf_bytes = pdf.output(dest='S').encode('latin-1')
     out.seek(0)
     return out
 
@@ -251,3 +251,5 @@ if 'results' in st.session_state:
 
         pdf_bytes = create_pdf(df)
         st.download_button('Télécharger PDF', pdf_bytes, 'signals.pdf', 'application/pdf')
+
+      
