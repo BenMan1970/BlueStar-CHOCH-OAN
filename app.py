@@ -204,6 +204,17 @@ def scan_instrument_timeframe(api_client, instrument, tf_name, tf_code):
 
 def main():
     st.set_page_config(page_title="Scanner de CHoCH", layout="wide")
+    # Masquer la barre de défilement horizontal
+    st.markdown("""
+        <style>
+            .stDataFrame {
+                width: 100%;
+            }
+            [data-testid="stHorizontalBlock"] {
+                overflow-x: auto !important;
+            }
+        </style>
+    """, unsafe_allow_html=True)
     st.markdown("""
         <div style="display: flex; align-items: center; margin-bottom: 25px;">
             <svg width="40" height="40" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-right: 10px;">
@@ -321,8 +332,9 @@ def main():
                 tf_df = full_df[full_df['Timeframe'] == tf_name].copy()
                 if not tf_df.empty:
                     tf_df = tf_df.sort_values(by='Heure (UTC)', ascending=False)
-                    tf_df.insert(0, ' ', ['⭐'] + [''] * (len(tf_df) - 1))
                     tf_df['Heure (UTC)'] = tf_df['Heure (UTC)'].dt.strftime('%Y-%m-%d %H:%M')
+                    # Ajouter l'étoile au signal le plus récent
+                    tf_df['Heure (UTC)'] = ['⭐ ' + time if i == 0 else time for i, time in enumerate(tf_df['Heure (UTC)'])]
                     st.subheader(f"--- Signaux {tf_name} ---")
                     
                     def color_signal(val):
@@ -347,3 +359,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+       
