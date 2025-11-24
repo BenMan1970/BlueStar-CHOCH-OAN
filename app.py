@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
-import oandapyV20.exceptions
 import time as time_module
 from datetime import datetime
 from fpdf import FPDF
@@ -10,7 +9,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 # --- CONFIGURATION DE LA PAGE ---
-st.set_page_config(page_title="Scanner de CHoCH", layout="wide")
+st.set_page_config(page_title="Scanner CHoCH", layout="wide")
+
+# --- CSS PERSONNALISÉ POUR AFFICHAGE PROPRE ---
+st.markdown("""
+<style>
+    .stDataFrame { width: 100% !important; }
+    div[data-testid="stExpander"] details summary p { font-size: 1.1rem; font-weight: bold; }
+</style>
+""", unsafe_allow_html=True)
 
 # --- CONSTANTES ---
 INSTRUMENTS_TO_SCAN = [
@@ -37,45 +44,29 @@ VOLATILITY_LEVELS = {
 TIME_FRAMES = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
 FRACTAL_LENGTH = 5
 RECENT_BARS_THRESHOLD = 10
-MAX_WORKERS = 5 # Réduire si vous rencontrez des erreurs de connexion
+MAX_WORKERS = 4  # Un peu réduit pour stabilité
 
-FRACTAL_LENGTHS_BY_TF = {
-    "H1": 5, "H4": 6, "D1": 7, "Weekly": 8
-}
+FRACTAL_LENGTHS_BY_TF = { "H1": 5, "H4": 6, "D1": 7, "Weekly": 8 }
 
-# --- FONCTIONS METIER ---
+# --- FONCTIONS LOGIQUES ---
 
 def calculate_atr(df, period=14):
-    """Calcule l'ATR pour mesurer la volatilité actuelle"""
-    if df is None or len(df) < period:
-        return None
-    
-    high = df['high'].values
-    low = df['low'].values
-    close = df['close'].values
-    
+    if df is None or len(df) < period: return None
+    high, low, close = df['high'].values, df['low'].values, df['close'].values
     tr1 = high[1:] - low[1:]
     tr2 = np.abs(high[1:] - close[:-1])
     tr3 = np.abs(low[1:] - close[:-1])
-    
     tr = np.maximum(tr1, np.maximum(tr2, tr3))
-    # Simple Moving Average of TR
-    atr = np.mean(tr[-period:])
-    
-    return atr
+    return np.mean(tr[-period:])
 
 def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3):
-    """Récupération robuste des données Oanda"""
     params = {"count": count, "granularity": granularity}
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
-    
     for attempt in range(max_retries):
         try:
             api_client.request(r)
             data = r.response.get('candles')
-            if not data:
-                return None, f"Aucune bougie reçue."
-            
+            if not data: return None, "Aucune donnée"
             records = []
             for c in data:
                 if c['complete']:
@@ -86,123 +77,66 @@ def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3
                         "low": float(c['mid']['l']),
                         "close": float(c['mid']['c'])
                     })
-            
-            if not records:
-                return None, f"Données vides."
-            
             return pd.DataFrame(records), "Succès"
-            
         except Exception as e:
-            if attempt + 1 == max_retries:
-                return None, str(e)
-            time_module.sleep(1) # Petit délai avant retry
-    
+            if attempt + 1 == max_retries: return None, str(e)
+            time_module.sleep(1)
     return None, "Erreur inconnue"
 
 def detect_choch_optimized(df, instrument, tf_code, length=None):
-    """Détection CHoCH optimisée"""
-    if df is None or len(df) < 50: # Besoin d'un minimum de bougies
-        return None, None, None
-    
-    if length is None:
-        length = FRACTAL_LENGTHS_BY_TF.get(tf_code, FRACTAL_LENGTH)
+    if df is None or len(df) < 50: return None, None, None
+    if length is None: length = FRACTAL_LENGTHS_BY_TF.get(tf_code, FRACTAL_LENGTH)
     
     p = length // 2
-    # Conversion en numpy arrays pour la performance
-    highs = df['high'].values
-    lows = df['low'].values
-    closes = df['close'].values
-    times = df['time'].values
-    
+    highs, lows, closes, times = df['high'].values, df['low'].values, df['close'].values, df['time'].values
     atr = calculate_atr(df)
     
-    # Détection vectorisée (partielle) des fractales
-    # Note: Une boucle complète reste plus lisible pour la logique séquentielle du CHOCH
+    upper_val, lower_val = None, None
+    upper_crossed, lower_crossed = True, True
+    os = 0
     
-    upper_fractal_val = None
-    lower_fractal_val = None
-    upper_fractal_crossed = True
-    lower_fractal_crossed = True
-    
-    os = 0 # Order Structure
-    
-    choch_signal = None
-    choch_time = None
-    choch_index = -1
-    confirmation_strength = "Neutre"
+    choch_sig, choch_t, choch_idx = None, None, -1
+    strength = "Neutre"
 
-    # On itère sur les bougies. 
-    # Attention: range doit permettre de vérifier i-p et i+p
-    start_idx = p
-    end_idx = len(df) - p - 1 # On s'arrête un peu avant la fin pour la fractale future
-    
-    # Tableaux booléens pour identifier les fractales
     is_bull = np.zeros(len(df), dtype=bool)
     is_bear = np.zeros(len(df), dtype=bool)
 
-    # 1. Identifier toutes les fractales d'abord
-    for i in range(start_idx, end_idx + 1):
-        window_high = highs[i-p : i+p+1]
-        window_low = lows[i-p : i+p+1]
-        
-        if highs[i] == np.max(window_high):
-            is_bull[i] = True
-        if lows[i] == np.min(window_low):
-            is_bear[i] = True
+    # Identification fractales
+    for i in range(p, len(df) - p):
+        if highs[i] == np.max(highs[i-p : i+p+1]): is_bull[i] = True
+        if lows[i] == np.min(lows[i-p : i+p+1]): is_bear[i] = True
 
-    # 2. Logique séquentielle pour le CHOCH
-    # On commence après p pour avoir l'historique
+    # Identification CHOCH
     for i in range(length, len(df)):
-        # Mise à jour des niveaux fractals (basé sur la fractale confirmée à i-p)
         prev_idx = i - p
         if prev_idx >= 0:
-            if is_bull[prev_idx]:
-                upper_fractal_val = highs[prev_idx]
-                upper_fractal_crossed = False
-            if is_bear[prev_idx]:
-                lower_fractal_val = lows[prev_idx]
-                lower_fractal_crossed = False
+            if is_bull[prev_idx]: upper_val, upper_crossed = highs[prev_idx], False
+            if is_bear[prev_idx]: lower_val, lower_crossed = lows[prev_idx], False
         
-        curr_c = closes[i]
-        prev_c = closes[i-1]
+        curr, prev = closes[i], closes[i-1]
 
-        # Check Bullish CHOCH
-        if upper_fractal_val is not None and not upper_fractal_crossed:
-            if curr_c > upper_fractal_val and prev_c <= upper_fractal_val:
-                if os == -1: # Changement de structure
-                    choch_signal = "Bullish CHoCH"
-                    choch_time = times[i]
-                    choch_index = i
-                    dist = curr_c - upper_fractal_val
-                    confirmation_strength = "Fort" if (atr and dist > atr * 0.3) else "Normal"
-                os = 1
-                upper_fractal_crossed = True
+        if upper_val and not upper_crossed:
+            if curr > upper_val and prev <= upper_val:
+                if os == -1:
+                    choch_sig, choch_t, choch_idx = "Bullish CHoCH", times[i], i
+                    strength = "Fort" if (atr and (curr - upper_val) > atr * 0.3) else "Moyen"
+                os, upper_crossed = 1, True
 
-        # Check Bearish CHOCH
-        if lower_fractal_val is not None and not lower_fractal_crossed:
-            if curr_c < lower_fractal_val and prev_c >= lower_fractal_val:
-                if os == 1: # Changement de structure
-                    choch_signal = "Bearish CHoCH"
-                    choch_time = times[i]
-                    choch_index = i
-                    dist = lower_fractal_val - curr_c
-                    confirmation_strength = "Fort" if (atr and dist > atr * 0.3) else "Normal"
-                os = -1
-                lower_fractal_crossed = True
+        if lower_val and not lower_crossed:
+            if curr < lower_val and prev >= lower_val:
+                if os == 1:
+                    choch_sig, choch_t, choch_idx = "Bearish CHoCH", times[i], i
+                    strength = "Fort" if (atr and (lower_val - curr) > atr * 0.3) else "Moyen"
+                os, lower_crossed = -1, True
 
-    # Vérifier si le signal est récent
-    if choch_signal and (len(df) - 1 - choch_index) <= RECENT_BARS_THRESHOLD:
-        return choch_signal, pd.to_datetime(choch_time), confirmation_strength
-    
+    if choch_sig and (len(df) - 1 - choch_idx) <= RECENT_BARS_THRESHOLD:
+        return choch_sig, pd.to_datetime(choch_t), strength
     return None, None, None
 
 def scan_wrapper(api_key, instrument, tf_name, tf_code):
-    """Wrapper pour l'exécution threadée"""
     try:
-        # Création d'une instance API par thread pour éviter les conflits
         client = API(access_token=api_key)
         df, msg = get_oanda_data(client, instrument, tf_code)
-        
         if df is not None:
             signal, sig_time, strength = detect_choch_optimized(df, instrument, tf_code)
             if signal:
@@ -211,185 +145,179 @@ def scan_wrapper(api_key, instrument, tf_name, tf_code):
                     "Timeframe": tf_name,
                     "Ordre": "Achat" if "Bullish" in signal else "Vente",
                     "Signal": signal,
-                    "Volatilité": VOLATILITY_LEVELS.get(instrument, "-"),
+                    "Volatilité": VOLATILITY_LEVELS.get(instrument, "Inconnue"),
                     "Force": strength,
                     "Heure (UTC)": sig_time
                 }
-            return None # Pas de signal
-        else:
-            return {"error": True, "msg": f"{instrument} {tf_name}: {msg}"}
+            return None
+        return {"error": True, "msg": f"{instrument} {tf_name}: {msg}"}
     except Exception as e:
-        return {"error": True, "msg": f"Crash sur {instrument}: {str(e)}"}
+        return {"error": True, "msg": f"Crash {instrument}: {str(e)}"}
 
-# --- GENERATION PDF (Native FPDF sans dataframe_image) ---
+# --- FONCTIONS STYLE ---
+def apply_custom_style(df):
+    def color_signal(val):
+        color = "#089981" if "Bullish" in str(val) else "#f23645" if "Bearish" in str(val) else "black"
+        return f'color: {color}; font-weight: bold;'
+    
+    def style_order(val):
+        bg = "#089981" if val == "Achat" else "#f23645"
+        return f'background-color: {bg}; color: white; border-radius: 4px; text-align: center; font-weight: bold;'
+    
+    def style_volatility(val):
+        colors = {"Basse": "#089981", "Moyenne": "#FFA500", "Haute": "#FF6B6B", "Très Haute": "#f23645"}
+        return f'background-color: {colors.get(val, "white")}; color: white; border-radius: 4px; text-align: center;'
+
+    def style_force(val):
+        bg = "#089981" if val == "Fort" else "#FFA500"
+        return f'background-color: {bg}; color: white; border-radius: 4px; text-align: center;'
+
+    return df.style.applymap(color_signal, subset=['Signal']) \
+                   .applymap(style_order, subset=['Ordre']) \
+                   .applymap(style_volatility, subset=['Volatilité']) \
+                   .applymap(style_force, subset=['Force']) \
+                   .format({'Heure (UTC)': lambda x: x.strftime('%Y-%m-%d %H:%M')})
+
+# --- GENERATION PDF SIMPLE ---
 class PDFReport(FPDF):
     def header(self):
-        self.set_font('Arial', 'B', 15)
+        self.set_font('Arial', 'B', 16)
         self.cell(0, 10, 'Rapport des Signaux CHoCH', 0, 1, 'C')
         self.ln(5)
 
-    def footer(self):
-        self.set_y(-15)
-        self.set_font('Arial', 'I', 8)
-        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
-
-def generate_pdf(df):
+def generate_pdf(df_full):
     pdf = PDFReport()
     pdf.add_page()
     pdf.set_font("Arial", size=10)
     
-    # Configuration des colonnes
-    cols = df.columns.tolist()
-    # Ajustement largeurs approx
-    col_widths = [30, 25, 20, 40, 25, 20, 35] 
+    # On trie pour le PDF
+    df_export = df_full.drop(columns=['Top'], errors='ignore') if 'Top' in df_full.columns else df_full
     
-    # En-têtes
-    pdf.set_font("Arial", 'B', 10)
-    for i, col in enumerate(cols):
-        # Convertir timestamps en str si besoin
-        pdf.cell(col_widths[i], 10, str(col), 1, 0, 'C')
+    # Headers
+    cols = df_export.columns.tolist()
+    widths = [30, 20, 20, 40, 25, 20, 35]
+    pdf.set_font("Arial", 'B', 9)
+    for i, h in enumerate(cols):
+        pdf.cell(widths[i], 8, str(h), 1, 0, 'C')
     pdf.ln()
     
-    # Données
-    pdf.set_font("Arial", size=9)
-    for index, row in df.iterrows():
-        for i, col in enumerate(cols):
-            val = str(row[col])
-            # Petite couleur pour Achat/Vente
-            if col == "Ordre":
-                if val == "Achat":
-                    pdf.set_text_color(0, 128, 0)
-                else:
-                    pdf.set_text_color(200, 0, 0)
-            else:
-                pdf.set_text_color(0, 0, 0)
-                
-            pdf.cell(col_widths[i], 10, val, 1, 0, 'C')
+    # Rows
+    pdf.set_font("Arial", size=8)
+    for _, row in df_export.iterrows():
+        for i, c in enumerate(cols):
+            val = str(row[c])
+            pdf.set_text_color(0,0,0)
+            if c == 'Ordre':
+                pdf.set_text_color(0,100,0) if val == 'Achat' else pdf.set_text_color(200,0,0)
+            pdf.cell(widths[i], 8, val, 1, 0, 'C')
         pdf.ln()
-        
     return pdf.output(dest='S').encode('latin-1')
 
-# --- MAIN APP ---
+# --- MAIN ---
 def main():
     st.markdown("""
-        <h1 style='text-align: center; color: #089981;'>Scanner CHoCH Multi-Timeframe</h1>
-        <p style='text-align: center;'>Détecteur de retournement de structure (Fractales + ATR)</p>
-        <hr>
+        <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 20px;">
+            <h1 style="color: #f23645;">Scanner</h1>
+            <h1 style="color: #089981; margin-left: 10px;">CHoCH</h1>
+        </div>
     """, unsafe_allow_html=True)
 
-    # Gestion des secrets
     try:
         OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
     except:
-        st.warning("⚠️ Token Oanda introuvable. Vérifiez `.streamlit/secrets.toml`")
-        OANDA_ACCESS_TOKEN = st.text_input("Ou entrez votre Token API ici:", type="password")
-    
-    if not OANDA_ACCESS_TOKEN:
+        st.error("Token OANDA manquant dans les secrets.")
         st.stop()
 
-    # Bouton de lancement
-    if st.button('🚀 Lancer le Scan', use_container_width=True):
-        # Nettoyage
+    if st.button('🚀 Lancer le Scan Complet', use_container_width=True):
         st.session_state['scan_results'] = None
         st.session_state['failed_scans'] = []
+        
+        results, errors = [], []
+        total = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
+        
+        bar = st.progress(0)
+        status = st.empty()
+        done = 0
 
-        results = []
-        errors = []
-        
-        # Barre de progression
-        prog_bar = st.progress(0)
-        status_text = st.empty()
-        
-        total_tasks = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
-        completed = 0
-        
-        # ThreadPool
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = []
-            for instrument in INSTRUMENTS_TO_SCAN:
-                for tf_name, tf_code in TIME_FRAMES.items():
-                    futures.append(executor.submit(scan_wrapper, OANDA_ACCESS_TOKEN, instrument, tf_name, tf_code))
+            for inst in INSTRUMENTS_TO_SCAN:
+                for tf_n, tf_c in TIME_FRAMES.items():
+                    futures.append(executor.submit(scan_wrapper, OANDA_ACCESS_TOKEN, inst, tf_n, tf_c))
             
-            for future in as_completed(futures):
-                res = future.result()
+            for f in as_completed(futures):
+                res = f.result()
                 if res:
-                    if "error" in res:
-                        errors.append(res["msg"])
-                    else:
-                        results.append(res)
-                
-                completed += 1
-                prog_bar.progress(completed / total_tasks)
-                status_text.text(f"Analyse: {completed}/{total_tasks}")
+                    if "error" in res: errors.append(res["msg"])
+                    else: results.append(res)
+                done += 1
+                bar.progress(done / total)
+                status.text(f"Scan en cours: {done}/{total}")
 
-        prog_bar.empty()
-        status_text.success("✅ Analyse terminée")
-        
-        if results:
-            st.session_state['scan_results'] = pd.DataFrame(results)
-        else:
-            st.session_state['scan_results'] = pd.DataFrame()
-            
+        bar.empty()
+        status.success("Terminé !")
+        st.session_state['scan_results'] = pd.DataFrame(results) if results else pd.DataFrame()
         st.session_state['failed_scans'] = errors
-        
-        # Rerun pour afficher les résultats proprement
         st.rerun()
 
-    # Affichage des résultats
     if 'scan_results' in st.session_state:
-        df_res = st.session_state['scan_results']
+        df = st.session_state['scan_results']
         
-        if df_res is None or df_res.empty:
-            st.info("Aucun signal CHoCH détecté sur les 10 dernières bougies.")
+        if df.empty:
+            st.info("Aucun signal détecté.")
         else:
-            # Mise en forme des dates
-            df_display = df_res.copy()
-            df_display['Heure (UTC)'] = pd.to_datetime(df_display['Heure (UTC)']).dt.strftime('%Y-%m-%d %H:%M')
+            # Export boutons
+            c1, c2 = st.columns(2)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+            df_export = df.copy()
+            csv = df_export.to_csv(index=False).encode('utf-8')
+            c1.download_button("📥 CSV", csv, f"scan_{timestamp}.csv", "text/csv")
+            try:
+                pdf_data = generate_pdf(df_export)
+                c2.download_button("📄 PDF", pdf_data, f"scan_{timestamp}.pdf", "application/pdf")
+            except: pass
 
-            # Tableau interactif avec style
-            st.subheader("📊 Signaux Détectés")
+            # --- AFFICHAGE PAR TIMEFRAME ---
+            # Ordre d'affichage logique
+            ordered_tfs = ["H1", "H4", "D1", "Weekly"]
             
-            def color_direction(val):
-                color = '#d4edda' if val == 'Achat' else '#f8d7da'
-                text_color = '#155724' if val == 'Achat' else '#721c24'
-                return f'background-color: {color}; color: {text_color}'
+            for tf in ordered_tfs:
+                # Filtrer par timeframe
+                tf_df = df[df['Timeframe'] == tf].copy()
+                
+                if not tf_df.empty:
+                    st.markdown(f"### ⏱️ Timeframe: {tf}")
+                    
+                    # Trier par date la plus récente
+                    tf_df = tf_df.sort_values(by='Heure (UTC)', ascending=False)
+                    
+                    # Ajouter l'étoile au premier élément (le plus récent)
+                    tf_df.insert(0, 'Top', '')
+                    if len(tf_df) > 0:
+                        tf_df.iloc[0, tf_df.columns.get_loc('Top')] = '⭐'
+                    
+                    # On retire la colonne Timeframe car elle est dans le titre
+                    tf_df_display = tf_df.drop(columns=['Timeframe'])
 
-            st.dataframe(
-                df_display.style.applymap(color_direction, subset=['Ordre']),
-                use_container_width=True,
-                hide_index=True
-            )
-            
-            # Export CSV
-            csv = df_display.to_csv(index=False).encode('utf-8')
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.download_button(
-                    "📥 Télécharger CSV",
-                    csv,
-                    "signaux_choch.csv",
-                    "text/csv",
-                    key='download-csv'
-                )
-            
-            with col2:
-                try:
-                    pdf_bytes = generate_pdf(df_display)
-                    st.download_button(
-                        "📄 Télécharger PDF",
-                        data=pdf_bytes,
-                        file_name="signaux_choch.pdf",
-                        mime="application/pdf"
+                    # Application du style
+                    styled_df = apply_custom_style(tf_df_display)
+                    
+                    # Calcul de la hauteur pour afficher TOUT le tableau sans scroll
+                    # 35px par ligne + buffer header
+                    row_height = 35 + 3 
+                    table_height = (len(tf_df) + 1) * row_height
+
+                    st.dataframe(
+                        styled_df, 
+                        use_container_width=True, 
+                        hide_index=True,
+                        height=int(table_height) # Force la hauteur complète
                     )
-                except Exception as e:
-                    st.error(f"Erreur génération PDF: {e}")
+                    st.markdown("---")
 
-        # Affichage des erreurs si besoin
         if st.session_state.get('failed_scans'):
-            with st.expander("Voir les erreurs de connexion"):
-                for err in st.session_state['failed_scans']:
-                    st.text(err)
+            with st.expander("Voir les erreurs techniques"):
+                st.write(st.session_state['failed_scans'])
 
 if __name__ == "__main__":
     main()
