@@ -21,12 +21,9 @@ INSTRUMENTS_TO_SCAN = [
     "XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD"
 ]
 
-# Volatilité classée par instrument (basée sur ATR moyen historique)
 VOLATILITY_LEVELS = {
-    # Majors (faible volatilité)
     "EUR_USD": "Basse", "GBP_USD": "Basse", "USD_JPY": "Basse", "USD_CHF": "Basse", 
     "USD_CAD": "Basse", "AUD_USD": "Moyenne", "NZD_USD": "Moyenne",
-    # Crosses (moyenne volatilité)
     "EUR_GBP": "Moyenne", "EUR_JPY": "Moyenne", "EUR_CHF": "Moyenne", 
     "EUR_AUD": "Moyenne", "EUR_CAD": "Moyenne", "EUR_NZD": "Moyenne",
     "GBP_JPY": "Haute", "GBP_CHF": "Haute", "GBP_AUD": "Haute", 
@@ -34,7 +31,6 @@ VOLATILITY_LEVELS = {
     "AUD_JPY": "Haute", "AUD_CAD": "Moyenne", "AUD_CHF": "Haute", 
     "AUD_NZD": "Moyenne", "CAD_JPY": "Haute", "CAD_CHF": "Haute", 
     "CHF_JPY": "Haute", "NZD_JPY": "Haute", "NZD_CAD": "Moyenne", "NZD_CHF": "Haute",
-    # Commodités & Indices (très haute volatilité)
     "XAU_USD": "Très Haute", "US30_USD": "Très Haute", "NAS100_USD": "Très Haute", "SPX500_USD": "Très Haute"
 }
 
@@ -43,15 +39,14 @@ FRACTAL_LENGTH = 5
 RECENT_BARS_THRESHOLD = 10
 MAX_WORKERS = 5
 
-# Fractales adaptatives par timeframe
 FRACTAL_LENGTHS_BY_TF = {
-    "H1": 5,      # Court terme, fractales serrées
-    "H4": 6,      # Un peu plus large
-    "D1": 7,      # Fractales plus importantes
-    "Weekly": 8   # Long terme, fractales larges
+    "H1": 5,
+    "H4": 6,
+    "D1": 7,
+    "Weekly": 8
 }
 
-# --- Fonctions optimisées ---
+# --- FONCTIONS OPTIMISÉES ---
 def calculate_atr(df, period=14):
     """Calcule l'ATR pour mesurer la volatilité actuelle"""
     if df is None or len(df) < period:
@@ -62,10 +57,10 @@ def calculate_atr(df, period=14):
     close = df['close'].values
     
     tr1 = high - low
-    tr2 = np.abs(high - close[:-1])
-    tr3 = np.abs(low - close[:-1])
+    tr2 = np.abs(high - np.concatenate(([close[0]], close[:-1])))
+    tr3 = np.abs(low - np.concatenate(([close[0]], close[:-1])))
     
-    tr = np.maximum(tr1[1:], np.maximum(tr2, tr3))
+    tr = np.maximum(tr1, np.maximum(tr2, tr3))
     atr = np.mean(tr[-period:])
     
     return atr
@@ -73,6 +68,7 @@ def calculate_atr(df, period=14):
 def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3, retry_delay=2):
     params = {"count": count, "granularity": granularity}
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
+    
     for attempt in range(max_retries):
         try:
             api_client.request(r)
@@ -117,19 +113,20 @@ def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3
 
 def detect_choch_optimized(df, instrument, tf_code, length=None):
     """Détection CHoCH optimisée avec fractales adaptatives"""
-    if df is None or len(df) < length:
+    if df is None or len(df) < 10:
         return None, None, None
     
-    # Adapter la longueur de fractale selon le timeframe
     if length is None:
         length = FRACTAL_LENGTHS_BY_TF.get(tf_code, FRACTAL_LENGTH)
+    
+    if len(df) < length:
+        return None, None, None
     
     p = length // 2
     highs = df['high'].values
     lows = df['low'].values
     closes = df['close'].values
     
-    # Calculer ATR pour qualifier la confirmation
     atr = calculate_atr(df)
     
     is_bull_fractal = np.zeros(len(df), dtype=bool)
@@ -151,10 +148,11 @@ def detect_choch_optimized(df, instrument, tf_code, length=None):
     confirmation_strength = None
     
     for i in range(length, len(df)):
-        if is_bull_fractal[i - p]:
-            upper_fractal = {'value': highs[i - p], 'iscrossed': False}
-        if is_bear_fractal[i - p]:
-            lower_fractal = {'value': lows[i - p], 'iscrossed': False}
+        if i - p >= 0 and i - p < len(df):
+            if is_bull_fractal[i - p]:
+                upper_fractal = {'value': highs[i - p], 'iscrossed': False}
+            if is_bear_fractal[i - p]:
+                lower_fractal = {'value': lows[i - p], 'iscrossed': False}
         
         current_close, previous_close = closes[i], closes[i - 1]
         
@@ -164,7 +162,6 @@ def detect_choch_optimized(df, instrument, tf_code, length=None):
                     choch_signal = "Bullish CHoCH"
                     choch_time = df['time'].iloc[i]
                     choch_bar_index = i
-                    # Force de confirmation basée sur la distance parcourue au-delà de la fractale
                     move_beyond = current_close - upper_fractal['value']
                     confirmation_strength = "Fort" if atr and move_beyond > atr * 0.5 else "Moyen"
                 os, upper_fractal['iscrossed'] = 1, True
@@ -179,7 +176,7 @@ def detect_choch_optimized(df, instrument, tf_code, length=None):
                     confirmation_strength = "Fort" if atr and move_beyond > atr * 0.5 else "Moyen"
                 os, lower_fractal['iscrossed'] = -1, True
     
-    if choch_signal and (len(df) - 1 - choch_bar_index) < RECENT_BARS_THRESHOLD:
+    if choch_signal and choch_bar_index >= 0 and (len(df) - 1 - choch_bar_index) < RECENT_BARS_THRESHOLD:
         return choch_signal, choch_time, confirmation_strength
     
     return None, None, None
@@ -188,7 +185,7 @@ def scan_instrument_timeframe(api_client, instrument, tf_name, tf_code):
     """Fonction pour scanner un couple instrument/timeframe"""
     df, status_message = get_oanda_data(api_client, instrument, tf_code)
     
-    if df is not None:
+    if df is not None and len(df) > 0:
         signal, signal_time, confirmation = detect_choch_optimized(df, instrument, tf_code)
         if signal:
             action = "Achat" if "Bullish" in signal else "Vente"
@@ -311,7 +308,10 @@ def main():
                     img_temp_path = f"temp_chunk_{i}.png"
                     dfi.export(chunk, img_temp_path, table_conversion='matplotlib')
                     pdf.image(img_temp_path, x=10, y=pdf.get_y(), w=277)
-                    os.remove(img_temp_path)
+                    try:
+                        os.remove(img_temp_path)
+                    except:
+                        pass
                 pdf_output = pdf.output(dest='S').encode('latin-1')
                 st.download_button("📄 Télécharger en PDF", pdf_output, f"choch_signaux_{timestamp}.pdf", "application/pdf")
             except Exception as e:
@@ -324,6 +324,7 @@ def main():
                     tf_df.insert(0, ' ', ['⭐'] + [''] * (len(tf_df) - 1))
                     tf_df['Heure (UTC)'] = tf_df['Heure (UTC)'].dt.strftime('%Y-%m-%d %H:%M')
                     st.subheader(f"--- Signaux {tf_name} ---")
+                    
                     def color_signal(val):
                         return f'color: {"#089981" if "Bullish" in val else "#f23645"}; font-weight: bold;'
                     def style_order(val):
@@ -336,15 +337,13 @@ def main():
                         return f'background-color: {"#089981" if val == "Fort" else "#FFA500"}; color: white; text-align: center; border-radius: 3px;'
                     
                     styled_df = tf_df.drop(columns=['Timeframe']).style \
-                        .applymap(color_signal, subset=['Signal']) \
-                        .applymap(style_order, subset=['Ordre']) \
-                        .applymap(style_volatility, subset=['Volatilité']) \
-                        .applymap(style_force, subset=['Force'])
+                        .map(color_signal, subset=['Signal']) \
+                        .map(style_order, subset=['Ordre']) \
+                        .map(style_volatility, subset=['Volatilité']) \
+                        .map(style_force, subset=['Force'])
                     st.dataframe(styled_df, hide_index=True, use_container_width=True)
 
-        if 'failed_scans' in st.session_state and st.session_state['failed_scans']:
-            with st.expander("⚠️ Voir le rapport des scans ayant échoué"):
-                st.markdown("\n".join(st.session_state['failed_scans']))
+
 
 if __name__ == "__main__":
     main()
