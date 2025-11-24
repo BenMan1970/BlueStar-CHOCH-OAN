@@ -11,11 +11,13 @@ import numpy as np
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="Scanner CHoCH", layout="wide")
 
-# --- CSS PERSONNALISÉ POUR AFFICHAGE PROPRE ---
+# --- CSS POUR FORCER L'AFFICHAGE LARGE ET PROPRE ---
 st.markdown("""
 <style>
     .stDataFrame { width: 100% !important; }
-    div[data-testid="stExpander"] details summary p { font-size: 1.1rem; font-weight: bold; }
+    /* Cache l'index si nécessaire et ajuste les headers */
+    thead tr th:first-child { display:none }
+    tbody th { display:none }
 </style>
 """, unsafe_allow_html=True)
 
@@ -44,7 +46,7 @@ VOLATILITY_LEVELS = {
 TIME_FRAMES = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
 FRACTAL_LENGTH = 5
 RECENT_BARS_THRESHOLD = 10
-MAX_WORKERS = 4  # Un peu réduit pour stabilité
+MAX_WORKERS = 4
 
 FRACTAL_LENGTHS_BY_TF = { "H1": 5, "H4": 6, "D1": 7, "Weekly": 8 }
 
@@ -101,12 +103,10 @@ def detect_choch_optimized(df, instrument, tf_code, length=None):
     is_bull = np.zeros(len(df), dtype=bool)
     is_bear = np.zeros(len(df), dtype=bool)
 
-    # Identification fractales
     for i in range(p, len(df) - p):
         if highs[i] == np.max(highs[i-p : i+p+1]): is_bull[i] = True
         if lows[i] == np.min(lows[i-p : i+p+1]): is_bear[i] = True
 
-    # Identification CHOCH
     for i in range(length, len(df)):
         prev_idx = i - p
         if prev_idx >= 0:
@@ -154,7 +154,7 @@ def scan_wrapper(api_key, instrument, tf_name, tf_code):
     except Exception as e:
         return {"error": True, "msg": f"Crash {instrument}: {str(e)}"}
 
-# --- FONCTIONS STYLE ---
+# --- FONCTIONS STYLE (Mise à jour pour Pandas récents) ---
 def apply_custom_style(df):
     def color_signal(val):
         color = "#089981" if "Bullish" in str(val) else "#f23645" if "Bearish" in str(val) else "black"
@@ -172,13 +172,14 @@ def apply_custom_style(df):
         bg = "#089981" if val == "Fort" else "#FFA500"
         return f'background-color: {bg}; color: white; border-radius: 4px; text-align: center;'
 
-    return df.style.applymap(color_signal, subset=['Signal']) \
-                   .applymap(style_order, subset=['Ordre']) \
-                   .applymap(style_volatility, subset=['Volatilité']) \
-                   .applymap(style_force, subset=['Force']) \
+    # Utilisation de .map() au lieu de .applymap() pour éviter les erreurs de dépréciation
+    return df.style.map(color_signal, subset=['Signal']) \
+                   .map(style_order, subset=['Ordre']) \
+                   .map(style_volatility, subset=['Volatilité']) \
+                   .map(style_force, subset=['Force']) \
                    .format({'Heure (UTC)': lambda x: x.strftime('%Y-%m-%d %H:%M')})
 
-# --- GENERATION PDF SIMPLE ---
+# --- PDF ---
 class PDFReport(FPDF):
     def header(self):
         self.set_font('Arial', 'B', 16)
@@ -189,19 +190,13 @@ def generate_pdf(df_full):
     pdf = PDFReport()
     pdf.add_page()
     pdf.set_font("Arial", size=10)
-    
-    # On trie pour le PDF
     df_export = df_full.drop(columns=['Top'], errors='ignore') if 'Top' in df_full.columns else df_full
-    
-    # Headers
     cols = df_export.columns.tolist()
     widths = [30, 20, 20, 40, 25, 20, 35]
     pdf.set_font("Arial", 'B', 9)
     for i, h in enumerate(cols):
         pdf.cell(widths[i], 8, str(h), 1, 0, 'C')
     pdf.ln()
-    
-    # Rows
     pdf.set_font("Arial", size=8)
     for _, row in df_export.iterrows():
         for i, c in enumerate(cols):
@@ -213,7 +208,7 @@ def generate_pdf(df_full):
         pdf.ln()
     return pdf.output(dest='S').encode('latin-1')
 
-# --- MAIN ---
+# --- MAIN APP ---
 def main():
     st.markdown("""
         <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 20px;">
@@ -228,7 +223,7 @@ def main():
         st.error("Token OANDA manquant dans les secrets.")
         st.stop()
 
-    if st.button('🚀 Lancer le Scan Complet', use_container_width=True):
+    if st.button('🚀 Lancer le Scan', use_container_width=True):
         st.session_state['scan_results'] = None
         st.session_state['failed_scans'] = []
         
@@ -266,52 +261,47 @@ def main():
         if df.empty:
             st.info("Aucun signal détecté.")
         else:
-            # Export boutons
+            # Export
             c1, c2 = st.columns(2)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M")
             df_export = df.copy()
             csv = df_export.to_csv(index=False).encode('utf-8')
-            c1.download_button("📥 CSV", csv, f"scan_{timestamp}.csv", "text/csv")
+            c1.download_button("📥 CSV", csv, f"scan_{timestamp}.csv", "text/csv", use_container_width=True)
             try:
                 pdf_data = generate_pdf(df_export)
-                c2.download_button("📄 PDF", pdf_data, f"scan_{timestamp}.pdf", "application/pdf")
+                c2.download_button("📄 PDF", pdf_data, f"scan_{timestamp}.pdf", "application/pdf", use_container_width=True)
             except: pass
 
             # --- AFFICHAGE PAR TIMEFRAME ---
-            # Ordre d'affichage logique
             ordered_tfs = ["H1", "H4", "D1", "Weekly"]
             
             for tf in ordered_tfs:
-                # Filtrer par timeframe
                 tf_df = df[df['Timeframe'] == tf].copy()
                 
                 if not tf_df.empty:
-                    st.markdown(f"### ⏱️ Timeframe: {tf}")
+                    st.markdown(f"### ⏱️ {tf}")
                     
-                    # Trier par date la plus récente
                     tf_df = tf_df.sort_values(by='Heure (UTC)', ascending=False)
                     
-                    # Ajouter l'étoile au premier élément (le plus récent)
-                    tf_df.insert(0, 'Top', '')
+                    # Logique de l'étoile
+                    tf_df.insert(0, 'Top', '') 
                     if len(tf_df) > 0:
                         tf_df.iloc[0, tf_df.columns.get_loc('Top')] = '⭐'
                     
-                    # On retire la colonne Timeframe car elle est dans le titre
                     tf_df_display = tf_df.drop(columns=['Timeframe'])
-
-                    # Application du style
+                    
+                    # Style
                     styled_df = apply_custom_style(tf_df_display)
                     
-                    # Calcul de la hauteur pour afficher TOUT le tableau sans scroll
-                    # 35px par ligne + buffer header
-                    row_height = 35 + 3 
-                    table_height = (len(tf_df) + 1) * row_height
+                    # Calcul Hauteur pour éviter le scroll interne
+                    # 38px par ligne approx + 40px header
+                    height_calc = (len(tf_df) + 1) * 38 
 
                     st.dataframe(
                         styled_df, 
                         use_container_width=True, 
                         hide_index=True,
-                        height=int(table_height) # Force la hauteur complète
+                        height=height_calc
                     )
                     st.markdown("---")
 
