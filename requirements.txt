@@ -1,6 +1,7 @@
 streamlit
 oandapyV20
 pandas
+numpy
 fpdf
 pillow
 matplotlib
