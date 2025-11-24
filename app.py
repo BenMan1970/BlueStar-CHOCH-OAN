@@ -1,4 +1,5 @@
-# app.py → VERSION FINALE 100% FONCTIONNELLE (24/11/2025)
+# app.py → VERSION FINALE RÉPARÉE (24/11/2025)
+
 import streamlit as st
 import pandas as pd
 from oandapyV20 import API
@@ -44,13 +45,23 @@ TIME_FRAMES = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
 FRACTAL_LENGTHS_BY_TF = {"H1": 5, "H4": 6, "D": 7, "W": 8}
 RECENT_BARS_THRESHOLD = 10
 MAX_WORKERS = 5
-REQUEST_DELAY = 0.09  # safe OANDA
+REQUEST_DELAY = 0.09
 
 lock = threading.Lock()
 
 def delay():
     with lock:
         time_module.sleep(REQUEST_DELAY)
+
+# ─── CHARGEMENT TOKEN ────────────────────────────────────────────────
+try:
+    OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
+except:
+    st.error("OANDA_ACCESS_TOKEN manquant dans Secrets")
+    st.stop()
+
+# FIX : api_client doit être créé avant tout appel
+api_client = API(access_token=OANDA_ACCESS_TOKEN)
 
 # ─── ATR + DONNÉES ─────────────────────────────────────────────────────
 def calculate_atr(df, period=14):
@@ -62,6 +73,7 @@ def calculate_atr(df, period=14):
 def get_oanda_data(instrument, granularity):
     params = {"count": 260, "granularity": granularity}
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
+
     for _ in range(3):
         try:
             delay()
@@ -79,7 +91,7 @@ def get_oanda_data(instrument, granularity):
             time_module.sleep(1)
     return None
 
-# ─── DÉTECTION CHOCH (corrigée à 100%) ──────────────────────────────────
+# ─── DÉTECTION CHOCH ──────────────────────────────────────────────────
 def detect_choch(df, tf_code):
     if df is None or len(df) < 30:
         return None, None, None
@@ -94,9 +106,9 @@ def detect_choch(df, tf_code):
     close = df['close'].values
     atr = calculate_atr(df)
 
-    # Fractales
     is_bull = np.zeros(len(df), bool)
     is_bear = np.zeros(len(df), bool)
+
     for i in range(p, len(df)-p):
         if high[i] == np.max(high[i-p:i+p+1]): is_bull[i] = True
         if low[i]  == np.min(low[i-p:i+p+1]):  is_bear[i] = True
@@ -109,7 +121,6 @@ def detect_choch(df, tf_code):
         if is_bull[i-p]: upper_fr = high[i-p]
         if is_bear[i-p]: lower_fr = low[i-p]
 
-        # Bullish CHoCH
         if order_state == -1 and upper_fr is not None and close[i] > upper_fr >= close[i-1]:
             bar_idx = i
             move = close[i] - upper_fr
@@ -118,7 +129,6 @@ def detect_choch(df, tf_code):
             time_sig = df['time'].iloc[i]
             order_state = 1
 
-        # Bearish CHoCH
         if order_state == 1 and lower_fr is not None and close[i] < lower_fr <= close[i-1]:
             bar_idx = i
             move = lower_fr - close[i]
@@ -151,18 +161,9 @@ def scan_pair_tf(instrument, tf_name, tf_code):
         }
     return None
 
-# ─── STREAMLIT ────────────────────────────────────────────────────────
+# ─── STREAMLIT UI ──────────────────────────────────────────────────────
 st.set_page_config(page_title="Scanner CHoCH", layout="wide")
 st.markdown("<h1 style='text-align:center;'>Scanner Change of Character (CHoCH)</h1>", unsafe_allow_html=True)
-
-# ─── CHARGEMENT TOKEN (exactement comme avant) ───────────────────────
-try:
-    OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
-except:
-    st.error("OANDA_ACCESS_TOKEN manquant dans Secrets")
-    st.stop()
-
-api_client = API(access_token=OANDA_ACCESS_TOKEN)
 
 if st.button("Lancer un nouveau Scan", type="primary"):
     st.session_state.clear()
@@ -174,14 +175,16 @@ if st.button("Lancer un nouveau Scan", type="primary"):
         status = st.empty()
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(scan_pair_tf, i, n, c): (i,n) 
-                      for i in INSTRUMENTS_TO_SCAN 
-                      for n,c in TIME_FRAMES.items()}
+            futures = {
+                executor.submit(scan_pair_tf, i, n, c): (i, n)
+                for i in INSTRUMENTS_TO_SCAN
+                for n, c in TIME_FRAMES.items()
+            }
 
             done = 0
             for f in as_completed(futures):
                 done += 1
-                bar.progress(done/total)
+                bar.progress(done / total)
                 status.text(f"{done}/{total}")
                 res = f.result()
                 if isinstance(res, dict) and "error" in res:
@@ -195,9 +198,10 @@ if st.button("Lancer un nouveau Scan", type="primary"):
 
     st.rerun()
 
-# ─── AFFICHAGE ───────────────────────────────────────────────────────
+# ─── AFFICHAGE ─────────────────────────────────────────────────────────
 if "results" in st.session_state:
     df = st.session_state.results
+
     if df.empty:
         st.success("Aucun signal CHoCH récent détecté")
     else:
@@ -207,13 +211,19 @@ if "results" in st.session_state:
 
         for tf in TIME_FRAMES:
             sub = df[df["Timeframe"] == tf]
-            if sub.empty: continue
-            sub = sub[["Instrument","Ordre","Signal","Volatilité","Force","Heure (UTC)"]].copy()
+            if sub.empty:
+                continue
+
+            sub = sub[["Instrument", "Ordre", "Signal", "Volatilité", "Force", "Heure (UTC)"]].copy()
+
             st.subheader(f"--- {tf} ---")
-            st.dataframe(sub.style
+            st.dataframe(
+                sub.style
                 .map(lambda x: "color:#089981;font-weight:bold" if "Bullish" in str(x) else "color:#f23645;font-weight:bold", subset=["Signal"])
-                .map(lambda x: "background:#089981;color:white" if x=="Achat" else "background:#f23645;color:white", subset=["Ordre"]),
-                hide_index=True, use_container_width=True)
+                .map(lambda x: "background:#089981;color:white" if x == "Achat" else "background:#f23645;color:white", subset=["Ordre"]),
+                hide_index=True,
+                use_container_width=True
+            )
 
     if st.session_state.get("failed"):
         with st.expander("Erreurs (voir détails)"):
