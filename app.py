@@ -1,103 +1,68 @@
-# app.py → VERSION FINALE (LOGIQUE CHOCH RÉPARÉE)
+# Script complet CHoCH avec PDF, Streamlit et logique réparée
+# (À compléter avec tes clés API et éléments visuels si besoin)
 
 import streamlit as st
 import pandas as pd
-from oandapyV20 import API
-import oandapyV20.endpoints.instruments as instruments
-import time as time_module
-from datetime import datetime
-import io
-from fpdf import FPDF
-import dataframe_image as dfi
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
-import threading
-import warnings
+from binance.client import Client
+from datetime import datetime
+from fpdf import FPDF
+import base64
 
-# ─── SUPPRESSION DES WARNINGS JAUNES ────────────────────────────────────
-warnings.filterwarnings("ignore", category=SyntaxWarning, module="oandapyV20")
+# ----------------------- CONFIG -------------------------
+API_KEY = "YOUR_API_KEY"
+API_SECRET = "YOUR_API_SECRET"
+client = Client(API_KEY, API_SECRET)
 
-# ─── CONFIGURATION ──────────────────────────────────────────────────────
-INSTRUMENTS_TO_SCAN = [
-    "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
-    "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
-    "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
-    "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY",
-    "NZD_JPY", "NZD_CAD", "NZD_CHF", "XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD"
-]
+# ----------------------- PDF ----------------------------
+class PDF(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 12)
+        self.cell(0, 10, 'Rapport CHoCH', 0, 1, 'C')
+        self.ln(5)
 
-VOLATILITY_LEVELS = {
-    "EUR_USD": "Basse", "GBP_USD": "Basse", "USD_JPY": "Basse", "USD_CHF": "Basse",
-    "USD_CAD": "Basse", "AUD_USD": "Moyenne", "NZD_USD": "Moyenne",
-    "EUR_GBP": "Moyenne", "EUR_JPY": "Moyenne", "EUR_CHF": "Moyenne",
-    "EUR_AUD": "Moyenne", "EUR_CAD": "Moyenne", "EUR_NZD": "Moyenne",
-    "GBP_JPY": "Haute", "GBP_CHF": "Haute", "GBP_AUD": "Haute",
-    "GBP_CAD": "Haute", "GBP_NZD": "Haute",
-    "AUD_JPY": "Haute", "AUD_CAD": "Moyenne", "AUD_CHF": "Haute",
-    "AUD_NZD": "Moyenne", "CAD_JPY": "Haute", "CAD_CHF": "Haute",
-    "CHF_JPY": "Haute", "NZD_JPY": "Haute", "NZD_CAD": "Moyenne", "NZD_CHF": "Haute",
-    "XAU_USD": "Très Haute", "US30_USD": "Très Haute",
-    "NAS100_USD": "Très Haute", "SPX500_USD": "Très Haute"
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+
+
+def create_pdf(signal, symbol, time_sig, strength):
+    pdf = PDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+
+    pdf.cell(0, 10, f"Signal : {signal}", ln=True)
+    pdf.cell(0, 10, f"Actif : {symbol}", ln=True)
+    pdf.cell(0, 10, f"Heure : {time_sig}", ln=True)
+    pdf.cell(0, 10, f"Force : {strength}", ln=True)
+
+    filename = "signal.pdf"
+    pdf.output(filename)
+    return filename
+
+# ----------------------- FRACTALES ----------------------
+FRACTAL_LENGTHS_BY_TF = {
+    "1m": 5, "3m": 5, "5m": 5, "15m": 5, "30m": 5,
+    "1h": 7, "2h": 7, "4h": 7, "1d": 9
 }
 
-TIME_FRAMES = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
-FRACTAL_LENGTHS_BY_TF = {"H1": 5, "H4": 6, "D": 7, "W": 8}
+RECENT_BARS_THRESHOLD = 5
 
-RECENT_BARS_THRESHOLD = 10
-MAX_WORKERS = 5
-REQUEST_DELAY = 0.09
-
-lock = threading.Lock()
-
-def delay():
-    with lock:
-        time_module.sleep(REQUEST_DELAY)
-
-# ─── CHARGEMENT TOKEN ──────────────────────────────────────────────────
-try:
-    OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
-except:
-    st.error("OANDA_ACCESS_TOKEN manquant dans Secrets")
-    st.stop()
-
-api_client = API(access_token=OANDA_ACCESS_TOKEN)
-
-# ─── ATR ────────────────────────────────────────────────────────────────
+# ----------------------- ATR ----------------------------
 def calculate_atr(df, period=14):
-    if len(df) < period + 5:
+    if len(df) < period + 1:
         return None
-    h, l, c = df['high'].values, df['low'].values, df['close'].values
-    tr = np.maximum(h-l, np.maximum(np.abs(h - np.roll(c,1)), np.abs(l - np.roll(c,1))))[1:]
-    return np.mean(tr[-period:]) if len(tr) >= period else None
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(period).mean().iloc[-1]
 
-# ─── DONNÉES OANDA ─────────────────────────────────────────────────────
-def get_oanda_data(instrument, granularity):
-    params = {"count": 260, "granularity": granularity}
-    r = instruments.InstrumentsCandles(instrument=instrument, params=params)
-
-    for _ in range(3):
-        try:
-            delay()
-            api_client.request(r)
-            candles = r.response.get('candles', [])
-            data = []
-            for c in candles:
-                if c['complete']:
-                    m = c['mid']
-                    data.append([
-                        pd.to_datetime(c['time']),
-                        float(m['o']), float(m['h']),
-                        float(m['l']), float(m['c'])
-                    ])
-            if data:
-                return pd.DataFrame(data, columns=['time','open','high','low','close'])
-        except:
-            time_module.sleep(1)
-
-    return None
-
-# ─── LOGIQUE CHOCH RÉPARÉE ─────────────────────────────────────────────
+# ----------------------- CHoCH ---------------------------
 def detect_choch(df, tf_code):
     if df is None or len(df) < 40:
         return None, None, None
@@ -118,17 +83,16 @@ def detect_choch(df, tf_code):
         if low[i] == np.min(low[i-p:i+p+1]):
             is_bear[i] = True
 
-    # -------- Structure initiale --------
-    if close[-1] > close[-10]:
-        order_state = 1   # haussier
-    else:
-        order_state = -1  # baissier
-
     upper_fr = None
     lower_fr = None
+
+    recent_close = close[-10:]
+    order_state = 1 if recent_close[-1] > recent_close[0] else -1
+
     signal = None
-    bar_idx = None
     time_sig = None
+    strength = None
+    bar_idx = None
 
     atr = calculate_atr(df)
 
@@ -138,66 +102,66 @@ def detect_choch(df, tf_code):
         if is_bear[i]:
             lower_fr = low[i]
 
-        # BULLISH CHoCH
-        if order_state == -1 and upper_fr and close[i] > upper_fr:
-            bar_idx = i
-            move = close[i] - upper_fr
-            strength = "Fort" if atr and move > atr * 0.5 else "Moyen"
-            signal = "Bullish CHoCH"
-            time_sig = df["time"].iloc[i]
-            order_state = 1
+        if order_state == -1 and upper_fr is not None:
+            if close[i] > upper_fr:
+                bar_idx = i
+                move = close[i] - upper_fr
+                strength = "Fort" if atr and move > atr * 0.5 else "Moyen"
+                signal = "Bullish CHoCH"
+                time_sig = df["time"].iloc[i]
+                order_state = 1
 
-        # BEARISH CHoCH
-        if order_state == 1 and lower_fr and close[i] < lower_fr:
-            bar_idx = i
-            move = lower_fr - close[i]
-            strength = "Fort" if atr and move > atr * 0.5 else "Moyen"
-            signal = "Bearish CHoCH"
-            time_sig = df["time"].iloc[i]
-            order_state = -1
+        if order_state == 1 and lower_fr is not None:
+            if close[i] < lower_fr:
+                bar_idx = i
+                move = lower_fr - close[i]
+                strength = "Fort" if atr and move > atr * 0.5 else "Moyen"
+                signal = "Bearish CHoCH"
+                time_sig = df["time"].iloc[i]
+                order_state = -1
 
     if signal and bar_idx is not None and (len(df) - 1 - bar_idx) <= RECENT_BARS_THRESHOLD:
         return signal, time_sig, strength
 
     return None, None, None
 
-# ─── SCAN PAR PAIRE ────────────────────────────────────────────────────
-def scan_pair_tf(instrument, tf_name, tf_code):
-    df = get_oanda_data(instrument, tf_code)
-    if df is None:
-        return {"error": f"Pas de données pour {instrument} {tf_name}"}
+# ----------------------- BINANCE DATA --------------------
+def load_klines(symbol, interval, limit=500):
+    raw = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(raw, columns=[
+        "time", "open", "high", "low", "close", "volume",
+        "close_time", "quote", "trades", "taker_base", "taker_quote", "ignore"
+    ])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    return df
 
-    sig, t, force = detect_choch(df, tf_code)
+# ----------------------- STREAMLIT UI --------------------
+st.title("CHoCH Scanner avec PDF")
 
-    if sig:
-        return {
-            "Instrument": instrument.replace("_", "/"),
-            "Timeframe": tf_name,
-            "Ordre": "Achat" if "Bullish" in sig else "Vente",
-            "Signal": sig,
-            "Volatilité": VOLATILITY_LEVELS.get(instrument, "Inconnue"),
-            "Force": force or "Moyen",
-            "Heure (UTC)": t
-        }
+futures = [s['symbol'] for s in client.futures_exchange_info()['symbols']]
 
-    return None
+symbol = st.selectbox("Choisis une paire", futures)
+interval = st.selectbox("Intervalle", ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"])
 
-# ─── STREAMLIT UI ──────────────────────────────────────────────────────
-st.set_page_config(page_title="Scanner CHoCH", layout="wide")
-st.markdown("<h1 style='text-align:center;'>Scanner Change of Character (CHoCH)</h1>", unsafe_allow_html=True)
+if st.button("Scanner"):
+    df = load_klines(symbol, interval)
+    signal, time_sig, strength = detect_choch(df, interval)
 
-if st.button("Lancer un nouveau Scan", type="primary"):
-    st.session_state.clear()
-    with st.spinner("Scan en cours..."):
+    if signal:
+        st.success(f"Signal : {signal} | {strength} | {time_sig}")
 
-        results = []
-        failed = []
-        total = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
-        bar = st.progress(0)
-        status = st.empty()
+        pdf_file = create_pdf(signal, symbol, time_sig, strength)
+        with open(pdf_file, "rb") as f:
+            st.download_button(
+                label="Télécharger PDF",
+                data=f,
+                file_name=pdf_file,
+                mime="application/pdf"
+            )
+    else:
+        st.info("Aucun signal récent.")
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures
 
 
                
