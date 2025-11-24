@@ -20,12 +20,56 @@ INSTRUMENTS_TO_SCAN = [
     "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY", "NZD_JPY", "NZD_CAD", "NZD_CHF",
     "XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD"
 ]
+
+# Volatilité classée par instrument (basée sur ATR moyen historique)
+VOLATILITY_LEVELS = {
+    # Majors (faible volatilité)
+    "EUR_USD": "Basse", "GBP_USD": "Basse", "USD_JPY": "Basse", "USD_CHF": "Basse", 
+    "USD_CAD": "Basse", "AUD_USD": "Moyenne", "NZD_USD": "Moyenne",
+    # Crosses (moyenne volatilité)
+    "EUR_GBP": "Moyenne", "EUR_JPY": "Moyenne", "EUR_CHF": "Moyenne", 
+    "EUR_AUD": "Moyenne", "EUR_CAD": "Moyenne", "EUR_NZD": "Moyenne",
+    "GBP_JPY": "Haute", "GBP_CHF": "Haute", "GBP_AUD": "Haute", 
+    "GBP_CAD": "Haute", "GBP_NZD": "Haute",
+    "AUD_JPY": "Haute", "AUD_CAD": "Moyenne", "AUD_CHF": "Haute", 
+    "AUD_NZD": "Moyenne", "CAD_JPY": "Haute", "CAD_CHF": "Haute", 
+    "CHF_JPY": "Haute", "NZD_JPY": "Haute", "NZD_CAD": "Moyenne", "NZD_CHF": "Haute",
+    # Commodités & Indices (très haute volatilité)
+    "XAU_USD": "Très Haute", "US30_USD": "Très Haute", "NAS100_USD": "Très Haute", "SPX500_USD": "Très Haute"
+}
+
 TIME_FRAMES = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
 FRACTAL_LENGTH = 5
 RECENT_BARS_THRESHOLD = 10
-MAX_WORKERS = 5  # Limitation pour éviter de surcharger l'API OANDA
+MAX_WORKERS = 5
+
+# Fractales adaptatives par timeframe
+FRACTAL_LENGTHS_BY_TF = {
+    "H1": 5,      # Court terme, fractales serrées
+    "H4": 6,      # Un peu plus large
+    "D1": 7,      # Fractales plus importantes
+    "Weekly": 8   # Long terme, fractales larges
+}
 
 # --- Fonctions optimisées ---
+def calculate_atr(df, period=14):
+    """Calcule l'ATR pour mesurer la volatilité actuelle"""
+    if df is None or len(df) < period:
+        return None
+    
+    high = df['high'].values
+    low = df['low'].values
+    close = df['close'].values
+    
+    tr1 = high - low
+    tr2 = np.abs(high - close[:-1])
+    tr3 = np.abs(low - close[:-1])
+    
+    tr = np.maximum(tr1[1:], np.maximum(tr2, tr3))
+    atr = np.mean(tr[-period:])
+    
+    return atr
+
 def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3, retry_delay=2):
     params = {"count": count, "granularity": granularity}
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
@@ -36,7 +80,6 @@ def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3
             if not data:
                 return None, f"Aucune bougie pour {instrument} sur {granularity}."
             
-            # Optimisation : utiliser des listes au lieu de dictionnaires pour plus de rapidité
             times = []
             opens, highs, lows, closes = [], [], [], []
             for c in data:
@@ -72,17 +115,23 @@ def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3
     
     return None, "Échec après plusieurs tentatives."
 
-def detect_choch_optimized(df, length=5):
-    """Détection CHoCH optimisée avec numpy"""
+def detect_choch_optimized(df, instrument, tf_code, length=None):
+    """Détection CHoCH optimisée avec fractales adaptatives"""
     if df is None or len(df) < length:
-        return None, None
+        return None, None, None
+    
+    # Adapter la longueur de fractale selon le timeframe
+    if length is None:
+        length = FRACTAL_LENGTHS_BY_TF.get(tf_code, FRACTAL_LENGTH)
     
     p = length // 2
     highs = df['high'].values
     lows = df['low'].values
     closes = df['close'].values
     
-    # Utiliser numpy pour les calculs rolling (plus rapide que pandas)
+    # Calculer ATR pour qualifier la confirmation
+    atr = calculate_atr(df)
+    
     is_bull_fractal = np.zeros(len(df), dtype=bool)
     is_bear_fractal = np.zeros(len(df), dtype=bool)
     
@@ -99,6 +148,7 @@ def detect_choch_optimized(df, length=5):
     os = 0
     choch_signal, choch_time = None, None
     choch_bar_index = -1
+    confirmation_strength = None
     
     for i in range(length, len(df)):
         if is_bull_fractal[i - p]:
@@ -114,6 +164,9 @@ def detect_choch_optimized(df, length=5):
                     choch_signal = "Bullish CHoCH"
                     choch_time = df['time'].iloc[i]
                     choch_bar_index = i
+                    # Force de confirmation basée sur la distance parcourue au-delà de la fractale
+                    move_beyond = current_close - upper_fractal['value']
+                    confirmation_strength = "Fort" if atr and move_beyond > atr * 0.5 else "Moyen"
                 os, upper_fractal['iscrossed'] = 1, True
         
         if lower_fractal['value'] is not None and not lower_fractal['iscrossed']:
@@ -122,26 +175,31 @@ def detect_choch_optimized(df, length=5):
                     choch_signal = "Bearish CHoCH"
                     choch_time = df['time'].iloc[i]
                     choch_bar_index = i
+                    move_beyond = lower_fractal['value'] - current_close
+                    confirmation_strength = "Fort" if atr and move_beyond > atr * 0.5 else "Moyen"
                 os, lower_fractal['iscrossed'] = -1, True
     
     if choch_signal and (len(df) - 1 - choch_bar_index) < RECENT_BARS_THRESHOLD:
-        return choch_signal, choch_time
+        return choch_signal, choch_time, confirmation_strength
     
-    return None, None
+    return None, None, None
 
 def scan_instrument_timeframe(api_client, instrument, tf_name, tf_code):
     """Fonction pour scanner un couple instrument/timeframe"""
     df, status_message = get_oanda_data(api_client, instrument, tf_code)
     
     if df is not None:
-        signal, signal_time = detect_choch_optimized(df, length=FRACTAL_LENGTH)
+        signal, signal_time, confirmation = detect_choch_optimized(df, instrument, tf_code)
         if signal:
             action = "Achat" if "Bullish" in signal else "Vente"
+            volatility = VOLATILITY_LEVELS.get(instrument, "Inconnue")
             return {
                 "Instrument": instrument.replace("_", "/"),
                 "Timeframe": tf_name,
                 "Ordre": action,
                 "Signal": signal,
+                "Volatilité": volatility,
+                "Force": confirmation,
                 "Heure (UTC)": signal_time
             }
     
@@ -185,17 +243,14 @@ def main():
             progress_status = st.empty()
             completed_scans = 0
             
-            # Utiliser ThreadPoolExecutor pour paralléliser les requêtes
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = {}
                 
-                # Soumettre tous les jobs
                 for instrument in INSTRUMENTS_TO_SCAN:
                     for tf_name, tf_code in TIME_FRAMES.items():
                         future = executor.submit(scan_instrument_timeframe, api_client, instrument, tf_name, tf_code)
                         futures[future] = (instrument, tf_name)
                 
-                # Traiter les résultats au fur et à mesure
                 for future in as_completed(futures):
                     completed_scans += 1
                     instrument, tf_name = futures[future]
@@ -209,7 +264,6 @@ def main():
                     except Exception as e:
                         failed.append(f"- **{instrument} ({tf_name})**: Erreur d'exécution: {e}")
                     
-                    # Mise à jour de la progress bar
                     progress_value = completed_scans / total_scans
                     progress_bar.progress(progress_value)
                     progress_status.text(f"Progression: {completed_scans}/{total_scans} scans")
@@ -274,7 +328,18 @@ def main():
                         return f'color: {"#089981" if "Bullish" in val else "#f23645"}; font-weight: bold;'
                     def style_order(val):
                         return f'background-color: {"#089981" if val == "Achat" else "#f23645"}; color: white; border-radius: 5px; text-align: center; font-weight: bold;'
-                    styled_df = tf_df.drop(columns=['Timeframe']).style.applymap(color_signal, subset=['Signal']).applymap(style_order, subset=['Ordre'])
+                    def style_volatility(val):
+                        colors = {"Basse": "#089981", "Moyenne": "#FFA500", "Haute": "#FF6B6B", "Très Haute": "#f23645"}
+                        color = colors.get(val, "#FFFFFF")
+                        return f'background-color: {color}; color: white; text-align: center; border-radius: 3px;'
+                    def style_force(val):
+                        return f'background-color: {"#089981" if val == "Fort" else "#FFA500"}; color: white; text-align: center; border-radius: 3px;'
+                    
+                    styled_df = tf_df.drop(columns=['Timeframe']).style \
+                        .applymap(color_signal, subset=['Signal']) \
+                        .applymap(style_order, subset=['Ordre']) \
+                        .applymap(style_volatility, subset=['Volatilité']) \
+                        .applymap(style_force, subset=['Force'])
                     st.dataframe(styled_df, hide_index=True, use_container_width=True)
 
         if 'failed_scans' in st.session_state and st.session_state['failed_scans']:
