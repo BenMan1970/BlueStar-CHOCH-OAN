@@ -2,32 +2,17 @@ import streamlit as st
 import pandas as pd
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
+import oandapyV20.exceptions
 import time as time_module
 from datetime import datetime
+import io
 from fpdf import FPDF
+import dataframe_image as dfi
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
-# --- CONFIGURATION DE LA PAGE ---
-st.set_page_config(page_title="Scanner CHoCH", layout="wide")
-
-# --- CSS: Suppression marges, pleine largeur, style tableau ---
-st.markdown("""
-<style>
-    /* Force les tableaux à prendre toute la largeur */
-    .stDataFrame { width: 100% !important; }
-    div[data-testid="stDataFrame"] { width: 100% !important; }
-    
-    /* Masquer l'index disgracieux dans les tableaux */
-    thead tr th:first-child { display:none }
-    tbody th { display:none }
-    
-    /* Style global */
-    h3 { padding-top: 10px; border-bottom: 2px solid #333; }
-</style>
-""", unsafe_allow_html=True)
-
-# --- CONSTANTES ---
+# --- CONFIGURATION ---
 INSTRUMENTS_TO_SCAN = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
     "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
@@ -36,9 +21,12 @@ INSTRUMENTS_TO_SCAN = [
     "XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD"
 ]
 
+# Volatilité classée par instrument (basée sur ATR moyen historique)
 VOLATILITY_LEVELS = {
+    # Majors (faible volatilité)
     "EUR_USD": "Basse", "GBP_USD": "Basse", "USD_JPY": "Basse", "USD_CHF": "Basse", 
     "USD_CAD": "Basse", "AUD_USD": "Moyenne", "NZD_USD": "Moyenne",
+    # Crosses (moyenne volatilité)
     "EUR_GBP": "Moyenne", "EUR_JPY": "Moyenne", "EUR_CHF": "Moyenne", 
     "EUR_AUD": "Moyenne", "EUR_CAD": "Moyenne", "EUR_NZD": "Moyenne",
     "GBP_JPY": "Haute", "GBP_CHF": "Haute", "GBP_AUD": "Haute", 
@@ -46,279 +34,317 @@ VOLATILITY_LEVELS = {
     "AUD_JPY": "Haute", "AUD_CAD": "Moyenne", "AUD_CHF": "Haute", 
     "AUD_NZD": "Moyenne", "CAD_JPY": "Haute", "CAD_CHF": "Haute", 
     "CHF_JPY": "Haute", "NZD_JPY": "Haute", "NZD_CAD": "Moyenne", "NZD_CHF": "Haute",
+    # Commodités & Indices (très haute volatilité)
     "XAU_USD": "Très Haute", "US30_USD": "Très Haute", "NAS100_USD": "Très Haute", "SPX500_USD": "Très Haute"
 }
 
 TIME_FRAMES = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
 FRACTAL_LENGTH = 5
 RECENT_BARS_THRESHOLD = 10
-MAX_WORKERS = 4
+MAX_WORKERS = 5
 
-FRACTAL_LENGTHS_BY_TF = { "H1": 5, "H4": 6, "D1": 7, "Weekly": 8 }
+# Fractales adaptatives par timeframe
+FRACTAL_LENGTHS_BY_TF = {
+    "H1": 5,      # Court terme, fractales serrées
+    "H4": 6,      # Un peu plus large
+    "D1": 7,      # Fractales plus importantes
+    "Weekly": 8   # Long terme, fractales larges
+}
 
-# --- FONCTIONS METIER ---
-
+# --- Fonctions optimisées ---
 def calculate_atr(df, period=14):
-    if df is None or len(df) < period: return None
-    high, low, close = df['high'].values, df['low'].values, df['close'].values
-    tr1 = high[1:] - low[1:]
-    tr2 = np.abs(high[1:] - close[:-1])
-    tr3 = np.abs(low[1:] - close[:-1])
-    tr = np.maximum(tr1, np.maximum(tr2, tr3))
-    return np.mean(tr[-period:])
+    """Calcule l'ATR pour mesurer la volatilité actuelle"""
+    if df is None or len(df) < period:
+        return None
+    
+    high = df['high'].values
+    low = df['low'].values
+    close = df['close'].values
+    
+    tr1 = high - low
+    tr2 = np.abs(high - close[:-1])
+    tr3 = np.abs(low - close[:-1])
+    
+    tr = np.maximum(tr1[1:], np.maximum(tr2, tr3))
+    atr = np.mean(tr[-period:])
+    
+    return atr
 
-def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3):
+def get_oanda_data(api_client, instrument, granularity, count=250, max_retries=3, retry_delay=2):
     params = {"count": count, "granularity": granularity}
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
     for attempt in range(max_retries):
         try:
             api_client.request(r)
             data = r.response.get('candles')
-            if not data: return None, "Aucune donnée"
-            records = []
+            if not data:
+                return None, f"Aucune bougie pour {instrument} sur {granularity}."
+            
+            times = []
+            opens, highs, lows, closes = [], [], [], []
             for c in data:
                 if c['complete']:
-                    records.append({
-                        "time": pd.to_datetime(c['time']),
-                        "open": float(c['mid']['o']),
-                        "high": float(c['mid']['h']),
-                        "low": float(c['mid']['l']),
-                        "close": float(c['mid']['c'])
-                    })
-            return pd.DataFrame(records), "Succès"
+                    times.append(pd.to_datetime(c['time']))
+                    opens.append(float(c['mid']['o']))
+                    highs.append(float(c['mid']['h']))
+                    lows.append(float(c['mid']['l']))
+                    closes.append(float(c['mid']['c']))
+            
+            if not times:
+                return None, f"DataFrame vide pour {instrument} sur {granularity}."
+            
+            df = pd.DataFrame({
+                "time": times,
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": closes
+            })
+            return df, "Succès"
+            
+        except oandapyV20.exceptions.V20Error as e:
+            error_message = f"Erreur API OANDA (tentative {attempt + 1}/{max_retries}): {e}"
+            if attempt + 1 == max_retries:
+                return None, error_message
+            time_module.sleep(retry_delay)
         except Exception as e:
-            if attempt + 1 == max_retries: return None, str(e)
-            time_module.sleep(1)
-    return None, "Erreur inconnue"
+            error_message = f"Erreur inattendue (tentative {attempt + 1}/{max_retries}): {e}"
+            if attempt + 1 == max_retries:
+                return None, error_message
+            time_module.sleep(retry_delay)
+    
+    return None, "Échec après plusieurs tentatives."
 
 def detect_choch_optimized(df, instrument, tf_code, length=None):
-    if df is None or len(df) < 50: return None, None, None
-    if length is None: length = FRACTAL_LENGTHS_BY_TF.get(tf_code, FRACTAL_LENGTH)
+    """Détection CHoCH optimisée avec fractales adaptatives"""
+    if df is None or len(df) < length:
+        return None, None, None
+    
+    # Adapter la longueur de fractale selon le timeframe
+    if length is None:
+        length = FRACTAL_LENGTHS_BY_TF.get(tf_code, FRACTAL_LENGTH)
     
     p = length // 2
-    highs, lows, closes, times = df['high'].values, df['low'].values, df['close'].values, df['time'].values
+    highs = df['high'].values
+    lows = df['low'].values
+    closes = df['close'].values
+    
+    # Calculer ATR pour qualifier la confirmation
     atr = calculate_atr(df)
     
-    upper_val, lower_val = None, None
-    upper_crossed, lower_crossed = True, True
-    os = 0
+    is_bull_fractal = np.zeros(len(df), dtype=bool)
+    is_bear_fractal = np.zeros(len(df), dtype=bool)
     
-    choch_sig, choch_t, choch_idx = None, None, -1
-    strength = "Neutre"
-
-    is_bull = np.zeros(len(df), dtype=bool)
-    is_bear = np.zeros(len(df), dtype=bool)
-
-    # Identification fractales
     for i in range(p, len(df) - p):
-        if highs[i] == np.max(highs[i-p : i+p+1]): is_bull[i] = True
-        if lows[i] == np.min(lows[i-p : i+p+1]): is_bear[i] = True
-
-    # Identification CHOCH
+        window_highs = highs[i - p:i + p + 1]
+        window_lows = lows[i - p:i + p + 1]
+        if highs[i] == np.max(window_highs):
+            is_bull_fractal[i] = True
+        if lows[i] == np.min(window_lows):
+            is_bear_fractal[i] = True
+    
+    upper_fractal = {'value': None, 'iscrossed': True}
+    lower_fractal = {'value': None, 'iscrossed': True}
+    os = 0
+    choch_signal, choch_time = None, None
+    choch_bar_index = -1
+    confirmation_strength = None
+    
     for i in range(length, len(df)):
-        prev_idx = i - p
-        if prev_idx >= 0:
-            if is_bull[prev_idx]: upper_val, upper_crossed = highs[prev_idx], False
-            if is_bear[prev_idx]: lower_val, lower_crossed = lows[prev_idx], False
+        if is_bull_fractal[i - p]:
+            upper_fractal = {'value': highs[i - p], 'iscrossed': False}
+        if is_bear_fractal[i - p]:
+            lower_fractal = {'value': lows[i - p], 'iscrossed': False}
         
-        curr, prev = closes[i], closes[i-1]
-
-        if upper_val and not upper_crossed:
-            if curr > upper_val and prev <= upper_val:
+        current_close, previous_close = closes[i], closes[i - 1]
+        
+        if upper_fractal['value'] is not None and not upper_fractal['iscrossed']:
+            if current_close > upper_fractal['value'] and previous_close <= upper_fractal['value']:
                 if os == -1:
-                    choch_sig, choch_t, choch_idx = "Bullish CHoCH", times[i], i
-                    strength = "Fort" if (atr and (curr - upper_val) > atr * 0.3) else "Moyen"
-                os, upper_crossed = 1, True
-
-        if lower_val and not lower_crossed:
-            if curr < lower_val and prev >= lower_val:
+                    choch_signal = "Bullish CHoCH"
+                    choch_time = df['time'].iloc[i]
+                    choch_bar_index = i
+                    # Force de confirmation basée sur la distance parcourue au-delà de la fractale
+                    move_beyond = current_close - upper_fractal['value']
+                    confirmation_strength = "Fort" if atr and move_beyond > atr * 0.5 else "Moyen"
+                os, upper_fractal['iscrossed'] = 1, True
+        
+        if lower_fractal['value'] is not None and not lower_fractal['iscrossed']:
+            if current_close < lower_fractal['value'] and previous_close >= lower_fractal['value']:
                 if os == 1:
-                    choch_sig, choch_t, choch_idx = "Bearish CHoCH", times[i], i
-                    strength = "Fort" if (atr and (lower_val - curr) > atr * 0.3) else "Moyen"
-                os, lower_crossed = -1, True
-
-    if choch_sig and (len(df) - 1 - choch_idx) <= RECENT_BARS_THRESHOLD:
-        return choch_sig, pd.to_datetime(choch_t), strength
+                    choch_signal = "Bearish CHoCH"
+                    choch_time = df['time'].iloc[i]
+                    choch_bar_index = i
+                    move_beyond = lower_fractal['value'] - current_close
+                    confirmation_strength = "Fort" if atr and move_beyond > atr * 0.5 else "Moyen"
+                os, lower_fractal['iscrossed'] = -1, True
+    
+    if choch_signal and (len(df) - 1 - choch_bar_index) < RECENT_BARS_THRESHOLD:
+        return choch_signal, choch_time, confirmation_strength
+    
     return None, None, None
 
-def scan_wrapper(api_key, instrument, tf_name, tf_code):
-    try:
-        client = API(access_token=api_key)
-        df, msg = get_oanda_data(client, instrument, tf_code)
-        if df is not None:
-            signal, sig_time, strength = detect_choch_optimized(df, instrument, tf_code)
-            if signal:
-                return {
-                    "Instrument": instrument.replace("_", "/"),
-                    "Timeframe": tf_name,
-                    "Ordre": "Achat" if "Bullish" in signal else "Vente",
-                    "Signal": signal,
-                    "Volatilité": VOLATILITY_LEVELS.get(instrument, "Inconnue"),
-                    "Force": strength,
-                    "Heure (UTC)": sig_time
-                }
-            return None
-        return {"error": True, "msg": f"{instrument} {tf_name}: {msg}"}
-    except Exception as e:
-        return {"error": True, "msg": f"Crash {instrument}: {str(e)}"}
-
-# --- STYLE DU TABLEAU (CORRIGÉ: map au lieu de applymap) ---
-def apply_custom_style(df):
-    def color_signal(val):
-        color = "#089981" if "Bullish" in str(val) else "#f23645" if "Bearish" in str(val) else "black"
-        return f'color: {color}; font-weight: bold;'
+def scan_instrument_timeframe(api_client, instrument, tf_name, tf_code):
+    """Fonction pour scanner un couple instrument/timeframe"""
+    df, status_message = get_oanda_data(api_client, instrument, tf_code)
     
-    def style_order(val):
-        bg = "#089981" if val == "Achat" else "#f23645"
-        return f'background-color: {bg}; color: white; border-radius: 4px; text-align: center; font-weight: bold;'
+    if df is not None:
+        signal, signal_time, confirmation = detect_choch_optimized(df, instrument, tf_code)
+        if signal:
+            action = "Achat" if "Bullish" in signal else "Vente"
+            volatility = VOLATILITY_LEVELS.get(instrument, "Inconnue")
+            return {
+                "Instrument": instrument.replace("_", "/"),
+                "Timeframe": tf_name,
+                "Ordre": action,
+                "Signal": signal,
+                "Volatilité": volatility,
+                "Force": confirmation,
+                "Heure (UTC)": signal_time
+            }
     
-    def style_volatility(val):
-        colors = {"Basse": "#089981", "Moyenne": "#FFA500", "Haute": "#FF6B6B", "Très Haute": "#f23645"}
-        return f'background-color: {colors.get(val, "white")}; color: white; border-radius: 4px; text-align: center;'
+    return {"error": True, "instrument": instrument, "tf": tf_name, "message": status_message}
 
-    def style_force(val):
-        bg = "#089981" if val == "Fort" else "#FFA500"
-        return f'background-color: {bg}; color: white; border-radius: 4px; text-align: center;'
-
-    # Utilisation de .map() (compatible Pandas récent/Streamlit)
-    return df.style.map(color_signal, subset=['Signal']) \
-                   .map(style_order, subset=['Ordre']) \
-                   .map(style_volatility, subset=['Volatilité']) \
-                   .map(style_force, subset=['Force']) \
-                   .format({'Heure (UTC)': lambda x: x.strftime('%Y-%m-%d %H:%M')})
-
-# --- PDF ---
-class PDFReport(FPDF):
-    def header(self):
-        self.set_font('Arial', 'B', 16)
-        self.cell(0, 10, 'Rapport des Signaux CHoCH', 0, 1, 'C')
-        self.ln(5)
-
-def generate_pdf(df_full):
-    pdf = PDFReport()
-    pdf.add_page()
-    pdf.set_font("Arial", size=10)
-    df_export = df_full.drop(columns=['Top'], errors='ignore') if 'Top' in df_full.columns else df_full
-    cols = df_export.columns.tolist()
-    widths = [30, 20, 20, 40, 25, 20, 35]
-    pdf.set_font("Arial", 'B', 9)
-    for i, h in enumerate(cols):
-        pdf.cell(widths[i], 8, str(h), 1, 0, 'C')
-    pdf.ln()
-    pdf.set_font("Arial", size=8)
-    for _, row in df_export.iterrows():
-        for i, c in enumerate(cols):
-            val = str(row[c])
-            pdf.set_text_color(0,0,0)
-            if c == 'Ordre':
-                pdf.set_text_color(0,100,0) if val == 'Achat' else pdf.set_text_color(200,0,0)
-            pdf.cell(widths[i], 8, val, 1, 0, 'C')
-        pdf.ln()
-    return pdf.output(dest='S').encode('latin-1')
-
-# --- MAIN APPLICATION ---
 def main():
+    st.set_page_config(page_title="Scanner de CHoCH", layout="wide")
     st.markdown("""
-        <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 20px;">
-            <h1 style="color: #f23645;">Scanner</h1>
-            <h1 style="color: #089981; margin-left: 10px;">CHoCH</h1>
+        <div style="display: flex; align-items: center; margin-bottom: 25px;">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-right: 10px;">
+                <path d="M4 4V8H8" stroke="#f23645" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M4 12V20H20V4H12" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M8 4L4 8" stroke="#089981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <h1 style="margin: 0;">Scanner de Change of Character (CHoCH)</h1>
         </div>
     """, unsafe_allow_html=True)
 
     try:
         OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
-    except:
-        st.error("⚠️ Token OANDA manquant dans les secrets.")
+    except (KeyError, FileNotFoundError):
+        st.error("Erreur : Veuillez configurer OANDA_ACCESS_TOKEN dans les secrets de Streamlit.")
         st.stop()
-
-    if st.button('🚀 Lancer le Scan', use_container_width=True):
-        st.session_state['scan_results'] = None
-        st.session_state['failed_scans'] = []
-        
-        results, errors = [], []
-        total = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
-        
-        bar = st.progress(0)
-        status = st.empty()
-        done = 0
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
-            for inst in INSTRUMENTS_TO_SCAN:
-                for tf_n, tf_c in TIME_FRAMES.items():
-                    futures.append(executor.submit(scan_wrapper, OANDA_ACCESS_TOKEN, inst, tf_n, tf_c))
+    
+    if st.button('Lancer un nouveau Scan'):
+        if 'scan_results' in st.session_state:
+            del st.session_state['scan_results']
+        if 'failed_scans' in st.session_state:
+            del st.session_state['failed_scans']
             
-            for f in as_completed(futures):
-                res = f.result()
-                if res:
-                    if "error" in res: errors.append(res["msg"])
-                    else: results.append(res)
-                done += 1
-                bar.progress(done / total)
-                status.text(f"Scan en cours: {done}/{total}")
+        try:
+            api_client = API(access_token=OANDA_ACCESS_TOKEN)
+        except Exception as e:
+            st.error(f"Erreur d'initialisation de l'API Oanda: {e}")
+            st.stop()
 
-        bar.empty()
-        status.success("Terminé !")
-        st.session_state['scan_results'] = pd.DataFrame(results) if results else pd.DataFrame()
-        st.session_state['failed_scans'] = errors
-        st.rerun()
+        with st.spinner('Scan en cours...'):
+            results, failed = [], []
+            total_scans = len(INSTRUMENTS_TO_SCAN) * len(TIME_FRAMES)
+            progress_bar = st.progress(0)
+            progress_status = st.empty()
+            completed_scans = 0
+            
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {}
+                
+                for instrument in INSTRUMENTS_TO_SCAN:
+                    for tf_name, tf_code in TIME_FRAMES.items():
+                        future = executor.submit(scan_instrument_timeframe, api_client, instrument, tf_name, tf_code)
+                        futures[future] = (instrument, tf_name)
+                
+                for future in as_completed(futures):
+                    completed_scans += 1
+                    instrument, tf_name = futures[future]
+                    
+                    try:
+                        result = future.result()
+                        if "error" not in result or not result["error"]:
+                            results.append(result)
+                        else:
+                            failed.append(f"- **{result['instrument']} ({result['tf']})**: {result['message']}")
+                    except Exception as e:
+                        failed.append(f"- **{instrument} ({tf_name})**: Erreur d'exécution: {e}")
+                    
+                    progress_value = completed_scans / total_scans
+                    progress_bar.progress(progress_value)
+                    progress_status.text(f"Progression: {completed_scans}/{total_scans} scans")
+            
+            progress_status.success("✅ Scan terminé !")
+            st.session_state['scan_results'] = pd.DataFrame(results) if results else None
+            st.session_state['failed_scans'] = failed if failed else None
+            
+            st.rerun()
 
     if 'scan_results' in st.session_state:
-        df = st.session_state['scan_results']
-        
-        if df.empty:
-            st.info("Aucun signal détecté.")
+        full_df = st.session_state['scan_results']
+
+        if full_df is None or full_df.empty:
+            st.success("✅ Aucun signal de CHoCH récent détecté.")
         else:
-            # Boutons d'export
-            c1, c2 = st.columns(2)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-            df_export = df.copy()
-            csv = df_export.to_csv(index=False).encode('utf-8')
-            c1.download_button("📥 CSV", csv, f"scan_{timestamp}.csv", "text/csv", use_container_width=True)
+            full_df['Heure (UTC)'] = pd.to_datetime(full_df['Heure (UTC)'])
+            st.markdown("### 📤 Exporter les résultats")
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
+            df_to_export = full_df.copy()
+
+            csv = df_to_export.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Télécharger en CSV", csv, f"choch_signaux_{timestamp}.csv", "text/csv")
+
             try:
-                pdf_data = generate_pdf(df_export)
-                c2.download_button("📄 PDF", pdf_data, f"scan_{timestamp}.pdf", "application/pdf", use_container_width=True)
-            except: pass
+                image_buf = io.BytesIO()
+                dfi.export(df_to_export, image_buf, table_conversion='matplotlib')
+                image_buf.seek(0)
+                st.download_button("🖼️ Télécharger en PNG", image_buf, f"choch_signaux_{timestamp}.png", "image/png")
+            except Exception as e:
+                st.warning(f"Erreur lors de l'export PNG : {e}")
 
-            # --- AFFICHAGE PAR TIMEFRAME ---
-            ordered_tfs = ["H1", "H4", "D1", "Weekly"]
-            
-            for tf in ordered_tfs:
-                tf_df = df[df['Timeframe'] == tf].copy()
-                
+            try:
+                pdf = FPDF(orientation='L', unit='mm', format='A4')
+                pdf.set_auto_page_break(auto=True, margin=15)
+                pdf.add_page()
+                pdf.set_font("Arial", 'B', 16)
+                pdf.cell(0, 10, "Rapport des Signaux CHoCH", 0, 1, 'C')
+                pdf.set_font("Arial", size=10)
+                rows_per_page = 20
+                for i in range(0, len(df_to_export), rows_per_page):
+                    if i > 0:
+                        pdf.add_page()
+                    chunk = df_to_export.iloc[i:i+rows_per_page]
+                    img_temp_path = f"temp_chunk_{i}.png"
+                    dfi.export(chunk, img_temp_path, table_conversion='matplotlib')
+                    pdf.image(img_temp_path, x=10, y=pdf.get_y(), w=277)
+                    os.remove(img_temp_path)
+                pdf_output = pdf.output(dest='S').encode('latin-1')
+                st.download_button("📄 Télécharger en PDF", pdf_output, f"choch_signaux_{timestamp}.pdf", "application/pdf")
+            except Exception as e:
+                st.warning(f"Erreur lors de l'export PDF : {e}")
+
+            for tf_name in TIME_FRAMES.keys():
+                tf_df = full_df[full_df['Timeframe'] == tf_name].copy()
                 if not tf_df.empty:
-                    st.markdown(f"### ⏱️ {tf}")
-                    
-                    # 1. Trier par date (le plus récent en haut)
                     tf_df = tf_df.sort_values(by='Heure (UTC)', ascending=False)
+                    tf_df.insert(0, ' ', ['⭐'] + [''] * (len(tf_df) - 1))
+                    tf_df['Heure (UTC)'] = tf_df['Heure (UTC)'].dt.strftime('%Y-%m-%d %H:%M')
+                    st.subheader(f"--- Signaux {tf_name} ---")
+                    def color_signal(val):
+                        return f'color: {"#089981" if "Bullish" in val else "#f23645"}; font-weight: bold;'
+                    def style_order(val):
+                        return f'background-color: {"#089981" if val == "Achat" else "#f23645"}; color: white; border-radius: 5px; text-align: center; font-weight: bold;'
+                    def style_volatility(val):
+                        colors = {"Basse": "#089981", "Moyenne": "#FFA500", "Haute": "#FF6B6B", "Très Haute": "#f23645"}
+                        color = colors.get(val, "#FFFFFF")
+                        return f'background-color: {color}; color: white; text-align: center; border-radius: 3px;'
+                    def style_force(val):
+                        return f'background-color: {"#089981" if val == "Fort" else "#FFA500"}; color: white; text-align: center; border-radius: 3px;'
                     
-                    # 2. Ajout de la colonne Top (étoile)
-                    tf_df.insert(0, 'Top', '') 
-                    if len(tf_df) > 0:
-                        tf_df.iloc[0, tf_df.columns.get_loc('Top')] = '⭐'
-                    
-                    # 3. Supprimer la colonne Timeframe (redondante avec le titre)
-                    tf_df_display = tf_df.drop(columns=['Timeframe'])
-                    
-                    # 4. Appliquer le style
-                    styled_df = apply_custom_style(tf_df_display)
-                    
-                    # 5. Calcul de la hauteur pour afficher tout le tableau SANS SCROLL
-                    # Environ 35px par ligne + header + padding
-                    height_calc = (len(tf_df) + 1) * 35 + 3
+                    styled_df = tf_df.drop(columns=['Timeframe']).style \
+                        .applymap(color_signal, subset=['Signal']) \
+                        .applymap(style_order, subset=['Ordre']) \
+                        .applymap(style_volatility, subset=['Volatilité']) \
+                        .applymap(style_force, subset=['Force'])
+                    st.dataframe(styled_df, hide_index=True, use_container_width=True)
 
-                    st.dataframe(
-                        styled_df, 
-                        use_container_width=True, 
-                        hide_index=True,
-                        height=int(height_calc)
-                    )
-                    st.markdown("---")
-
-        if st.session_state.get('failed_scans'):
-            with st.expander("Voir les erreurs techniques"):
-                st.write(st.session_state['failed_scans'])
+        if 'failed_scans' in st.session_state and st.session_state['failed_scans']:
+            with st.expander("⚠️ Voir le rapport des scans ayant échoué"):
+                st.markdown("\n".join(st.session_state['failed_scans']))
 
 if __name__ == "__main__":
     main()
-                  
