@@ -1,4 +1,4 @@
-# app.py → VERSION FINALE ULTIME – PARFAITE, PROFESSIONNELLE, TERMINÉE
+# app.py → VERSION FINALE ABSOLUE – TOUT INCLUS : XPT/USD (PLATINE) + OR + INDICES
 import streamlit as st
 import pandas as pd
 import io
@@ -14,13 +14,18 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 
-# ===================== CONFIG =====================
+# ===================== CONFIG COMPLÈTE (PLATINE INCLUS) =====================
 INSTRUMENTS = [
     "EUR_USD","GBP_USD","USD_JPY","USD_CHF","USD_CAD","AUD_USD","NZD_USD",
     "EUR_GBP","EUR_JPY","EUR_CHF","EUR_AUD","EUR_CAD","EUR_NZD",
     "GBP_JPY","GBP_CHF","GBP_AUD","GBP_CAD","GBP_NZD",
     "AUD_JPY","AUD_CAD","AUD_CHF","AUD_NZD","CAD_JPY","CAD_CHF","CHF_JPY",
-    "NZD_JPY","NZD_CAD","NZD_CHF","XAU_USD","US30_USD","NAS100_USD","SPX500_USD"
+    "NZD_JPY","NZD_CAD","NZD_CHF",
+    "XAU_USD",      # Or
+    "XPT_USD",      # ← PLATINE AJOUTÉ ICI
+    "US30_USD",     # Dow Jones
+    "NAS100_USD",   # Nasdaq
+    "SPX500_USD"    # S&P 500
 ]
 
 VOLATILITY = {
@@ -30,8 +35,12 @@ VOLATILITY = {
     "GBP_JPY":"Haute","GBP_CHF":"Haute","GBP_AUD":"Haute","GBP_CAD":"Haute","GBP_NZD":"Haute",
     "AUD_JPY":"Haute","AUD_CAD":"Moyenne","AUD_CHF":"Haute","AUD_NZD":"Moyenne",
     "CAD_JPY":"Haute","CAD_CHF":"Haute","CHF_JPY":"Haute","NZD_JPY":"Haute",
-    "NZD_CAD":"Moyenne","NZD_CHF":"Haute","XAU_USD":"Très Haute",
-    "US30_USD":"Très Haute","NAS100_USD":"Très Haute","SPX500_USD":"Très Haute"
+    "NZD_CAD":"Moyenne","NZD_CHF":"Haute",
+    "XAU_USD":"Très Haute",     # Or
+    "XPT_USD":"Très Haute",     # ← Platine = Très Haute volatilité
+    "US30_USD":"Très Haute",    # Dow
+    "NAS100_USD":"Très Haute",  # Nasdaq
+    "SPX500_USD":"Très Haute"   # S&P 500
 }
 
 TIMEFRAMES = {"H1":"H1", "H4":"H4", "D1":"D", "Weekly":"W"}
@@ -124,7 +133,7 @@ st.set_page_config(page_title="CHoCH Scanner", layout="wide")
 st.markdown("<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>Scanner Change of Character (CHoCH)</h1>", unsafe_allow_html=True)
 
 if st.button("Lancer le Scan", type="primary", use_container_width=True):
-    with st.spinner("Scan en cours sur 124 timeframes..."):
+    with st.spinner("Scan en cours sur 128 timeframes... (Forex + Or + Platine + Indices)"):
         results = []
         with ThreadPoolExecutor(max_workers=12) as executor:
             futures = {
