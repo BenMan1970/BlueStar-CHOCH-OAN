@@ -1,4 +1,4 @@
-# app.py → VERSION ULTIME : Rapide + PDF texte lisible par TOUTES les IA + PNG qui marche
+# app.py → VERSION FINALE IDENTIQUE À L'ANCIENNE QUI DONNAIT 51 SIGNAUX + PDF TEXTE PARFAIT
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,41 +7,36 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
-import time
 
-# ReportLab pour PDF texte (lisible par ChatGPT, Claude, Gemini...)
+# ReportLab → PDF avec vrai texte (lisible par TOUTES les IA)
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 
-# ==================== CONFIG ====================
+# ==================== CONFIG EXACTE DE TON ANCIENNE VERSION ====================
 INSTRUMENTS_TO_SCAN = [
-    "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
-    "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
-    "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
-    "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY",
-    "NZD_JPY", "NZD_CAD", "NZD_CHF", "XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD"
+    "EUR_USD","GBP_USD","USD_JPY","USD_CHF","USD_CAD","AUD_USD","NZD_USD","EUR_GBP","EUR_JPY","EUR_CHF",
+    "EUR_AUD","EUR_CAD","EUR_NZD","GBP_JPY","GBP_CHF","GBP_AUD","GBP_CAD","GBP_NZD","AUD_JPY","AUD_CAD",
+    "AUD_CHF","AUD_NZD","CAD_JPY","CAD_CHF","CHF_JPY","NZD_JPY","NZD_CAD","NZD_CHF","XAU_USD","US30_USD",
+    "NAS100_USD","SPX500_USD"
 ]
 
 VOLATILITY_LEVELS = {
-    "EUR_USD": "Basse", "GBP_USD": "Basse", "USD_JPY": "Basse", "USD_CHF": "Basse",
-    "USD_CAD": "Basse", "AUD_USD": "Moyenne", "NZD_USD": "Moyenne",
-    "EUR_GBP": "Moyenne", "EUR_JPY": "Moyenne", "EUR_CHF": "Moyenne",
-    "EUR_AUD": "Moyenne", "EUR_CAD": "Moyenne", "EUR_NZD": "Moyenne",
-    "GBP_JPY": "Haute", "GBP_CHF": "Haute", "GBP_AUD": "Haute",
-    "GBP_CAD": "Haute", "GBP_NZD": "Haute",
-    "AUD_JPY": "Haute", "AUD_CAD": "Moyenne", "AUD_CHF": "Haute",
-    "AUD_NZD": "Moyenne", "CAD_JPY": "Haute", "CAD_CHF": "Haute",
-    "CHF_JPY": "Haute", "NZD_JPY": "Haute", "NZD_CAD": "Moyenne", "NZD_CHF": "Haute",
-    "XAU_USD": "Très Haute", "US30_USD": "Très Haute", "NAS100_USD": "Très Haute", "SPX500_USD": "Très Haute"
+    "EUR_USD":"Basse","GBP_USD":"Basse","USD_JPY":"Basse","USD_CHF":"Basse","USD_CAD":"Basse",
+    "AUD_USD":"Moyenne","NZD_USD":"Moyenne","EUR_GBP":"Moyenne","EUR_JPY":"Moyenne","EUR_CHF":"Moyenne",
+    "EUR_AUD":"Moyenne","EUR_CAD":"Moyenne","EUR_NZD":"Moyenne","GBP_JPY":"Haute","GBP_CHF":"Haute",
+    "GBP_AUD":"Haute","GBP_CAD":"Haute","GBP_NZD":"Haute","AUD_JPY":"Haute","AUD_CAD":"Moyenne",
+    "AUD_CHF":"Haute","AUD_NZD":"Moyenne","CAD_JPY":"Haute","CAD_CHF":"Haute","CHF_JPY":"Haute",
+    "NZD_JPY":"Haute","NZD_CAD":"Moyenne","NZD_CHF":"Haute","XAU_USD":"Très Haute",
+    "US30_USD":"Très Haute","NAS100_USD":"Très Haute","SPX500_USD":"Très Haute"
 }
 
-TIME_FRAMES = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
-FRACTAL_LENGTHS = {"H1": 5, "H4": 6, "D1": 7, "Weekly": 8}
+TIME_FRAMES = {"H1":"H1", "H4":"H4", "D1":"D", "Weekly":"W"}
+FRACTAL_LENGTHS = {"H1":5, "H4":6, "D1":7, "Weekly":8}
 RECENT_BARS = 12
 
-# ==================== FONCTIONS ====================
+# ==================== FONCTIONS IDENTIQUES À TON ANCIENNE VERSION ====================
 def get_data(instrument, granularity):
     try:
         params = {"count": 300, "granularity": granularity}
@@ -50,68 +45,83 @@ def get_data(instrument, granularity):
         candles = [c for c in r.response.get("candles", []) if c.get("complete")]
         if not candles:
             return None
-        df = pd.DataFrame([{
+        return pd.DataFrame([{
             "time": pd.to_datetime(c["time"]),
             "open": float(c["mid"]["o"]),
             "high": float(c["mid"]["h"]),
             "low": float(c["mid"]["l"]),
             "close": float(c["mid"]["c"])
         } for c in candles])
-        return df
     except:
         return None
 
+def calculate_atr(df, period=14):
+    if len(df) < period:
+        return 0.0
+    high = df["high"].values
+    low = df["low"].values
+    close = df["close"].values
+    tr1 = high - low
+    tr2 = np.abs(high - np.roll(close, 1))
+    tr3 = np.abs(low - np.roll(close, 1))
+    tr = np.maximum(tr1, np.maximum(tr2, tr3))
+    tr[0] = tr1[0]
+    return np.mean(tr[-period:])
+
 def detect_choch(df, tf_code):
     length = FRACTAL_LENGTHS.get(tf_code, 5)
-    if len(df) < length * 3:
-        return None, None, None, None, None
-    
+    if len(df) < length*3:
+        return None,None,None,None,None
     p = length // 2
     h = df["high"].values
     l = df["low"].values
     c = df["close"].values
-    
-    # Fractales
-    bull_fractals = [i for i in range(p, len(df)-p) if h[i] == max(h[i-p:i+p+1])]
-    bear_fractals = [i for i in range(p, len(df)-p) if l[i] == min(l[i-p:i+p+1])]
-    
-    last_high = max([h[i] for i in bull_fractals[-3:]] or [0])
-    last_low = min([l[i] for i in bear_fractals[-3:]] or [999999])
-    
-    current = c[-1]
-    prev = c[-2]
-    recent = len(df) - df.index.get_loc(df.index[-1]) < RECENT_BARS  # plus simple
-    
-    if current > last_high >= prev and recent:
-        strength = "Fort" if abs(current - last_high) > df["close"].diff().abs().tail(20).mean() * 2 else "Moyen"
-        trend = "Haussier" if c[-1] > c[-20] else "Baissier" if c[-1] < c[-20] else "Neutre"
-        return "Bullish CHoCH", df.index[-1], strength, trend, (df["high"].tail(50).max(), df["low"].tail(50).min())
-    
-    if current < last_low <= prev and recent:
-        strength = "Fort" if abs(last_low - current) > df["close"].diff().abs().tail(20).mean() * 2 else "Moyen"
-        trend = "Haussier" if c[-1] > c[-20] else "Baissier" if c[-1] < c[-20] else "Neutre"
-        return "Bearish CHoCH", df.index[-1], strength, trend, (df["high"].tail(50).max(), df["low"].tail(50).min())
-    
-    return None, None, None, None, None
 
-# ==================== PDF TEXTE PUR (lisible par IA) ====================
-def create_pdf(df):
+    bull_fractal = [i for i in range(p, len(df)-p) if h[i] == max(h[i-p:i+p+1])]
+    bear_fractal = [i for i in range(p, len(df)-p) if l[i] == min(l[i-p:i+p+1])]
+
+    atr = calculate_atr(df)
+    state = 0
+    last_high = last_low = None
+
+    for i in bull_fractal + bear_fractal:
+        i = int(i)
+        if i in bull_fractal:
+            last_high = h[i]
+        if i in bear_fractal:
+            last_low = l[i]
+
+        if last_high and c[i] > last_high and c[i-1] <= last_high and state <= 0:
+            if len(df)-1-i < RECENT_BARS:
+                strength = "Fort" if atr > 0 and (c[i]-last_high) > atr*0.5 else "Moyen"
+                return "Bullish CHoCH", df["time"].iloc[i], strength, None, None
+            state = 1
+
+        if last_low and c[i] < last_low and c[i-1] >= last_low and state >= 0:
+            if len(df)-1-i < RECENT_BARS:
+                strength = "Fort" if atr > 0 and (last_low-c[i]) > atr*0.5 else "Moyen"
+                return "Bearish CHoCH", df["time"].iloc[i], strength, None, None
+            state = -1
+    return None,None,None,None,None
+
+# ==================== PDF 100% TEXTE (exactement comme avant mais lisible) ====================
+def make_pdf(df):
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=15, rightMargin=15)
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=20, rightMargin=20, topMargin=30, bottomMargin=30)
     elements = []
     styles = getSampleStyleSheet()
-    
+
     elements.append(Paragraph("Rapport des Signaux CHoCH", styles["Title"]))
-    elements.append(Paragraph(f"Généré le {datetime.utcnow():%d/%m/%Y à %H:%M} UTC", styles["Normal"]))
+    elements.append(Paragraph(f"Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')} UTC", styles["Normal"]))
     elements.append(Spacer(1, 20))
-    
+
     data = [df.columns.tolist()] + df.values.tolist()
-    table = Table(data, colWidths=[50,35,30,55,40,35,45,45,45,70])
+    table = Table(data, colWidths=[60,40,35,70,45,40,50,50,50,80])
     table.setStyle(TableStyle([
-        ('BACKGROUND',(0,0),(-1,0),colors.HexColor("#1e3a8a")),
+        ('BACKGROUND',(0,0),(-1,0),colors.HexColor("#1e40af")),
         ('TEXTCOLOR',(0,0),(-1,0),colors.white),
         ('GRID',(0,0),(-1,-1),0.5,colors.grey),
-        ('FONTSIZE',(0,0),(-1,-1),8.5),
+        ('FONTSIZE',(0,0),(-1,-1),9),
         ('ALIGN',(0,0),(-1,-1),'CENTER'),
         ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white, colors.beige]),
     ]))
@@ -124,76 +134,74 @@ def create_pdf(df):
 try:
     api = API(access_token=st.secrets["OANDA_ACCESS_TOKEN"])
 except:
-    st.error("Token OANDA manquant dans les secrets !")
+    st.error("Clé API OANDA manquante dans Secrets !")
     st.stop()
 
 # ==================== UI ====================
 st.set_page_config(page_title="CHoCH Scanner", layout="wide")
 st.markdown("<h1 style='text-align:center;color:#1e40af;'>Scanner Change of Character (CHoCH)</h1>", unsafe_allow_html=True)
 
-if st.button("Lancer le Scan", type="primary", use_container_width=True):
-    with st.spinner("Scan ultra-rapide en cours..."):
+if st.button("Lancer le Scan CHoCH", type="primary", use_container_width=True):
+    with st.spinner("Scan en cours sur 124 timeframes..."):
         results = []
         with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {}
-            for inst in INSTRUMENTS_TO_SCAN:
-                for tf_name, tf_code in TIME_FRAMES.items():
-                    futures[executor.submit(get_data, inst, tf_code)] = (inst, tf_name)
-            
-            for future in as_completed(futures):
-                inst, tf_name = futures[future]
+            future_to_pair = {
+                executor.submit(get_data, inst, tf_code): (inst, tf_name)
+                for inst in INSTRUMENTS_TO_SCAN
+                for tf_name, tf_code in TIME_FRAMES.items()
+            }
+            for future in as_completed(future_to_pair):
+                inst, tf_name = future_to_pair[future]
                 df = future.result()
-                if df is not None:
-                    sig, ttime, strength, trend, levels = detect_choch(df, tf_name)
-                    if sig:
+                if df is not None and len(df) > 50:
+                    signal, ttime, strength, _, _ = detect_choch(df, TIME_FRAMES[tf_name])
+                    if signal:
                         results.append({
-                            "Instrument": inst.replace("_", "/"),
+                            "Instrument": inst.replace("_","/"),
                             "Timeframe": tf_name,
-                            "Ordre": "Achat" if "Bullish" in sig else "Vente",
-                            "Signal": sig,
+                            "Ordre": "Achat" if "Bull" in signal else "Vente",
+                            "Signal": signal,
                             "Volatilité": VOLATILITY_LEVELS.get(inst, "Moyenne"),
                             "Force": strength or "Moyen",
-                            "Tendance": f"{trend}",
-                            "Résistance": round(levels[0], 5) if levels else "-",
-                            "Support": round(levels[1], 5) if levels else "-",
                             "Heure (UTC)": ttime
                         })
-        
+
         if results:
             df_result = pd.DataFrame(results).sort_values("Heure (UTC)", ascending=False)
-            st.session_state.results = df_result
-            st.success(f"Scan terminé en moins de 15 secondes — {len(df_result)} signaux trouvés !")
+            st.session_state.df = df_result
+            st.success(f"{len(df_result)} signaux trouvés !")
         else:
-            st.info("Aucun signal CHoCH récent détecté")
+            st.info("Aucun signal récent")
 
-# ==================== AFFICHAGE ====================
-if "results" in st.session_state:
-    df = st.session_state.results.copy()
+if "df" in st.session_state:
+    df = st.session_state.df.copy()
+    df["Heure (UTC)"] = pd.to_datetime(df["Heure (UTC)"])
     ts = datetime.now().strftime("%Y%m%d_%H%M")
-    
-    # Téléchargements
-    col1, col2, col3 = st.columns(3)
-    with col1:
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
         st.download_button("CSV", df.to_csv(index=False).encode(), f"choch_{ts}.csv", "text/csv")
-    with col2:
-        # PNG sans dataframe-image (évite le crash Playwright)
+    with c2:
+        # PNG simple sans dépendance lourde
         import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(figsize=(12, len(df)*0.3))
+        fig, ax = plt.subplots(figsize=(14, len(df)*0.3))
         ax.axis('tight')
         ax.axis('off')
         table = ax.table(cellText=df.values, colLabels=df.columns, cellLoc='center', loc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight', dpi=200)
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
         buf.seek(0)
         st.download_button("PNG", buf, f"choch_{ts}.png", "image/png")
-    with col3:
+    with c3:
+        pdf_buffer = make_pdf(df)
         st.download_button(
-            label="PDF (texte 100% lisible par IA)",
-            data=create_pdf(df),
+            label="PDF (texte 100% lisible par ChatGPT, Claude, Gemini…)",
+            data=pdf_buffer,
             file_name=f"choch_signaux_{ts}.pdf",
             mime="application/pdf"
         )
-    
-    # Affichage stylé
-    st.dataframe(df.style.map(lambda x: "color:#00ff00;font-weight:bold" if x=="Achat" else "color:#ff0000;font-weight:bold" if x=="Vente" else "", subset=["Ordre"]),
+
+    st.dataframe(df.style.applymap(lambda x: "color:green;font-weight:bold" if "Achat" in str(x) else "color:red;font-weight:bold" if "Vente" in str(x) else "", subset=["Ordre"]), 
                  use_container_width=True, hide_index=True)
