@@ -1,7 +1,7 @@
 streamlit
 pandas
-oandapyV20
 numpy
+oandapyV20
 dataframe-image
 reportlab
 matplotlib
