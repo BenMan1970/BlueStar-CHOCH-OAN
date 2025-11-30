@@ -1,7 +1,7 @@
-streamlit==1.38.0
-pandas==2.2.2
-oandapyV20==0.7.2
-numpy==1.26.4
-dataframe-image==0.2.3
-reportlab==4.2.2
-matplotlib==3.8.0
+streamlit
+pandas
+oandapyV20
+numpy
+dataframe-image
+reportlab
+matplotlib
