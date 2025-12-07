@@ -1,4 +1,4 @@
-# app.py → VERSION FINALE ABSOLUE – TOUT INCLUS : XPT/USD (PLATINE) + OR + INDICES
+# app.py → VERSION FINALE AVEC MONTHLY (5 TIMEFRAMES)
 import streamlit as st
 import pandas as pd
 import io
@@ -14,7 +14,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 
-# ===================== CONFIG COMPLÈTE (PLATINE INCLUS) =====================
+# ===================== CONFIG COMPLÈTE (PLATINE + MONTHLY) =====================
 INSTRUMENTS = [
     "EUR_USD","GBP_USD","USD_JPY","USD_CHF","USD_CAD","AUD_USD","NZD_USD",
     "EUR_GBP","EUR_JPY","EUR_CHF","EUR_AUD","EUR_CAD","EUR_NZD",
@@ -22,7 +22,7 @@ INSTRUMENTS = [
     "AUD_JPY","AUD_CAD","AUD_CHF","AUD_NZD","CAD_JPY","CAD_CHF","CHF_JPY",
     "NZD_JPY","NZD_CAD","NZD_CHF",
     "XAU_USD",      # Or
-    "XPT_USD",      # ← PLATINE AJOUTÉ ICI
+    "XPT_USD",      # Platine
     "US30_USD",     # Dow Jones
     "NAS100_USD",   # Nasdaq
     "SPX500_USD"    # S&P 500
@@ -37,14 +37,15 @@ VOLATILITY = {
     "CAD_JPY":"Haute","CAD_CHF":"Haute","CHF_JPY":"Haute","NZD_JPY":"Haute",
     "NZD_CAD":"Moyenne","NZD_CHF":"Haute",
     "XAU_USD":"Très Haute",     # Or
-    "XPT_USD":"Très Haute",     # ← Platine = Très Haute volatilité
+    "XPT_USD":"Très Haute",     # Platine
     "US30_USD":"Très Haute",    # Dow
     "NAS100_USD":"Très Haute",  # Nasdaq
     "SPX500_USD":"Très Haute"   # S&P 500
 }
 
-TIMEFRAMES = {"H1":"H1", "H4":"H4", "D1":"D", "Weekly":"W"}
-FRACTAL_LEN = {"H1":5, "H4":6, "D1":7, "Weekly":8}
+# ← MONTHLY AJOUTÉ ICI
+TIMEFRAMES = {"H1":"H1", "H4":"H4", "D1":"D", "Weekly":"W", "Monthly":"M"}
+FRACTAL_LEN = {"H1":5, "H4":6, "D1":7, "Weekly":8, "Monthly":9}
 
 # ===================== API =====================
 try:
@@ -56,7 +57,9 @@ except:
 # ===================== FONCTIONS (TA LOGIQUE ORIGINALE 100%) =====================
 def get_candles(inst, gran):
     try:
-        r = instruments.InstrumentsCandles(instrument=inst, params={"count": 300, "granularity": gran})
+        # Plus d'historique pour Monthly
+        count = 500 if gran == "M" else 300
+        r = instruments.InstrumentsCandles(instrument=inst, params={"count": count, "granularity": gran})
         api.request(r)
         candles = [c for c in r.response.get("candles", []) if c.get("complete")]
         if len(candles) < 50:
@@ -133,7 +136,7 @@ st.set_page_config(page_title="CHoCH Scanner", layout="wide")
 st.markdown("<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>Scanner Change of Character (CHoCH)</h1>", unsafe_allow_html=True)
 
 if st.button("Lancer le Scan", type="primary", use_container_width=True):
-    with st.spinner("Scan en cours sur 128 timeframes... (Forex + Or + Platine + Indices)"):
+    with st.spinner("Scan en cours sur 160 timeframes... (Forex + Or + Platine + Indices + Monthly)"):
         results = []
         with ThreadPoolExecutor(max_workers=12) as executor:
             futures = {
@@ -160,7 +163,7 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True):
         if results:
             df_result = pd.DataFrame(results).sort_values("Heure (UTC)", ascending=False)
             st.session_state.df = df_result
-            st.success(f"Scan terminé – {len(df_result)} signaux détectés !")
+            st.success(f"Scan terminé – {len(df_result)} signaux détectés sur 160 timeframes !")
         else:
             st.info("Aucun signal CHoCH récent détecté")
 
