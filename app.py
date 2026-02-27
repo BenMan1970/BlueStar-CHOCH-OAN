@@ -147,11 +147,11 @@ def detect_choch(df, tf):
             return "Moyen"
         ratio = breakout / atr
         if tf == "H1":
-            return "Fort" if ratio > 1.2 else ("Faible" if ratio < 0.6 else "Moyen")
+            return "Fort" if ratio > 0.8 else ("Faible" if ratio < 0.3 else "Moyen")
         elif tf in ("Weekly", "Monthly"):
-            return "Fort" if ratio > 2.0 else ("Faible" if ratio < 1.0 else "Moyen")
+            return "Fort" if ratio > 1.5 else ("Faible" if ratio < 0.6 else "Moyen")
         else:  # H4, D1
-            return "Fort" if ratio > 1.5 else ("Faible" if ratio < 0.8 else "Moyen")
+            return "Fort" if ratio > 1.0 else ("Faible" if ratio < 0.4 else "Moyen")
 
     if last_high and c[-1] > last_high and c[-2] <= last_high:
         breakout = abs(c[-1] - last_high)
