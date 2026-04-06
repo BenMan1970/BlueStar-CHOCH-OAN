@@ -1,4 +1,4 @@
-# app.py → v4.5 — Force par percentile (auto-calibré par instrument/TF, zéro seuil fixe)
+# app.py → v4.6 — Filtre doji + contexte EMA (zéro changement visuel)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -40,10 +40,8 @@ VOLATILITY = {
 TIMEFRAMES  = {"H1":"H1", "H4":"H4", "D1":"D", "Weekly":"W", "Monthly":"M"}
 FRACTAL_LEN = {"H1":5, "H4":6, "D1":7, "Weekly":8, "Monthly":9}
 
-# Durée d'une bougie par TF (en heures)
 TF_HOURS = {"H1": 1, "H4": 4, "D1": 24, "Weekly": 168, "Monthly": 720}
 
-# Seuils Fresh/Aged/Stale en nombre de bougies
 TF_STATUT = {
     "H1":      {"Fresh": 3,  "Aged": 8},
     "H4":      {"Fresh": 2,  "Aged": 5},
@@ -52,11 +50,11 @@ TF_STATUT = {
     "Monthly": {"Fresh": 1,  "Aged": 2},
 }
 
-# ===================== API — F8: timeout 10s =====================
+# ===================== API =====================
 try:
     api = API(
         access_token=st.secrets["OANDA_ACCESS_TOKEN"],
-        request_params={"timeout": 10}   # F8: évite les threads bloqués indéfiniment
+        request_params={"timeout": 10}
     )
 except Exception as e:
     st.error(f"Token OANDA manquant dans les secrets Streamlit : {e}")
@@ -64,7 +62,7 @@ except Exception as e:
 
 # ===================== FONCTIONS =====================
 def get_candles(inst, gran):
-    try:  # F2: except Exception au lieu de bare except
+    try:
         count = 500 if gran == "M" else 300
         r = instruments.InstrumentsCandles(
             instrument=inst,
@@ -83,12 +81,11 @@ def get_candles(inst, gran):
         } for c in candles])
         df.set_index("time", inplace=True)
         return df
-    except Exception:  # F2
+    except Exception:
         return None
 
 
 def calc_atr(df, period=14):
-    """ATR réel (True Range) — utilisé pour get_force dans detect_choch."""
     h = df["high"].values
     l = df["low"].values
     c = df["close"].values
@@ -101,10 +98,6 @@ def calc_atr(df, period=14):
 
 
 def compute_bb_width(df, length=20, std=2):
-    """
-    BB Width % vs sa propre moyenne sur le TF du signal.
-    Tags : "-32%_Squeeze" | "+41%_Expansion" | "5%_Normal"
-    """
     close = df["close"]
     if len(close) < length * 2:
         return "N/A"
@@ -114,12 +107,9 @@ def compute_bb_width(df, length=20, std=2):
     lower   = sma - std * std_dev
     bb_w    = (upper - lower) / sma
     bb_avg  = bb_w.rolling(length).mean()
-
-    # F5: guard division par zéro
     avg_last = bb_avg.iloc[-1]
     if pd.isna(avg_last) or avg_last == 0:
         return "N/A"
-
     pct  = ((bb_w - bb_avg) / bb_avg * 100).iloc[-1]
     if pd.isna(pct):
         return "N/A"
@@ -132,8 +122,7 @@ def compute_bb_width(df, length=20, std=2):
 
 
 def compute_statut(time_sig, tf):
-    """Fresh / Aged / Stale selon le nb de bougies écoulées depuis le signal."""
-    try:  # F2
+    try:
         now     = datetime.now(timezone.utc)
         sig_utc = time_sig.replace(tzinfo=timezone.utc) if time_sig.tzinfo is None else time_sig
         elapsed_h      = (now - sig_utc).total_seconds() / 3600
@@ -144,8 +133,29 @@ def compute_statut(time_sig, tf):
         if candles_elapsed <= thresholds["Aged"]:
             return "Aged"
         return "Stale"
-    except Exception:  # F2
+    except Exception:
         return "N/A"
+
+
+# ===================== AMÉLIORATION 1 : Contexte de tendance EMA =====================
+def get_trend_context(df):
+    """
+    Retourne 'Uptrend', 'Downtrend' ou 'Range' selon EMA20/EMA50.
+    Un CHoCH en Range avec force non-Fort sera filtré.
+    """
+    close = df["close"]
+    if len(close) < 55:
+        return "Unknown"
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    e20_last = ema20.iloc[-1]
+    e50_last = ema50.iloc[-1]
+    e20_prev = ema20.iloc[-6]  # ~5 bougies en arrière
+    if e20_last > e50_last and e20_last > e20_prev:
+        return "Uptrend"
+    if e20_last < e50_last and e20_last < e20_prev:
+        return "Downtrend"
+    return "Range"
 
 
 def detect_choch(df, tf):
@@ -156,7 +166,6 @@ def detect_choch(df, tf):
         df["close"].values, df["open"].values
     )
 
-    # F9: guard longueur minimale
     if len(c) < max(p * 2 + 1, 3):
         return None, None, None
 
@@ -168,17 +177,11 @@ def detect_choch(df, tf):
         if l[i] == min(l[i-p:i+p+1]):
             last_low = l[i]
 
-    # Distribution des ranges des N dernières bougies (auto-calibrage par instrument/TF)
     candle_ranges = h[1:] - l[1:]
     p25 = float(np.percentile(candle_ranges, 25)) if len(candle_ranges) >= 10 else None
     p75 = float(np.percentile(candle_ranges, 75)) if len(candle_ranges) >= 10 else None
 
     def get_force(candle_range):
-        """
-        Force par percentile sur la distribution des ranges de l'instrument/TF.
-        Top 25% → Fort | 25-75% → Moyen | Bas 25% → Faible
-        Auto-calibré : chaque marché a sa propre distribution, zéro seuil fixe.
-        """
         if p25 is None or p75 is None:
             return "Moyen"
         if candle_range >= p75:
@@ -187,17 +190,48 @@ def detect_choch(df, tf):
             return "Faible"
         return "Moyen"
 
-    # F1 FIX: breakout_range = range de la bougie de breakout
     breakout_range = h[-1] - l[-1]
 
-    # F4 FIX: is not None au lieu de falsy check
+    # ===================== AMÉLIORATION 2 : Filtre doji =====================
+    def is_valid_breakout_candle():
+        """
+        Rejette les dojis : corps < 30% du range total = signal non fiable.
+        Guard division par zéro inclus.
+        """
+        range_total = h[-1] - l[-1]
+        if range_total == 0:
+            return False
+        body = abs(c[-1] - o[-1])
+        return (body / range_total) >= 0.3
+
+    if not is_valid_breakout_candle():
+        return None, None, None
+    # =========================================================================
+
+    sig      = None
+    time_sig = None
+    force    = None
+
     if last_high is not None and c[-1] > last_high and c[-2] <= last_high:
-        return "Bullish CHoCH", df.index[-1], get_force(breakout_range)
+        sig      = "Bullish CHoCH"
+        time_sig = df.index[-1]
+        force    = get_force(breakout_range)
 
-    if last_low is not None and c[-1] < last_low and c[-2] >= last_low:
-        return "Bearish CHoCH", df.index[-1], get_force(breakout_range)
+    elif last_low is not None and c[-1] < last_low and c[-2] >= last_low:
+        sig      = "Bearish CHoCH"
+        time_sig = df.index[-1]
+        force    = get_force(breakout_range)
 
-    return None, None, None
+    if sig is None:
+        return None, None, None
+
+    # ===================== FILTRE : Range sans force =====================
+    trend = get_trend_context(df)
+    if trend == "Range" and force == "Faible":
+        return None, None, None
+    # ====================================================================
+
+    return sig, time_sig, force
 
 
 # ===================== PDF =====================
@@ -211,7 +245,6 @@ def create_pdf(df):
     styles   = getSampleStyleSheet()
 
     elements.append(Paragraph("Rapport des Signaux CHoCH", styles["Title"]))
-    # F7 FIX: datetime.now(timezone.utc) au lieu de utcnow()
     elements.append(Paragraph(
         f"Généré le {datetime.now(timezone.utc).strftime('%d/%m/%Y à %H:%M')} UTC",
         styles["Normal"]
@@ -219,7 +252,7 @@ def create_pdf(df):
     elements.append(Spacer(1, 20))
 
     data       = [df.columns.tolist()] + df.values.tolist()
-    col_widths = [80, 60, 55, 100, 75, 60, 110, 60, 125]  # 9 colonnes
+    col_widths = [80, 60, 55, 100, 75, 60, 110, 60, 125]
 
     table = Table(data, colWidths=col_widths, repeatRows=1)
     table.setStyle(TableStyle([
@@ -243,9 +276,8 @@ def create_pdf(df):
     return buffer
 
 
-# ===================== PNG — F6: généré une seule fois =====================
+# ===================== PNG =====================
 def generate_png(df, display_cols):
-    """Génère le PNG une fois et le met en cache dans session_state."""
     fig, ax = plt.subplots(figsize=(18, max(5, len(df) * 0.35)))
     ax.axis('off')
     disp = df[[c for c in display_cols if c in df.columns]]
@@ -287,7 +319,7 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True):
             }
             for future in as_completed(futures):
                 inst, tf = futures[future]
-                try:  # F3: wrapper future.result()
+                try:
                     df = future.result()
                 except Exception as e:
                     errors.append(f"{inst}/{tf}: {e}")
@@ -314,7 +346,7 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True):
         if results:
             df_result = pd.DataFrame(results).sort_values("Heure (UTC)", ascending=False)
             st.session_state.df      = df_result
-            st.session_state.png_buf = None  # F6: invalider le cache PNG au nouveau scan
+            st.session_state.png_buf = None
             st.success(f"Scan terminé – {len(df_result)} signaux sur 175 combinaisons !")
         else:
             st.info("Aucun signal CHoCH récent détecté")
@@ -324,7 +356,6 @@ if "df" in st.session_state:
     df = st.session_state.df.copy()
     ts = datetime.now().strftime("%Y%m%d_%H%M")
 
-    # F6: PNG généré une seule fois, mis en cache dans session_state
     if st.session_state.get("png_buf") is None:
         st.session_state.png_buf = generate_png(df, DISPLAY_COLS)
 
@@ -348,7 +379,6 @@ if "df" in st.session_state:
             f"choch_signaux_{ts}.pdf", "application/pdf"
         )
 
-    # Tableau avec couleurs
     def style_bb(val):
         if "Squeeze"   in str(val): return "color:#ff9800;font-weight:bold"
         if "Expansion" in str(val): return "color:#ab47bc;font-weight:bold"
