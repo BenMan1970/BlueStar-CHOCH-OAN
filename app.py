@@ -1,4 +1,4 @@
-# app.py → VERSION FINALE AVEC MONTHLY (5 TIMEFRAMES) - v4.1
+# app.py → VERSION FINALE AVEC MONTHLY (5 TIMEFRAMES) - v4.2 (BB Width remplace ATR)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,26 +9,20 @@ from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 import matplotlib.pyplot as plt
 
-# ReportLab → PDF 100% texte sélectionnable, propre et professionnel
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 
-# ===================== CONFIG COMPLÈTE (TOUS ACTIFS + MONTHLY) =====================
+# ===================== CONFIG =====================
 INSTRUMENTS = [
     "EUR_USD","GBP_USD","USD_JPY","USD_CHF","USD_CAD","AUD_USD","NZD_USD",
     "EUR_GBP","EUR_JPY","EUR_CHF","EUR_AUD","EUR_CAD","EUR_NZD",
     "GBP_JPY","GBP_CHF","GBP_AUD","GBP_CAD","GBP_NZD",
     "AUD_JPY","AUD_CAD","AUD_CHF","AUD_NZD","CAD_JPY","CAD_CHF","CHF_JPY",
     "NZD_JPY","NZD_CAD","NZD_CHF",
-    "XAU_USD",      # Or
-    "XAG_USD",      # Argent
-    "XPT_USD",      # Platine
-    "US30_USD",     # Dow Jones
-    "NAS100_USD",   # Nasdaq
-    "SPX500_USD",   # S&P 500
-    "DE30_EUR",     # DAX
+    "XAU_USD","XAG_USD","XPT_USD",
+    "US30_USD","NAS100_USD","SPX500_USD","DE30_EUR",
 ]
 
 VOLATILITY = {
@@ -39,16 +33,10 @@ VOLATILITY = {
     "AUD_JPY":"Haute","AUD_CAD":"Moyenne","AUD_CHF":"Haute","AUD_NZD":"Moyenne",
     "CAD_JPY":"Haute","CAD_CHF":"Haute","CHF_JPY":"Haute","NZD_JPY":"Haute",
     "NZD_CAD":"Moyenne","NZD_CHF":"Haute",
-    "XAU_USD":"Très Haute",
-    "XAG_USD":"Très Haute",
-    "XPT_USD":"Très Haute",
-    "US30_USD":"Très Haute",
-    "NAS100_USD":"Très Haute",
-    "SPX500_USD":"Très Haute",
-    "DE30_EUR":"Très Haute",
+    "XAU_USD":"Très Haute","XAG_USD":"Très Haute","XPT_USD":"Très Haute",
+    "US30_USD":"Très Haute","NAS100_USD":"Très Haute","SPX500_USD":"Très Haute","DE30_EUR":"Très Haute",
 }
 
-# ← MONTHLY INCLUS
 TIMEFRAMES = {"H1":"H1", "H4":"H4", "D1":"D", "Weekly":"W", "Monthly":"M"}
 FRACTAL_LEN = {"H1":5, "H4":6, "D1":7, "Weekly":8, "Monthly":9}
 
@@ -82,7 +70,7 @@ def get_candles(inst, gran):
 
 
 def calc_atr(df, period=14):
-    """ATR réel (True Range) — remplace diff().abs().mean() qui donnait toujours Moyen"""
+    """ATR réel (True Range) — utilisé pour le calcul de Force dans detect_choch"""
     h = df["high"].values
     l = df["low"].values
     c = df["close"].values
@@ -94,36 +82,33 @@ def calc_atr(df, period=14):
     return round(float(np.mean(tr[-period:])), 5)
 
 
-def get_atr_multitf(inst):
-    """Récupère ATR Daily, H1, M15 pour un instrument signalé"""
-    result = {"ATR Daily": "N/A", "ATR H1": "N/A", "ATR M15": "N/A"}
-    for key, gran in [("ATR Daily","D"), ("ATR H1","H1"), ("ATR M15","M15")]:
-        df = get_candles_light(inst, gran)
-        if df is not None:
-            val = calc_atr(df)
-            result[key] = val if not np.isnan(val) else "N/A"
-    return result
-
-
-def get_candles_light(inst, gran, count=50):
-    """Version légère pour ATR seulement"""
-    try:
-        r = instruments.InstrumentsCandles(instrument=inst, params={"count": count, "granularity": gran})
-        api.request(r)
-        candles = [c for c in r.response.get("candles", []) if c.get("complete")]
-        if len(candles) < 20:
-            return None
-        df = pd.DataFrame([{
-            "time":  pd.to_datetime(c["time"]),
-            "open":  float(c["mid"]["o"]),
-            "high":  float(c["mid"]["h"]),
-            "low":   float(c["mid"]["l"]),
-            "close": float(c["mid"]["c"])
-        } for c in candles])
-        df.set_index("time", inplace=True)
-        return df
-    except:
-        return None
+def compute_bb_width(df, length=20, std=2):
+    """
+    BB Width % vs sa propre moyenne sur le TF du signal.
+    Retourne un tag lisible : ex. "-32%_Squeeze", "+41%_Expansion", "5%_Normal"
+    
+    Squeeze  : BB Width < -25% vs moyenne → marché comprimé, breakout probable
+    Expansion: BB Width > +25% vs moyenne → marché déjà étendu, signal moins fiable
+    Normal   : entre -25% et +25%
+    """
+    close = df["close"]
+    if len(close) < length * 2:
+        return "N/A"
+    sma     = close.rolling(length).mean()
+    std_dev = close.rolling(length).std()
+    upper   = sma + std * std_dev
+    lower   = sma - std * std_dev
+    bb_w    = (upper - lower) / sma
+    bb_avg  = bb_w.rolling(length).mean()
+    pct     = ((bb_w - bb_avg) / bb_avg * 100).iloc[-1]
+    if pd.isna(pct):
+        return "N/A"
+    sign = "+" if pct >= 0 else ""
+    if pct < -25:
+        return f"{sign}{pct:.0f}%_Squeeze"
+    if pct > 25:
+        return f"{sign}{pct:.0f}%_Expansion"
+    return f"{sign}{pct:.0f}%_Normal"
 
 
 def detect_choch(df, tf):
@@ -132,7 +117,7 @@ def detect_choch(df, tf):
     h, l, c = df["high"].values, df["low"].values, df["close"].values
 
     last_high = None
-    last_low = None
+    last_low  = None
     for i in range(p, len(df) - p):
         if h[i] == max(h[i-p:i+p+1]):
             last_high = h[i]
@@ -141,7 +126,6 @@ def detect_choch(df, tf):
 
     atr = calc_atr(df)
 
-    # Seuils Force basés sur ATR réel (différenciés par TF)
     def get_force(breakout):
         if np.isnan(atr) or atr == 0:
             return "Moyen"
@@ -150,21 +134,19 @@ def detect_choch(df, tf):
             return "Fort" if ratio > 0.8 else ("Faible" if ratio < 0.3 else "Moyen")
         elif tf in ("Weekly", "Monthly"):
             return "Fort" if ratio > 1.5 else ("Faible" if ratio < 0.6 else "Moyen")
-        else:  # H4, D1
+        else:
             return "Fort" if ratio > 1.0 else ("Faible" if ratio < 0.4 else "Moyen")
 
     if last_high and c[-1] > last_high and c[-2] <= last_high:
-        breakout = abs(c[-1] - last_high)
-        return "Bullish CHoCH", df.index[-1], get_force(breakout)
+        return "Bullish CHoCH", df.index[-1], get_force(abs(c[-1] - last_high))
 
     if last_low and c[-1] < last_low and c[-2] >= last_low:
-        breakout = abs(last_low - c[-1])
-        return "Bearish CHoCH", df.index[-1], get_force(breakout)
+        return "Bearish CHoCH", df.index[-1], get_force(abs(last_low - c[-1]))
 
     return None, None, None
 
 
-# ===================== PDF PROPRE & PRO =====================
+# ===================== PDF =====================
 def create_pdf(df):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=20, rightMargin=20, topMargin=40, bottomMargin=40)
@@ -176,7 +158,8 @@ def create_pdf(df):
     elements.append(Spacer(1, 20))
 
     data = [df.columns.tolist()] + df.values.tolist()
-    col_widths = [75, 55, 50, 95, 70, 60, 75, 60, 55, 130]
+    # 9 colonnes au lieu de 11 (ATR Daily + ATR H1 + ATR M15 → BB_Width)
+    col_widths = [80, 60, 55, 100, 75, 60, 110, 55, 130]
 
     table = Table(data, colWidths=col_widths, repeatRows=1)
     table.setStyle(TableStyle([
@@ -202,14 +185,16 @@ def create_pdf(df):
 
 # ===================== UI =====================
 st.set_page_config(page_title="CHoCH Scanner", layout="wide")
-st.markdown("<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>Scanner Change of Character (CHoCH)</h1>", unsafe_allow_html=True)
+st.markdown(
+    "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>Scanner Change of Character (CHoCH)</h1>",
+    unsafe_allow_html=True
+)
 
 if st.button("Lancer le Scan", type="primary", use_container_width=True):
     with st.spinner("Scan en cours sur 175 combinaisons... (Forex + Or + Argent + Platine + Indices + Monthly)"):
         results = []
-        insts_signaled = []  # Pour récupérer ATR multi-TF après
 
-        # ── Étape 1 : Scan CHoCH ──────────────────────────────────────────────
+        # ── Scan CHoCH + BB Width en une seule passe ─────────────────────────
         with ThreadPoolExecutor(max_workers=12) as executor:
             futures = {
                 executor.submit(get_candles, inst, code): (inst, name)
@@ -229,33 +214,16 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True):
                             "Signal":     sig,
                             "Volatilité": VOLATILITY.get(inst, "Moyenne"),
                             "Force":      strength or "Moyen",
-                            "ATR Daily":  "N/A",
-                            "ATR H1":     "N/A",
-                            "ATR M15":    "N/A",
-                            "Âge (h)":    round((datetime.now(timezone.utc) - time_sig.replace(tzinfo=timezone.utc) if time_sig.tzinfo is None else datetime.now(timezone.utc) - time_sig).total_seconds() / 3600, 1),
+                            # BB Width calculé directement sur le df déjà en mémoire
+                            "BB_Width":   compute_bb_width(df),
+                            "Âge (h)":    round(
+                                (datetime.now(timezone.utc) - (
+                                    time_sig.replace(tzinfo=timezone.utc)
+                                    if time_sig.tzinfo is None else time_sig
+                                )).total_seconds() / 3600, 1
+                            ),
                             "Heure (UTC)": time_sig.strftime("%Y-%m-%d %H:%M"),
-                            "_inst_raw":  inst,
                         })
-                        insts_signaled.append(inst)
-
-        # ── Étape 2 : ATR multi-TF pour les instruments signalés ─────────────
-        insts_unique = list(set(insts_signaled))
-        if insts_unique:
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                atr_futures = {executor.submit(get_atr_multitf, inst): inst for inst in insts_unique}
-                atr_cache = {}
-                for future in as_completed(atr_futures):
-                    atr_cache[atr_futures[future]] = future.result()
-
-            for r in results:
-                atr_data = atr_cache.get(r["_inst_raw"], {})
-                r["ATR Daily"] = atr_data.get("ATR Daily", "N/A")
-                r["ATR H1"]    = atr_data.get("ATR H1",    "N/A")
-                r["ATR M15"]   = atr_data.get("ATR M15",   "N/A")
-
-        # Nettoyer colonne interne
-        for r in results:
-            r.pop("_inst_raw", None)
 
         if results:
             df_result = pd.DataFrame(results).sort_values("Heure (UTC)", ascending=False)
@@ -271,8 +239,7 @@ if "df" in st.session_state:
 
     DISPLAY_COLS = [
         "Instrument", "Timeframe", "Ordre", "Signal",
-        "Volatilité", "Force", "ATR Daily", "ATR H1", "ATR M15",
-        "Âge (h)", "Heure (UTC)"
+        "Volatilité", "Force", "BB_Width", "Âge (h)", "Heure (UTC)"
     ]
 
     col1, col2, col3 = st.columns(3)
@@ -296,6 +263,13 @@ if "df" in st.session_state:
                            f"choch_signaux_{ts}.pdf", "application/pdf")
 
     # Tableau avec couleurs
+    def style_bb(val):
+        if "Squeeze" in str(val):
+            return "color:#ff9800;font-weight:bold"   # orange → compression
+        if "Expansion" in str(val):
+            return "color:#ab47bc;font-weight:bold"   # violet → déjà étendu
+        return "color:#90a4ae"                         # gris → normal
+
     st.dataframe(
         df[[c for c in DISPLAY_COLS if c in df.columns]].style
         .map(
@@ -311,7 +285,8 @@ if "df" in st.session_state:
             lambda x: "color:#00c853;font-weight:bold" if x == "Fort"
             else "color:#ff5252" if x == "Faible" else "color:#ff9800" if x == "Moyen" else "",
             subset=["Force"]
-        ),
+        )
+        .map(style_bb, subset=["BB_Width"]),
         hide_index=True,
         use_container_width=True
     )
