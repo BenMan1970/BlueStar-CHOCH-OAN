@@ -1,4 +1,4 @@
-# app.py → VERSION FINALE AVEC MONTHLY (5 TIMEFRAMES) - v4.2 (BB Width remplace ATR)
+# app.py → VERSION FINALE AVEC MONTHLY (5 TIMEFRAMES) - v4.3 (BB Width + Statut Fresh/Aged/Stale)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -111,6 +111,35 @@ def compute_bb_width(df, length=20, std=2):
     return f"{sign}{pct:.0f}%_Normal"
 
 
+# Durée d'une bougie par TF (en heures)
+TF_HOURS = {"H1": 1, "H4": 4, "D1": 24, "Weekly": 168, "Monthly": 720}
+
+# Seuils Fresh/Aged/Stale en nombre de bougies
+TF_STATUT = {
+    "H1":      {"Fresh": 3,  "Aged": 8},   # >8  → Stale
+    "H4":      {"Fresh": 2,  "Aged": 5},   # >5  → Stale
+    "D1":      {"Fresh": 2,  "Aged": 5},   # >5  → Stale
+    "Weekly":  {"Fresh": 2,  "Aged": 4},   # >4  → Stale
+    "Monthly": {"Fresh": 1,  "Aged": 2},   # >2  → Stale
+}
+
+def compute_statut(time_sig, tf):
+    """Retourne Fresh / Aged / Stale selon le nb de bougies écoulées depuis le signal."""
+    try:
+        now = datetime.now(timezone.utc)
+        sig_utc = time_sig.replace(tzinfo=timezone.utc) if time_sig.tzinfo is None else time_sig
+        elapsed_h = (now - sig_utc).total_seconds() / 3600
+        candles_elapsed = elapsed_h / TF_HOURS.get(tf, 1)
+        thresholds = TF_STATUT.get(tf, {"Fresh": 2, "Aged": 5})
+        if candles_elapsed <= thresholds["Fresh"]:
+            return "Fresh"
+        if candles_elapsed <= thresholds["Aged"]:
+            return "Aged"
+        return "Stale"
+    except:
+        return "N/A"
+
+
 def detect_choch(df, tf):
     length = FRACTAL_LEN.get(tf, 5)
     p = length // 2
@@ -216,12 +245,7 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True):
                             "Force":      strength or "Moyen",
                             # BB Width calculé directement sur le df déjà en mémoire
                             "BB_Width":   compute_bb_width(df),
-                            "Âge (h)":    round(
-                                (datetime.now(timezone.utc) - (
-                                    time_sig.replace(tzinfo=timezone.utc)
-                                    if time_sig.tzinfo is None else time_sig
-                                )).total_seconds() / 3600, 1
-                            ),
+                            "Statut":     compute_statut(time_sig, tf),
                             "Heure (UTC)": time_sig.strftime("%Y-%m-%d %H:%M"),
                         })
 
@@ -239,7 +263,7 @@ if "df" in st.session_state:
 
     DISPLAY_COLS = [
         "Instrument", "Timeframe", "Ordre", "Signal",
-        "Volatilité", "Force", "BB_Width", "Âge (h)", "Heure (UTC)"
+        "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
     ]
 
     col1, col2, col3 = st.columns(3)
@@ -286,7 +310,13 @@ if "df" in st.session_state:
             else "color:#ff5252" if x == "Faible" else "color:#ff9800" if x == "Moyen" else "",
             subset=["Force"]
         )
-        .map(style_bb, subset=["BB_Width"]),
+        .map(style_bb, subset=["BB_Width"])
+        .map(
+            lambda x: "color:#00c853;font-weight:bold" if x == "Fresh"
+            else "color:#ff9800;font-weight:bold" if x == "Aged"
+            else "color:#ff5252;font-weight:bold" if x == "Stale" else "",
+            subset=["Statut"]
+        ),
         hide_index=True,
         use_container_width=True
     )
