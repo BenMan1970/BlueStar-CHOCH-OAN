@@ -1,6 +1,4 @@
-# app.py → v4.4 — Audit complet (9 findings patched)
-# F1 Force breakout fix | F2 bare except | F3 future.result() guard
-# F4 is not None | F5 bb_width div/0 | F6 PNG cache | F7 utcnow | F8 timeout | F9 len guard
+# app.py → v4.5 — Force par percentile (auto-calibré par instrument/TF, zéro seuil fixe)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -170,23 +168,24 @@ def detect_choch(df, tf):
         if l[i] == min(l[i-p:i+p+1]):
             last_low = l[i]
 
-    atr = calc_atr(df)
+    # Distribution des ranges des N dernières bougies (auto-calibrage par instrument/TF)
+    candle_ranges = h[1:] - l[1:]
+    p25 = float(np.percentile(candle_ranges, 25)) if len(candle_ranges) >= 10 else None
+    p75 = float(np.percentile(candle_ranges, 75)) if len(candle_ranges) >= 10 else None
 
     def get_force(candle_range):
         """
-        F1 FIX: on mesure le range complet de la bougie de breakout (h-l)
-        plutôt que la distance marginale close vs fractal.
-        Un candle_range ≈ 1× ATR = normal → Moyen.
+        Force par percentile sur la distribution des ranges de l'instrument/TF.
+        Top 25% → Fort | 25-75% → Moyen | Bas 25% → Faible
+        Auto-calibré : chaque marché a sa propre distribution, zéro seuil fixe.
         """
-        if np.isnan(atr) or atr == 0:
+        if p25 is None or p75 is None:
             return "Moyen"
-        ratio = candle_range / atr
-        if tf == "H1":
-            return "Fort" if ratio > 1.2 else ("Faible" if ratio < 0.6 else "Moyen")
-        elif tf in ("Weekly", "Monthly"):
-            return "Fort" if ratio > 1.5 else ("Faible" if ratio < 0.8 else "Moyen")
-        else:  # H4, D1
-            return "Fort" if ratio > 1.3 else ("Faible" if ratio < 0.7 else "Moyen")
+        if candle_range >= p75:
+            return "Fort"
+        if candle_range <= p25:
+            return "Faible"
+        return "Moyen"
 
     # F1 FIX: breakout_range = range de la bougie de breakout
     breakout_range = h[-1] - l[-1]
