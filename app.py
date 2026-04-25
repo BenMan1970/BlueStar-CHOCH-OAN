@@ -1,9 +1,3 @@
-# app.py → v5.0 — Optimisation CASCADE ENGINE
-# [1] Colonnes Niveau + Distance% (niveau fractal cassé + écart prix actuel)
-# [2] Monthly exclu du scan — Weekly conservé pour analyse personnelle
-# [3] Noms de paires normalisés sans slash dans PDF/CSV (EURUSD) — Streamlit conserve EUR/USD
-# [4] Filtre Stale : Fresh+Aged uniquement dans PDF/CSV — Stale visible Streamlit uniquement
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -51,7 +45,23 @@ VOLATILITY_STATIC = {
 
 # [2] Monthly retiré — Weekly conservé pour analyse personnelle
 TIMEFRAMES      = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
-FRACTAL_LEN     = {"H1": 5, "H4": 6, "D1": 7, "Weekly": 8}
+
+# [FIX-1] p = length // 2
+#   H1     : length=5  → p=2  (inchangé)
+#   H4     : length=5  → p=2  (était 6 → p=3 : ratait les cassures des 3 dernières bougies)
+#   D1     : length=7  → p=3  (inchangé)
+#   Weekly : length=7  → p=3  (était 8 → p=4 : ratait les pivots des 4 dernières semaines)
+FRACTAL_LEN     = {"H1": 5, "H4": 5, "D1": 7, "Weekly": 7}
+
+# [FIX-2] Fenêtre de recherche des fractals — N bougies max depuis la bougie courante
+#   Empêche un pivot vieux de 400 bougies d'être retenu comme niveau de référence.
+#   Calibrage : environ 2-3 mois de données par TF pour capturer les structures récentes.
+#   H1  : 120 bougies ≈ 5 jours
+#   H4  : 90  bougies ≈ 15 jours
+#   D1  : 60  bougies ≈ 2 mois
+#   Weekly : 26 bougies ≈ 6 mois
+FRACTAL_WINDOW  = {"H1": 120, "H4": 90, "D1": 60, "Weekly": 26}
+
 TF_HOURS        = {"H1": 1, "H4": 4, "D1": 24, "Weekly": 168}
 
 TF_STATUT = {
@@ -207,12 +217,16 @@ def detect_choch(df, tf):
     Retourne un 7-tuple :
       (sig_raw, time_sig, force, idx_cur, trend, niveau_casse, close_actuel)
 
-    [1] niveau_casse : prix exact du fractal rompu (last_high ou last_low)
-    [1] close_actuel : close de la dernière bougie disponible pour Distance%
+    [FIX-1] p réduit via FRACTAL_LEN : détecte les pivots récents
+    [FIX-2] Recherche last_high/last_low limitée à FRACTAL_WINDOW[tf] bougies
+            → évite de remonter toute l'histoire (faux niveaux de référence)
     """
     length   = FRACTAL_LEN.get(tf, 5)
     p        = length // 2
     lookback = TF_LOOKBACK.get(tf, 3)
+
+    # [FIX-2] Fenêtre de recherche des fractals (bougies récentes uniquement)
+    window   = FRACTAL_WINDOW.get(tf, 60)
 
     h_all = df["high"].values
     l_all = df["low"].values
@@ -254,9 +268,15 @@ def detect_choch(df, tf):
         l = l_all[:idx_cur + 1]
         c = c_all[:idx_cur + 1]
 
+        # [FIX-2] Limiter la recherche aux `window` dernières bougies
+        #         On conserve un minimum de p bougies pour ne pas couper les fractals
+        window_start = max(p, len(h) - window)
+
         last_high = None
         last_low  = None
-        for i in range(p, len(h) - p):
+
+        # [FIX-2] Parcours uniquement dans la fenêtre récente
+        for i in range(window_start, len(h) - p):
             if h[i] == max(h[i - p:i + p + 1]):
                 last_high = h[i]
             if l[i] == min(l[i - p:i + p + 1]):
@@ -313,7 +333,7 @@ def format_niveau(niveau, inst):
 
 def format_distance(niveau, close_actuel, inst):
     """
-    [1] Distance% = |close_actuel - niveau| / niveau × 100
+    Distance% = |close_actuel - niveau| / niveau × 100
     Seuils CASCADE ENGINE : ≤0.15% excellent / 0.15–0.40% acceptable / >0.40% raté
     """
     if niveau is None or close_actuel is None or niveau == 0:
@@ -323,7 +343,7 @@ def format_distance(niveau, close_actuel, inst):
 
 
 def normalize_pair(inst_slash):
-    """[3] Normalisation v1.5 CASCADE ENGINE — supprime '/' pour exports."""
+    """Normalisation v1.5 CASCADE ENGINE — supprime '/' pour exports."""
     return inst_slash.replace("/", "")
 
 
@@ -393,7 +413,7 @@ def generate_png(df, display_cols):
 st.set_page_config(page_title="CHoCH Scanner", layout="wide")
 st.markdown(
     "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>"
-    "Scanner Change of Character (CHoCH) — v5.0</h1>",
+    "Scanner Change of Character (CHoCH) — v5.1</h1>",
     unsafe_allow_html=True
 )
 
@@ -447,8 +467,8 @@ if st.button(
                         statut       = compute_statut(time_sig, tf_name)
 
                         results.append({
-                            "Instrument":  inst_display,       # Streamlit (avec slash)
-                            "Paire":       inst_export,        # Export normalisé (sans slash)
+                            "Instrument":  inst_display,
+                            "Paire":       inst_export,
                             "Timeframe":   tf_name,
                             "Type":        type_label,
                             "Ordre":       "Achat" if sig_raw == "Bullish" else "Vente",
@@ -526,11 +546,6 @@ if "df" in st.session_state:
         return "color:#90a4ae"
 
     def style_distance(val):
-        """
-        Vert  ≤ 0.15% : signal encore proche du niveau, entrée potentielle
-        Orange 0.15–0.40% : acceptable, surveiller
-        Rouge  > 0.40% : niveau raté, ignorer pour une entrée
-        """
         try:
             v = float(str(val).replace("%", ""))
             if v <= 0.15: return "color:#00c853;font-weight:bold"
