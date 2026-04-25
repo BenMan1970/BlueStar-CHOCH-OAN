@@ -65,8 +65,12 @@ FRACTAL_WINDOW  = {"H1": 120, "H4": 90, "D1": 60, "Weekly": 26}
 TF_HOURS        = {"H1": 1, "H4": 4, "D1": 24, "Weekly": 168}
 
 TF_STATUT = {
-    "H1":     {"Fresh": 3,  "Aged": 8},
-    "H4":     {"Fresh": 2,  "Aged": 5},
+    # [FIX-3] H1 : Fresh ≤ 4h | Aged ≤ 12h | Stale > 12h  (était Aged ≤ 8h)
+    #         H4 : Fresh ≤ 12h | Aged ≤ 32h | Stale > 32h  (était Aged ≤ 20h)
+    #         Les signaux H4/H1 détectés par FIX-1+2 tombaient tous en Stale
+    #         avec les anciens seuils → exclus des exports avant d'être vus.
+    "H1":     {"Fresh": 4,  "Aged": 12},
+    "H4":     {"Fresh": 3,  "Aged": 8},
     "D1":     {"Fresh": 2,  "Aged": 5},
     "Weekly": {"Fresh": 2,  "Aged": 4},
 }
@@ -413,7 +417,7 @@ def generate_png(df, display_cols):
 st.set_page_config(page_title="CHoCH Scanner", layout="wide")
 st.markdown(
     "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>"
-    "Scanner Change of Character (CHoCH) — v5.1</h1>",
+    "Scanner Change of Character (CHoCH) — v5.2</h1>",
     unsafe_allow_html=True
 )
 
