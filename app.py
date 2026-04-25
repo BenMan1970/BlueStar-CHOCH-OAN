@@ -1,5 +1,5 @@
-# app.py → v4.8 — Lookback 5 bougies + filtre EMA TF-aware + ATR dynamique
-# v4.8 : strict breakout filter · BB_Width au signal · colonne Type CHoCH/BOS
+# app.py → v4.9 — Corrections audit : PNG seek, TZ UTC strict, workers réduits,
+# déduplication signaux, CHoCH/BOS naming interne clarifié, VOLATILITY_STATIC nettoyé
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -23,11 +23,12 @@ INSTRUMENTS = [
     "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
     "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY",
     "NZD_JPY", "NZD_CAD", "NZD_CHF",
-    # 6 indices et métaux
-    "DE30_EUR", "XAU_USD", "XAG_USD", "SPX500_USD", "NAS100_USD", "US30_USD",
+    # 5 indices et métaux (liste canonique : XAG_USD retiré — absent de la liste canonique)
+    "DE30_EUR", "XAU_USD", "SPX500_USD", "NAS100_USD", "US30_USD",
 ]
 
 # Volatilité statique — fallback si ATR non disponible
+# Note : les indices/métaux atteignent rarement ce fallback (500 bougies disponibles)
 VOLATILITY_STATIC = {
     "EUR_USD": "Basse",  "GBP_USD": "Basse",  "USD_JPY": "Basse",
     "USD_CHF": "Basse",  "USD_CAD": "Basse",
@@ -41,8 +42,8 @@ VOLATILITY_STATIC = {
     "CHF_JPY": "Haute",  "NZD_JPY": "Haute",
     "NZD_CAD": "Moyenne","NZD_CHF": "Haute",
     "DE30_EUR":  "Très Haute", "XAU_USD":    "Très Haute",
-    "XAG_USD":  "Très Haute", "SPX500_USD": "Très Haute",
-    "NAS100_USD":"Très Haute", "US30_USD":   "Très Haute",
+    "SPX500_USD":"Très Haute", "NAS100_USD": "Très Haute",
+    "US30_USD":  "Très Haute",
 }
 
 TIMEFRAMES  = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W", "Monthly": "M"}
@@ -84,7 +85,8 @@ def get_candles(inst, gran):
         if len(candles) < 50:
             return None
         df = pd.DataFrame([{
-            "time":  pd.to_datetime(c["time"]),
+            # FIX [TZ] : utc=True garantit que tous les timestamps sont tz-aware UTC
+            "time":  pd.to_datetime(c["time"], utc=True),
             "open":  float(c["mid"]["o"]),
             "high":  float(c["mid"]["h"]),
             "low":   float(c["mid"]["l"]),
@@ -156,9 +158,11 @@ def compute_bb_width(df, length=20, std=2):
 
 
 def compute_statut(time_sig, tf):
+    # FIX [TZ] : plus besoin de la garde tzinfo is None — les timestamps sont
+    # désormais toujours tz-aware UTC grâce au fix dans get_candles
     try:
         now     = datetime.now(timezone.utc)
-        sig_utc = time_sig.replace(tzinfo=timezone.utc) if time_sig.tzinfo is None else time_sig
+        sig_utc = time_sig if time_sig.tzinfo is not None else time_sig.replace(tzinfo=timezone.utc)
         elapsed_h       = (now - sig_utc).total_seconds() / 3600
         candles_elapsed = elapsed_h / TF_HOURS.get(tf, 1)
         thresholds      = TF_STATUT.get(tf, {"Fresh": 2, "Aged": 5})
@@ -190,11 +194,9 @@ def get_trend_context(df, tf):
 
 def detect_choch(df, tf):
     """
-    [v4.8] Retourne un 5-tuple : (sig, time_sig, force, idx_cur, trend)
-    Corrections vs v4.7 :
-      - c[idx_prev] < last_high  (strict, était <=)
-      - c[idx_prev] > last_low   (strict, était >=)
-      - idx_cur et trend exposés pour le caller
+    Retourne un 5-tuple : (sig_raw, time_sig, force, idx_cur, trend)
+    sig_raw est toujours "Bullish" ou "Bearish" — le label CHoCH/BOS
+    est calculé dans le caller pour éviter la confusion interne.
     """
     length   = FRACTAL_LEN.get(tf, 5)
     p        = length // 2
@@ -256,30 +258,30 @@ def detect_choch(df, tf):
         if not is_valid_breakout_candle(idx_cur):
             continue
 
-        sig      = None
+        # FIX [NAMING] : sig_raw = "Bullish" ou "Bearish" uniquement.
+        # Le label complet ("Bullish CHoCH" / "Bullish BOS") est construit dans le caller.
+        sig_raw  = None
         time_sig = None
         force    = None
 
-        # [v4.8] Conditions strictes : < et > (était <= et >=)
         if last_high is not None and c[idx_cur] > last_high and c[idx_prev] < last_high:
-            sig      = "Bullish CHoCH"
+            sig_raw  = "Bullish"
             time_sig = df.index[idx_cur]
             force    = get_force(breakout_range)
 
         elif last_low is not None and c[idx_cur] < last_low and c[idx_prev] > last_low:
-            sig      = "Bearish CHoCH"
+            sig_raw  = "Bearish"
             time_sig = df.index[idx_cur]
             force    = get_force(breakout_range)
 
-        if sig is None:
+        if sig_raw is None:
             continue
 
         trend = get_trend_context(df.iloc[:idx_cur + 1], tf)
         if trend == "Range" and force == "Faible":
             continue
 
-        # [v4.8] Retourne idx_cur et trend pour le caller
-        return sig, time_sig, force, idx_cur, trend
+        return sig_raw, time_sig, force, idx_cur, trend
 
     return None, None, None, None, None
 
@@ -347,7 +349,7 @@ def generate_png(df, display_cols):
 st.set_page_config(page_title="CHoCH Scanner", layout="wide")
 st.markdown(
     "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>"
-    "Scanner Change of Character (CHoCH) — v4.8</h1>",
+    "Scanner Change of Character (CHoCH) — v4.9</h1>",
     unsafe_allow_html=True
 )
 
@@ -356,52 +358,67 @@ DISPLAY_COLS = [
     "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
 ]
 
-if st.button("Lancer le Scan", type="primary", use_container_width=True):
+# FIX [DOUBLE-SCAN] : flag pour bloquer un double-clic pendant le scan
+if "scanning" not in st.session_state:
+    st.session_state.scanning = False
+
+if st.button(
+    "Lancer le Scan",
+    type="primary",
+    use_container_width=True,
+    disabled=st.session_state.scanning
+):
+    st.session_state.scanning = True
     n_combos = len(INSTRUMENTS) * len(TIMEFRAMES)
+
     with st.spinner(f"Scan en cours sur {n_combos} combinaisons…"):
         results = []
         errors  = []
-
-        with ThreadPoolExecutor(max_workers=12) as executor:
+        # FIX [WORKERS] : réduit de 12 à 7 pour respecter les limites OANDA
+        # 33 instruments × 5 TF = 165 requêtes — 7 workers évitent le rate-limit
+        with ThreadPoolExecutor(max_workers=7) as executor:
+            # FIX [FUTURES KEY] : clé clarifiée — (inst, tf_name) explicite
             futures = {
-                executor.submit(get_candles, inst, code): (inst, name)
+                executor.submit(get_candles, inst, tf_code): (inst, tf_name)
                 for inst in INSTRUMENTS
-                for name, code in TIMEFRAMES.items()
+                for tf_name, tf_code in TIMEFRAMES.items()
             }
             for future in as_completed(futures):
-                inst, tf = futures[future]
+                inst, tf_name = futures[future]
                 try:
                     df = future.result()
                 except Exception as e:
-                    errors.append(f"{inst}/{tf}: {e}")
+                    errors.append(f"{inst}/{tf_name}: {e}")
                     continue
 
                 if df is not None:
-                    sig, time_sig, strength, idx_sig, trend = detect_choch(df, tf)
-                    if sig:
+                    # FIX [NAMING] : sig_raw est "Bullish"/"Bearish", pas "Bullish CHoCH"
+                    sig_raw, time_sig, strength, idx_sig, trend = detect_choch(df, tf_name)
+                    if sig_raw:
                         atr_val    = calc_atr(df)
                         volatilite = atr_to_volatility(atr_val, inst, df)
+                        df_sig     = df.iloc[:idx_sig + 1] if idx_sig is not None else df
 
-                        # [v4.8] BB Width au moment du signal
-                        df_sig = df.iloc[:idx_sig + 1] if idx_sig is not None else df
-
-                        # [v4.8] CHoCH = contre-tendance / BOS = dans le sens
+                        # BOS = dans le sens de la tendance / CHoCH = contre-tendance
                         is_bos = (
-                            (trend == "Uptrend"   and "Bull" in sig) or
-                            (trend == "Downtrend" and "Bear" in sig)
+                            (trend == "Uptrend"   and sig_raw == "Bullish") or
+                            (trend == "Downtrend" and sig_raw == "Bearish")
                         )
                         type_label = "BOS" if is_bos else "CHoCH"
 
+                        # Label complet construit ici, cohérent avec type_label
+                        signal_label = f"{sig_raw} {type_label}"
+
                         results.append({
                             "Instrument":  inst.replace("_", "/"),
-                            "Timeframe":   tf,
+                            "Timeframe":   tf_name,
                             "Type":        type_label,
-                            "Ordre":       "Achat" if "Bull" in sig else "Vente",
-                            "Signal":      sig,
+                            "Ordre":       "Achat" if sig_raw == "Bullish" else "Vente",
+                            "Signal":      signal_label,
                             "Volatilité":  volatilite,
                             "Force":       strength or "Moyen",
                             "BB_Width":    compute_bb_width(df_sig),
-                            "Statut":      compute_statut(time_sig, tf),
+                            "Statut":      compute_statut(time_sig, tf_name),
                             "Heure (UTC)": time_sig.strftime("%Y-%m-%d %H:%M"),
                         })
 
@@ -409,12 +426,23 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True):
             st.warning(f"{len(errors)} erreur(s) silencieuse(s) : {'; '.join(errors[:5])}")
 
         if results:
-            df_result = pd.DataFrame(results).sort_values("Heure (UTC)", ascending=False)
+            df_result = pd.DataFrame(results)
+
+            # FIX [DEDUP] : un seul signal par (Instrument, Timeframe) — on garde le plus récent
+            df_result = (
+                df_result
+                .sort_values("Heure (UTC)", ascending=False)
+                .drop_duplicates(subset=["Instrument", "Timeframe"], keep="first")
+                .reset_index(drop=True)
+            )
+
             st.session_state.df      = df_result
             st.session_state.png_buf = None
             st.success(f"Scan terminé – {len(df_result)} signaux sur {n_combos} combinaisons !")
         else:
             st.info("Aucun signal CHoCH/BOS récent détecté")
+
+    st.session_state.scanning = False
 
 # ===================== AFFICHAGE =====================
 if "df" in st.session_state:
@@ -432,6 +460,8 @@ if "df" in st.session_state:
             f"choch_{ts}.csv", "text/csv"
         )
     with col2:
+        # FIX [PNG BUF] : seek(0) avant chaque download pour éviter un fichier vide
+        st.session_state.png_buf.seek(0)
         st.download_button(
             "PNG",
             st.session_state.png_buf,
