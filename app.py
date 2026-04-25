@@ -1,5 +1,9 @@
-# app.py → v4.9 — Corrections audit : PNG seek, TZ UTC strict, workers réduits,
-# déduplication signaux, CHoCH/BOS naming interne clarifié, VOLATILITY_STATIC nettoyé
+# app.py → v5.0 — Optimisation CASCADE ENGINE
+# [1] Colonnes Niveau + Distance% (niveau fractal cassé + écart prix actuel)
+# [2] Monthly exclu du scan — Weekly conservé pour analyse personnelle
+# [3] Noms de paires normalisés sans slash dans PDF/CSV (EURUSD) — Streamlit conserve EUR/USD
+# [4] Filtre Stale : Fresh+Aged uniquement dans PDF/CSV — Stale visible Streamlit uniquement
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -23,12 +27,11 @@ INSTRUMENTS = [
     "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
     "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY",
     "NZD_JPY", "NZD_CAD", "NZD_CHF",
-    # 5 indices et métaux (liste canonique : XAG_USD retiré — absent de la liste canonique)
+    # 5 indices et métaux
     "DE30_EUR", "XAU_USD", "SPX500_USD", "NAS100_USD", "US30_USD",
 ]
 
 # Volatilité statique — fallback si ATR non disponible
-# Note : les indices/métaux atteignent rarement ce fallback (500 bougies disponibles)
 VOLATILITY_STATIC = {
     "EUR_USD": "Basse",  "GBP_USD": "Basse",  "USD_JPY": "Basse",
     "USD_CHF": "Basse",  "USD_CAD": "Basse",
@@ -46,22 +49,32 @@ VOLATILITY_STATIC = {
     "US30_USD":  "Très Haute",
 }
 
-TIMEFRAMES  = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W", "Monthly": "M"}
-FRACTAL_LEN = {"H1": 5, "H4": 6, "D1": 7, "Weekly": 8, "Monthly": 9}
-
-TF_HOURS = {"H1": 1, "H4": 4, "D1": 24, "Weekly": 168, "Monthly": 720}
+# [2] Monthly retiré — Weekly conservé pour analyse personnelle
+TIMEFRAMES      = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
+FRACTAL_LEN     = {"H1": 5, "H4": 6, "D1": 7, "Weekly": 8}
+TF_HOURS        = {"H1": 1, "H4": 4, "D1": 24, "Weekly": 168}
 
 TF_STATUT = {
-    "H1":      {"Fresh": 3,  "Aged": 8},
-    "H4":      {"Fresh": 2,  "Aged": 5},
-    "D1":      {"Fresh": 2,  "Aged": 5},
-    "Weekly":  {"Fresh": 2,  "Aged": 4},
-    "Monthly": {"Fresh": 1,  "Aged": 2},
+    "H1":     {"Fresh": 3,  "Aged": 8},
+    "H4":     {"Fresh": 2,  "Aged": 5},
+    "D1":     {"Fresh": 2,  "Aged": 5},
+    "Weekly": {"Fresh": 2,  "Aged": 4},
 }
 
-TF_LOOKBACK = {"H1": 5, "H4": 5, "D1": 4, "Weekly": 3, "Monthly": 2}
+TF_LOOKBACK     = {"H1": 5, "H4": 5, "D1": 4, "Weekly": 3}
+TF_EMA_LOOKBACK = {"H1": 5, "H4": 5, "D1": 10, "Weekly": 15}
 
-TF_EMA_LOOKBACK = {"H1": 5, "H4": 5, "D1": 10, "Weekly": 15, "Monthly": 20}
+# Colonnes Streamlit (affichage complet avec slash)
+DISPLAY_COLS = [
+    "Instrument", "Timeframe", "Type", "Ordre", "Signal",
+    "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
+]
+
+# Colonnes exports PDF/CSV (paire normalisée sans slash, Stale exclus)
+EXPORT_COLS = [
+    "Paire", "Timeframe", "Type", "Ordre", "Signal",
+    "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
+]
 
 # ===================== API =====================
 try:
@@ -85,7 +98,6 @@ def get_candles(inst, gran):
         if len(candles) < 50:
             return None
         df = pd.DataFrame([{
-            # FIX [TZ] : utc=True garantit que tous les timestamps sont tz-aware UTC
             "time":  pd.to_datetime(c["time"], utc=True),
             "open":  float(c["mid"]["o"]),
             "high":  float(c["mid"]["h"]),
@@ -158,8 +170,6 @@ def compute_bb_width(df, length=20, std=2):
 
 
 def compute_statut(time_sig, tf):
-    # FIX [TZ] : plus besoin de la garde tzinfo is None — les timestamps sont
-    # désormais toujours tz-aware UTC grâce au fix dans get_candles
     try:
         now     = datetime.now(timezone.utc)
         sig_utc = time_sig if time_sig.tzinfo is not None else time_sig.replace(tzinfo=timezone.utc)
@@ -194,9 +204,11 @@ def get_trend_context(df, tf):
 
 def detect_choch(df, tf):
     """
-    Retourne un 5-tuple : (sig_raw, time_sig, force, idx_cur, trend)
-    sig_raw est toujours "Bullish" ou "Bearish" — le label CHoCH/BOS
-    est calculé dans le caller pour éviter la confusion interne.
+    Retourne un 7-tuple :
+      (sig_raw, time_sig, force, idx_cur, trend, niveau_casse, close_actuel)
+
+    [1] niveau_casse : prix exact du fractal rompu (last_high ou last_low)
+    [1] close_actuel : close de la dernière bougie disponible pour Distance%
     """
     length   = FRACTAL_LEN.get(tf, 5)
     p        = length // 2
@@ -209,7 +221,7 @@ def detect_choch(df, tf):
 
     min_len = p * 2 + 1 + lookback + 1
     if len(c_all) < min_len:
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     candle_ranges = h_all[1:] - l_all[1:]
     p25 = float(np.percentile(candle_ranges, 25)) if len(candle_ranges) >= 10 else None
@@ -258,21 +270,22 @@ def detect_choch(df, tf):
         if not is_valid_breakout_candle(idx_cur):
             continue
 
-        # FIX [NAMING] : sig_raw = "Bullish" ou "Bearish" uniquement.
-        # Le label complet ("Bullish CHoCH" / "Bullish BOS") est construit dans le caller.
-        sig_raw  = None
-        time_sig = None
-        force    = None
+        sig_raw      = None
+        time_sig     = None
+        force        = None
+        niveau_casse = None
 
         if last_high is not None and c[idx_cur] > last_high and c[idx_prev] < last_high:
-            sig_raw  = "Bullish"
-            time_sig = df.index[idx_cur]
-            force    = get_force(breakout_range)
+            sig_raw      = "Bullish"
+            time_sig     = df.index[idx_cur]
+            force        = get_force(breakout_range)
+            niveau_casse = float(last_high)
 
         elif last_low is not None and c[idx_cur] < last_low and c[idx_prev] > last_low:
-            sig_raw  = "Bearish"
-            time_sig = df.index[idx_cur]
-            force    = get_force(breakout_range)
+            sig_raw      = "Bearish"
+            time_sig     = df.index[idx_cur]
+            force        = get_force(breakout_range)
+            niveau_casse = float(last_low)
 
         if sig_raw is None:
             continue
@@ -281,13 +294,41 @@ def detect_choch(df, tf):
         if trend == "Range" and force == "Faible":
             continue
 
-        return sig_raw, time_sig, force, idx_cur, trend
+        close_actuel = float(c_all[-1])
+        return sig_raw, time_sig, force, idx_cur, trend, niveau_casse, close_actuel
 
-    return None, None, None, None, None
+    return None, None, None, None, None, None, None
+
+
+def format_niveau(niveau, inst):
+    """Décimales adaptées par type d'instrument."""
+    if niveau is None:
+        return "N/A"
+    if any(k in inst for k in ["SPX500", "NAS100", "US30", "DE30", "XAU", "XAG"]):
+        return f"{niveau:.2f}"
+    if "JPY" in inst:
+        return f"{niveau:.3f}"
+    return f"{niveau:.5f}"
+
+
+def format_distance(niveau, close_actuel, inst):
+    """
+    [1] Distance% = |close_actuel - niveau| / niveau × 100
+    Seuils CASCADE ENGINE : ≤0.15% excellent / 0.15–0.40% acceptable / >0.40% raté
+    """
+    if niveau is None or close_actuel is None or niveau == 0:
+        return "N/A"
+    dist = abs(close_actuel - niveau) / niveau * 100
+    return f"{dist:.3f}%"
+
+
+def normalize_pair(inst_slash):
+    """[3] Normalisation v1.5 CASCADE ENGINE — supprime '/' pour exports."""
+    return inst_slash.replace("/", "")
 
 
 # ===================== PDF =====================
-def create_pdf(df):
+def create_pdf(df_export):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=landscape(A4),
@@ -298,13 +339,16 @@ def create_pdf(df):
 
     elements.append(Paragraph("Rapport des Signaux CHoCH", styles["Title"]))
     elements.append(Paragraph(
-        f"Généré le {datetime.now(timezone.utc).strftime('%d/%m/%Y à %H:%M')} UTC",
+        f"Généré le {datetime.now(timezone.utc).strftime('%d/%m/%Y à %H:%M')} UTC"
+        " — Fresh & Aged uniquement — Monthly exclu",
         styles["Normal"]
     ))
     elements.append(Spacer(1, 20))
 
-    data       = [df.columns.tolist()] + df.values.tolist()
-    col_widths = [75, 55, 48, 48, 95, 65, 55, 100, 55, 115]
+    cols_present = [c for c in EXPORT_COLS if c in df_export.columns]
+    data         = [cols_present] + df_export[cols_present].values.tolist()
+    col_widths   = [65, 48, 42, 42, 82, 68, 52, 58, 45, 90, 45, 105]
+    col_widths   = col_widths[:len(cols_present)]
 
     table = Table(data, colWidths=col_widths, repeatRows=1)
     table.setStyle(TableStyle([
@@ -312,15 +356,15 @@ def create_pdf(df):
         ('TEXTCOLOR',     (0, 0), (-1, 0), colors.white),
         ('ALIGN',         (0, 0), (-1, -1), 'CENTER'),
         ('FONTNAME',      (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE',      (0, 0), (-1, 0), 10),
-        ('FONTSIZE',      (0, 1), (-1, -1), 9),
+        ('FONTSIZE',      (0, 0), (-1, 0), 9),
+        ('FONTSIZE',      (0, 1), (-1, -1), 8),
         ('GRID',          (0, 0), (-1, -1), 0.5, colors.grey),
         ('ROWBACKGROUNDS',(0, 1), (-1, -1), [colors.white, colors.beige]),
         ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
-        ('LEFTPADDING',   (0, 0), (-1, -1), 6),
-        ('RIGHTPADDING',  (0, 0), (-1, -1), 6),
-        ('TOPPADDING',    (0, 0), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('LEFTPADDING',   (0, 0), (-1, -1), 5),
+        ('RIGHTPADDING',  (0, 0), (-1, -1), 5),
+        ('TOPPADDING',    (0, 0), (-1, -1), 7),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
     ]))
     elements.append(table)
     doc.build(elements)
@@ -330,13 +374,13 @@ def create_pdf(df):
 
 # ===================== PNG =====================
 def generate_png(df, display_cols):
-    fig, ax = plt.subplots(figsize=(20, max(5, len(df) * 0.35)))
+    fig, ax = plt.subplots(figsize=(22, max(5, len(df) * 0.35)))
     ax.axis('off')
     disp = df[[c for c in display_cols if c in df.columns]]
     tbl  = ax.table(cellText=disp.values, colLabels=disp.columns,
                     cellLoc='center', loc='center')
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8.5)
+    tbl.set_fontsize(8)
     tbl.scale(1.2, 1.8)
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=200)
@@ -349,16 +393,10 @@ def generate_png(df, display_cols):
 st.set_page_config(page_title="CHoCH Scanner", layout="wide")
 st.markdown(
     "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>"
-    "Scanner Change of Character (CHoCH) — v4.9</h1>",
+    "Scanner Change of Character (CHoCH) — v5.0</h1>",
     unsafe_allow_html=True
 )
 
-DISPLAY_COLS = [
-    "Instrument", "Timeframe", "Type", "Ordre", "Signal",
-    "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
-]
-
-# FIX [DOUBLE-SCAN] : flag pour bloquer un double-clic pendant le scan
 if "scanning" not in st.session_state:
     st.session_state.scanning = False
 
@@ -374,10 +412,8 @@ if st.button(
     with st.spinner(f"Scan en cours sur {n_combos} combinaisons…"):
         results = []
         errors  = []
-        # FIX [WORKERS] : réduit de 12 à 7 pour respecter les limites OANDA
-        # 33 instruments × 5 TF = 165 requêtes — 7 workers évitent le rate-limit
+
         with ThreadPoolExecutor(max_workers=7) as executor:
-            # FIX [FUTURES KEY] : clé clarifiée — (inst, tf_name) explicite
             futures = {
                 executor.submit(get_candles, inst, tf_code): (inst, tf_name)
                 for inst in INSTRUMENTS
@@ -392,33 +428,37 @@ if st.button(
                     continue
 
                 if df is not None:
-                    # FIX [NAMING] : sig_raw est "Bullish"/"Bearish", pas "Bullish CHoCH"
-                    sig_raw, time_sig, strength, idx_sig, trend = detect_choch(df, tf_name)
+                    sig_raw, time_sig, strength, idx_sig, trend, niveau_casse, close_actuel = \
+                        detect_choch(df, tf_name)
+
                     if sig_raw:
                         atr_val    = calc_atr(df)
                         volatilite = atr_to_volatility(atr_val, inst, df)
                         df_sig     = df.iloc[:idx_sig + 1] if idx_sig is not None else df
 
-                        # BOS = dans le sens de la tendance / CHoCH = contre-tendance
                         is_bos = (
                             (trend == "Uptrend"   and sig_raw == "Bullish") or
                             (trend == "Downtrend" and sig_raw == "Bearish")
                         )
-                        type_label = "BOS" if is_bos else "CHoCH"
-
-                        # Label complet construit ici, cohérent avec type_label
+                        type_label   = "BOS" if is_bos else "CHoCH"
                         signal_label = f"{sig_raw} {type_label}"
+                        inst_display = inst.replace("_", "/")
+                        inst_export  = normalize_pair(inst_display)
+                        statut       = compute_statut(time_sig, tf_name)
 
                         results.append({
-                            "Instrument":  inst.replace("_", "/"),
+                            "Instrument":  inst_display,       # Streamlit (avec slash)
+                            "Paire":       inst_export,        # Export normalisé (sans slash)
                             "Timeframe":   tf_name,
                             "Type":        type_label,
                             "Ordre":       "Achat" if sig_raw == "Bullish" else "Vente",
                             "Signal":      signal_label,
+                            "Niveau":      format_niveau(niveau_casse, inst),
+                            "Distance%":   format_distance(niveau_casse, close_actuel, inst),
                             "Volatilité":  volatilite,
                             "Force":       strength or "Moyen",
                             "BB_Width":    compute_bb_width(df_sig),
-                            "Statut":      compute_statut(time_sig, tf_name),
+                            "Statut":      statut,
                             "Heure (UTC)": time_sig.strftime("%Y-%m-%d %H:%M"),
                         })
 
@@ -426,16 +466,12 @@ if st.button(
             st.warning(f"{len(errors)} erreur(s) silencieuse(s) : {'; '.join(errors[:5])}")
 
         if results:
-            df_result = pd.DataFrame(results)
-
-            # FIX [DEDUP] : un seul signal par (Instrument, Timeframe) — on garde le plus récent
             df_result = (
-                df_result
+                pd.DataFrame(results)
                 .sort_values("Heure (UTC)", ascending=False)
                 .drop_duplicates(subset=["Instrument", "Timeframe"], keep="first")
                 .reset_index(drop=True)
             )
-
             st.session_state.df      = df_result
             st.session_state.png_buf = None
             st.success(f"Scan terminé – {len(df_result)} signaux sur {n_combos} combinaisons !")
@@ -446,21 +482,31 @@ if st.button(
 
 # ===================== AFFICHAGE =====================
 if "df" in st.session_state:
-    df = st.session_state.df.copy()
-    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    df_all = st.session_state.df.copy()
+    ts     = datetime.now().strftime("%Y%m%d_%H%M")
+
+    # [4] Exports = Fresh + Aged uniquement — Stale visible Streamlit, exclu PDF/CSV
+    df_export = df_all[df_all["Statut"].isin(["Fresh", "Aged"])].copy()
 
     if st.session_state.get("png_buf") is None:
-        st.session_state.png_buf = generate_png(df, DISPLAY_COLS)
+        st.session_state.png_buf = generate_png(df_all, DISPLAY_COLS)
+
+    n_stale = len(df_all[df_all["Statut"] == "Stale"])
+    if n_stale > 0:
+        st.info(
+            f"{n_stale} signal(s) Stale visible(s) dans le tableau — "
+            f"exclus du PDF/CSV (Fresh & Aged uniquement dans les exports)."
+        )
 
     col1, col2, col3 = st.columns(3)
     with col1:
         st.download_button(
             "CSV",
-            df[[c for c in DISPLAY_COLS if c in df.columns]].to_csv(index=False).encode(),
+            df_export[[c for c in EXPORT_COLS if c in df_export.columns]]
+                .to_csv(index=False).encode(),
             f"choch_{ts}.csv", "text/csv"
         )
     with col2:
-        # FIX [PNG BUF] : seek(0) avant chaque download pour éviter un fichier vide
         st.session_state.png_buf.seek(0)
         st.download_button(
             "PNG",
@@ -470,7 +516,7 @@ if "df" in st.session_state:
     with col3:
         st.download_button(
             "PDF",
-            create_pdf(df[[c for c in DISPLAY_COLS if c in df.columns]]),
+            create_pdf(df_export),
             f"choch_signaux_{ts}.pdf", "application/pdf"
         )
 
@@ -479,8 +525,23 @@ if "df" in st.session_state:
         if "Expansion" in str(val): return "color:#ab47bc;font-weight:bold"
         return "color:#90a4ae"
 
+    def style_distance(val):
+        """
+        Vert  ≤ 0.15% : signal encore proche du niveau, entrée potentielle
+        Orange 0.15–0.40% : acceptable, surveiller
+        Rouge  > 0.40% : niveau raté, ignorer pour une entrée
+        """
+        try:
+            v = float(str(val).replace("%", ""))
+            if v <= 0.15: return "color:#00c853;font-weight:bold"
+            if v <= 0.40: return "color:#ff9800;font-weight:bold"
+            return "color:#ff5252;font-weight:bold"
+        except Exception:
+            return "color:#90a4ae"
+
+    cols_display = [c for c in DISPLAY_COLS if c in df_all.columns]
     st.dataframe(
-        df[[c for c in DISPLAY_COLS if c in df.columns]].style
+        df_all[cols_display].style
         .map(
             lambda x: "color:#e879f9;font-weight:bold" if x == "CHoCH"
             else "color:#94a3b8" if x == "BOS" else "",
@@ -503,6 +564,7 @@ if "df" in st.session_state:
             subset=["Force"]
         )
         .map(style_bb, subset=["BB_Width"])
+        .map(style_distance, subset=["Distance%"])
         .map(
             lambda x: "color:#00c853;font-weight:bold" if x == "Fresh"
             else "color:#ff9800;font-weight:bold" if x == "Aged"
