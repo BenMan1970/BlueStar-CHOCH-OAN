@@ -125,6 +125,12 @@ def get_candles(inst, gran):
 
 
 def calc_atr(df, period=14):
+    """
+    ATR Wilder — ewm(alpha=1/period, adjust=False).
+    [FIX-4 v5.3] Aligné sur GPS v3.2 (_atr Wilder EWM).
+    Remplace np.mean(tr[-period:]) qui sous-estimait légèrement
+    les pics de volatilité récents (simple mean vs lissage exponentiel).
+    """
     h = df["high"].values
     l = df["low"].values
     c = df["close"].values
@@ -133,7 +139,7 @@ def calc_atr(df, period=14):
                     np.abs(l[1:] - c[:-1])))
     if len(tr) < period:
         return np.nan
-    return float(np.mean(tr[-period:]))
+    return float(pd.Series(tr).ewm(alpha=1/period, adjust=False).mean().iloc[-1])
 
 
 def atr_to_volatility(atr_val, inst, df):
@@ -417,7 +423,7 @@ def generate_png(df, display_cols):
 st.set_page_config(page_title="CHoCH Scanner", layout="wide")
 st.markdown(
     "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>"
-    "Scanner Change of Character (CHoCH) — v5.2</h1>",
+    "Scanner Change of Character (CHoCH) — v5.3</h1>",
     unsafe_allow_html=True
 )
 
