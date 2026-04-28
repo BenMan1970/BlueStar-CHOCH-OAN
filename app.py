@@ -84,7 +84,7 @@ DISPLAY_COLS = [
     "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
 ]
 
-# Colonnes exports PDF/CSV (paire normalisée sans slash, Stale exclus)
+# Colonnes exports PDF/CSV/JSON (paire normalisée sans slash, Stale exclus)
 EXPORT_COLS = [
     "Paire", "Timeframe", "Type", "Ordre", "Signal",
     "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
@@ -515,7 +515,7 @@ if "df" in st.session_state:
     df_all = st.session_state.df.copy()
     ts     = datetime.now().strftime("%Y%m%d_%H%M")
 
-    # [4] Exports = Fresh + Aged uniquement — Stale visible Streamlit, exclu PDF/CSV
+    # [4] Exports = Fresh + Aged uniquement — Stale visible Streamlit, exclu PDF/CSV/JSON
     df_export = df_all[df_all["Statut"].isin(["Fresh", "Aged"])].copy()
 
     if st.session_state.get("png_buf") is None:
@@ -525,10 +525,10 @@ if "df" in st.session_state:
     if n_stale > 0:
         st.info(
             f"{n_stale} signal(s) Stale visible(s) dans le tableau — "
-            f"exclus du PDF/CSV (Fresh & Aged uniquement dans les exports)."
+            f"exclus du PDF/CSV/JSON (Fresh & Aged uniquement dans les exports)."
         )
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.download_button(
             "CSV",
@@ -548,6 +548,13 @@ if "df" in st.session_state:
             "PDF",
             create_pdf(df_export),
             f"choch_signaux_{ts}.pdf", "application/pdf"
+        )
+    with col4:
+        st.download_button(
+            "JSON",
+            df_export[[c for c in EXPORT_COLS if c in df_export.columns]]
+                .to_json(orient="records", force_ascii=False, indent=2).encode("utf-8"),
+            f"choch_{ts}.json", "application/json"
         )
 
     def style_bb(val):
@@ -599,3 +606,4 @@ if "df" in st.session_state:
         hide_index=True,
         use_container_width=True
     )
+     
