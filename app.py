@@ -46,29 +46,11 @@ VOLATILITY_STATIC = {
 # [2] Monthly retiré — Weekly conservé pour analyse personnelle
 TIMEFRAMES      = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
 
-# [FIX-1] p = length // 2
-#   H1     : length=5  → p=2  (inchangé)
-#   H4     : length=5  → p=2  (était 6 → p=3 : ratait les cassures des 3 dernières bougies)
-#   D1     : length=7  → p=3  (inchangé)
-#   Weekly : length=7  → p=3  (était 8 → p=4 : ratait les pivots des 4 dernières semaines)
 FRACTAL_LEN     = {"H1": 5, "H4": 5, "D1": 7, "Weekly": 7}
-
-# [FIX-2] Fenêtre de recherche des fractals — N bougies max depuis la bougie courante
-#   Empêche un pivot vieux de 400 bougies d'être retenu comme niveau de référence.
-#   Calibrage : environ 2-3 mois de données par TF pour capturer les structures récentes.
-#   H1  : 120 bougies ≈ 5 jours
-#   H4  : 90  bougies ≈ 15 jours
-#   D1  : 60  bougies ≈ 2 mois
-#   Weekly : 26 bougies ≈ 6 mois
 FRACTAL_WINDOW  = {"H1": 120, "H4": 90, "D1": 60, "Weekly": 26}
-
 TF_HOURS        = {"H1": 1, "H4": 4, "D1": 24, "Weekly": 168}
 
 TF_STATUT = {
-    # [FIX-3] H1 : Fresh ≤ 4h | Aged ≤ 12h | Stale > 12h  (était Aged ≤ 8h)
-    #         H4 : Fresh ≤ 12h | Aged ≤ 32h | Stale > 32h  (était Aged ≤ 20h)
-    #         Les signaux H4/H1 détectés par FIX-1+2 tombaient tous en Stale
-    #         avec les anciens seuils → exclus des exports avant d'être vus.
     "H1":     {"Fresh": 4,  "Aged": 12},
     "H4":     {"Fresh": 3,  "Aged": 8},
     "D1":     {"Fresh": 2,  "Aged": 5},
@@ -84,7 +66,7 @@ DISPLAY_COLS = [
     "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
 ]
 
-# Colonnes exports PDF/CSV/JSON (paire normalisée sans slash, Stale exclus)
+# Colonnes exports PDF/CSV/JSON (paire avec slash, Stale exclus)
 EXPORT_COLS = [
     "Paire", "Timeframe", "Type", "Ordre", "Signal",
     "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
@@ -125,12 +107,6 @@ def get_candles(inst, gran):
 
 
 def calc_atr(df, period=14):
-    """
-    ATR Wilder — ewm(alpha=1/period, adjust=False).
-    [FIX-4 v5.3] Aligné sur GPS v3.2 (_atr Wilder EWM).
-    Remplace np.mean(tr[-period:]) qui sous-estimait légèrement
-    les pics de volatilité récents (simple mean vs lissage exponentiel).
-    """
     h = df["high"].values
     l = df["low"].values
     c = df["close"].values
@@ -223,19 +199,9 @@ def get_trend_context(df, tf):
 
 
 def detect_choch(df, tf):
-    """
-    Retourne un 7-tuple :
-      (sig_raw, time_sig, force, idx_cur, trend, niveau_casse, close_actuel)
-
-    [FIX-1] p réduit via FRACTAL_LEN : détecte les pivots récents
-    [FIX-2] Recherche last_high/last_low limitée à FRACTAL_WINDOW[tf] bougies
-            → évite de remonter toute l'histoire (faux niveaux de référence)
-    """
     length   = FRACTAL_LEN.get(tf, 5)
     p        = length // 2
     lookback = TF_LOOKBACK.get(tf, 3)
-
-    # [FIX-2] Fenêtre de recherche des fractals (bougies récentes uniquement)
     window   = FRACTAL_WINDOW.get(tf, 60)
 
     h_all = df["high"].values
@@ -278,14 +244,11 @@ def detect_choch(df, tf):
         l = l_all[:idx_cur + 1]
         c = c_all[:idx_cur + 1]
 
-        # [FIX-2] Limiter la recherche aux `window` dernières bougies
-        #         On conserve un minimum de p bougies pour ne pas couper les fractals
         window_start = max(p, len(h) - window)
 
         last_high = None
         last_low  = None
 
-        # [FIX-2] Parcours uniquement dans la fenêtre récente
         for i in range(window_start, len(h) - p):
             if h[i] == max(h[i - p:i + p + 1]):
                 last_high = h[i]
@@ -331,7 +294,6 @@ def detect_choch(df, tf):
 
 
 def format_niveau(niveau, inst):
-    """Décimales adaptées par type d'instrument."""
     if niveau is None:
         return "N/A"
     if any(k in inst for k in ["SPX500", "NAS100", "US30", "DE30", "XAU", "XAG"]):
@@ -342,19 +304,16 @@ def format_niveau(niveau, inst):
 
 
 def format_distance(niveau, close_actuel, inst):
-    """
-    Distance% = |close_actuel - niveau| / niveau × 100
-    Seuils CASCADE ENGINE : ≤0.15% excellent / 0.15–0.40% acceptable / >0.40% raté
-    """
     if niveau is None or close_actuel is None or niveau == 0:
         return "N/A"
     dist = abs(close_actuel - niveau) / niveau * 100
     return f"{dist:.3f}%"
 
 
+# [v5.4] normalize_pair conserve le slash — format canonique EUR/NZD
+#        Aligné sur P1 CANON_PAIR et le reste du pipeline Bluestar.
 def normalize_pair(inst_slash):
-    """Normalisation v1.5 CASCADE ENGINE — supprime '/' pour exports."""
-    return inst_slash.replace("/", "")
+    return inst_slash
 
 
 # ===================== PDF =====================
@@ -423,7 +382,7 @@ def generate_png(df, display_cols):
 st.set_page_config(page_title="CHoCH Scanner", layout="wide")
 st.markdown(
     "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>"
-    "Scanner Change of Character (CHoCH) — v5.3</h1>",
+    "Scanner Change of Character (CHoCH) — v5.4</h1>",
     unsafe_allow_html=True
 )
 
@@ -472,6 +431,9 @@ if st.button(
                         )
                         type_label   = "BOS" if is_bos else "CHoCH"
                         signal_label = f"{sig_raw} {type_label}"
+
+                        # [v5.4] inst_display et inst_export utilisent tous les deux
+                        #        le format slash (EUR/NZD) — aligné sur CANON_PAIR P1
                         inst_display = inst.replace("_", "/")
                         inst_export  = normalize_pair(inst_display)
                         statut       = compute_statut(time_sig, tf_name)
@@ -515,7 +477,6 @@ if "df" in st.session_state:
     df_all = st.session_state.df.copy()
     ts     = datetime.now().strftime("%Y%m%d_%H%M")
 
-    # [4] Exports = Fresh + Aged uniquement — Stale visible Streamlit, exclu PDF/CSV/JSON
     df_export = df_all[df_all["Statut"].isin(["Fresh", "Aged"])].copy()
 
     if st.session_state.get("png_buf") is None:
@@ -606,4 +567,3 @@ if "df" in st.session_state:
         hide_index=True,
         use_container_width=True
     )
-     
