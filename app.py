@@ -689,7 +689,7 @@ if "df" in st.session_state:
         )
 
     # ── Boutons d'export ──────────────────────────────────────────────
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         st.download_button(
@@ -712,16 +712,7 @@ if "df" in st.session_state:
             f"choch_signaux_{ts}.pdf", "application/pdf"
         )
     with col4:
-        # JSON UI — format lisible, colonnes display
-        st.download_button(
-            "JSON (UI)",
-            df_export[[c for c in EXPORT_COLS if c in df_export.columns]]
-                .to_json(orient="records", force_ascii=False, indent=2).encode("utf-8"),
-            f"choch_ui_{ts}.json", "application/json",
-            help="Export lisible pour consultation — colonnes affichage"
-        )
-    with col5:
-        # JSON PIPELINE — types natifs, contrat strict pour le pipeline aval
+        # JSON Pipeline — types natifs, contrat strict pour BLUESTAR
         pipeline_json = json.dumps(
             {
                 "meta": {
@@ -733,14 +724,13 @@ if "df" in st.session_state:
             },
             ensure_ascii=False,
             indent=2,
-            default=str   # fallback sécurisé pour tout type non sérialisable
+            default=str
         ).encode("utf-8")
 
         st.download_button(
-            "JSON (Pipeline)",
+            "JSON",
             pipeline_json,
-            f"choch_pipeline_{ts}.json", "application/json",
-            help="Export pipeline — types natifs, ISO 8601, signal_id unique"
+            f"choch_pipeline_{ts}.json", "application/json"
         )
 
     # ── Tableau UI ────────────────────────────────────────────────────
