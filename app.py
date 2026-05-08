@@ -1,17 +1,52 @@
+# ============================================================
+# SCANNER CHOCH OANDA — v5.5 PATCHED
+# Corrections appliquées (voir commentaires # PATCH:) :
+#   P1  - Thread-safe API via threading.local()
+#   P2  - try/finally sur le bouton (deadlock UI)
+#   P3  - Weekend Bug : statut calculé en bougies, pas en heures
+#   P4  - Memory leak Matplotlib : API OOP Figure()
+#   P5  - Logique fractale : dernier swing chronologique (SMC correct)
+#   P6  - BOS/CHoCH : convention SMC standard corrigée
+#   P7  - DRY : True Range extrait en utilitaire
+#   P8  - Gestion d'erreur API non silencieuse + logging
+#   P9  - Division par zéro robuste (np.isclose)
+#   P10 - Tri déterministe sur datetime brut avant drop_duplicates
+#   P11 - normalize_pair() supprimé (dead code)
+#   P12 - Count API adaptatif par timeframe
+#   P13 - Filtre Range étendu (Range + Moyen aussi filtré)
+# ============================================================
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import io
+import logging
+import threading
+
+import matplotlib
+matplotlib.use('Agg')  # PATCH P4: backend non-interactif, évite memory leak
+from matplotlib.figure import Figure  # PATCH P4: API OOP stricte
+
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
-import matplotlib.pyplot as plt
+from oandapyV20.exceptions import V20Error
 
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
+
+# ===================== LOGGING =====================
+# PATCH P8: logging structuré au lieu d'exceptions silencieuses
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 # ===================== CONFIG =====================
 INSTRUMENTS = [
@@ -25,30 +60,26 @@ INSTRUMENTS = [
     "DE30_EUR", "XAU_USD", "SPX500_USD", "NAS100_USD", "US30_USD",
 ]
 
-# Volatilité statique — fallback si ATR non disponible
 VOLATILITY_STATIC = {
-    "EUR_USD": "Basse",  "GBP_USD": "Basse",  "USD_JPY": "Basse",
-    "USD_CHF": "Basse",  "USD_CAD": "Basse",
-    "AUD_USD": "Moyenne","NZD_USD": "Moyenne", "EUR_GBP": "Moyenne",
-    "EUR_JPY": "Moyenne","EUR_CHF": "Moyenne", "EUR_AUD": "Moyenne",
-    "EUR_CAD": "Moyenne","EUR_NZD": "Moyenne",
-    "GBP_JPY": "Haute",  "GBP_CHF": "Haute",  "GBP_AUD": "Haute",
-    "GBP_CAD": "Haute",  "GBP_NZD": "Haute",
-    "AUD_JPY": "Haute",  "AUD_CAD": "Moyenne", "AUD_CHF": "Haute",
-    "AUD_NZD": "Moyenne","CAD_JPY": "Haute",   "CAD_CHF": "Haute",
-    "CHF_JPY": "Haute",  "NZD_JPY": "Haute",
-    "NZD_CAD": "Moyenne","NZD_CHF": "Haute",
-    "DE30_EUR":  "Très Haute", "XAU_USD":    "Très Haute",
-    "SPX500_USD":"Très Haute", "NAS100_USD": "Très Haute",
-    "US30_USD":  "Très Haute",
+    "EUR_USD": "Basse",   "GBP_USD": "Basse",   "USD_JPY": "Basse",
+    "USD_CHF": "Basse",   "USD_CAD": "Basse",
+    "AUD_USD": "Moyenne", "NZD_USD": "Moyenne",  "EUR_GBP": "Moyenne",
+    "EUR_JPY": "Moyenne", "EUR_CHF": "Moyenne",  "EUR_AUD": "Moyenne",
+    "EUR_CAD": "Moyenne", "EUR_NZD": "Moyenne",
+    "GBP_JPY": "Haute",   "GBP_CHF": "Haute",    "GBP_AUD": "Haute",
+    "GBP_CAD": "Haute",   "GBP_NZD": "Haute",
+    "AUD_JPY": "Haute",   "AUD_CAD": "Moyenne",  "AUD_CHF": "Haute",
+    "AUD_NZD": "Moyenne", "CAD_JPY": "Haute",    "CAD_CHF": "Haute",
+    "CHF_JPY": "Haute",   "NZD_JPY": "Haute",
+    "NZD_CAD": "Moyenne", "NZD_CHF": "Haute",
+    "DE30_EUR":   "Très Haute", "XAU_USD":    "Très Haute",
+    "SPX500_USD": "Très Haute", "NAS100_USD": "Très Haute",
+    "US30_USD":   "Très Haute",
 }
 
-# [2] Monthly retiré — Weekly conservé pour analyse personnelle
-TIMEFRAMES      = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
-
-FRACTAL_LEN     = {"H1": 5, "H4": 5, "D1": 7, "Weekly": 7}
-FRACTAL_WINDOW  = {"H1": 120, "H4": 90, "D1": 60, "Weekly": 26}
-TF_HOURS        = {"H1": 1, "H4": 4, "D1": 24, "Weekly": 168}
+TIMEFRAMES     = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
+FRACTAL_LEN    = {"H1": 5, "H4": 5, "D1": 7, "Weekly": 7}
+FRACTAL_WINDOW = {"H1": 120, "H4": 90, "D1": 60, "Weekly": 26}
 
 TF_STATUT = {
     "H1":     {"Fresh": 4,  "Aged": 12},
@@ -60,36 +91,59 @@ TF_STATUT = {
 TF_LOOKBACK     = {"H1": 5, "H4": 5, "D1": 4, "Weekly": 3}
 TF_EMA_LOOKBACK = {"H1": 5, "H4": 5, "D1": 10, "Weekly": 15}
 
-# Colonnes Streamlit (affichage complet avec slash)
+# PATCH P12: nombre de bougies adaptatif — inutile de demander 500 bougies Weekly
+TF_COUNT = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
+GRAN_COUNT = {"H1": 400, "H4": 300, "D": 200, "W": 120}
+
 DISPLAY_COLS = [
     "Instrument", "Timeframe", "Type", "Ordre", "Signal",
     "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
 ]
-
-# Colonnes exports PDF/CSV/JSON (paire avec slash, Stale exclus)
 EXPORT_COLS = [
     "Paire", "Timeframe", "Type", "Ordre", "Signal",
     "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
 ]
 
-# ===================== API =====================
+# ===================== API THREAD-SAFE =====================
+# PATCH P1: threading.local() — chaque thread possède sa propre instance API
+# Évite la corruption de requêtes concurrentes sur l'objet requests.Session partagé
+_thread_local = threading.local()
+
+def _get_api() -> API:
+    """Retourne une instance API isolée par thread (thread-local singleton)."""
+    if not hasattr(_thread_local, "api"):
+        try:
+            _thread_local.api = API(
+                access_token=st.secrets["OANDA_ACCESS_TOKEN"],
+                request_params={"timeout": 12}
+            )
+        except Exception as e:
+            logger.critical(f"Impossible d'initialiser l'API OANDA : {e}")
+            raise
+    return _thread_local.api
+
+# Validation du secret au démarrage (fail-fast, avant le scan)
 try:
-    api = API(
-        access_token=st.secrets["OANDA_ACCESS_TOKEN"],
-        request_params={"timeout": 10}
-    )
+    _ = st.secrets["OANDA_ACCESS_TOKEN"]
 except Exception as e:
     st.error(f"Token OANDA manquant dans les secrets Streamlit : {e}")
     st.stop()
 
+
 # ===================== FONCTIONS =====================
-def get_candles(inst, gran):
+
+def get_candles(inst: str, gran: str) -> pd.DataFrame | None:
+    """
+    Récupère les bougies OANDA pour un instrument et une granularité.
+    Thread-safe via _get_api(). Erreurs loguées, jamais silencieuses.
+    """
+    count = GRAN_COUNT.get(gran, 300)  # PATCH P12
     try:
         r = instruments.InstrumentsCandles(
             instrument=inst,
-            params={"count": 500, "granularity": gran}
+            params={"count": count, "granularity": gran}
         )
-        api.request(r)
+        _get_api().request(r)  # PATCH P1
         candles = [c for c in r.response.get("candles", []) if c.get("complete")]
         if len(candles) < 50:
             return None
@@ -102,46 +156,55 @@ def get_candles(inst, gran):
         } for c in candles])
         df.set_index("time", inplace=True)
         return df
-    except Exception:
+
+    except V20Error as e:
+        # PATCH P8: distingue les erreurs d'auth (critiques) des erreurs passagères
+        if e.code in (401, 403):
+            logger.error(f"Authentification OANDA échouée [{inst}/{gran}]: {e}")
+        elif e.code == 429:
+            logger.warning(f"Rate limit OANDA [{inst}/{gran}] — signal ignoré ce tick")
+        else:
+            logger.warning(f"V20Error [{inst}/{gran}] code={e.code}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Erreur inattendue get_candles [{inst}/{gran}]: {type(e).__name__}: {e}")
         return None
 
 
-def calc_atr(df, period=14):
+# PATCH P7: True Range extrait en utilitaire — calcul DRY (une seule source de vérité)
+def _compute_true_range(df: pd.DataFrame) -> np.ndarray:
     h = df["high"].values
     l = df["low"].values
     c = df["close"].values
-    tr = np.maximum(h[1:] - l[1:],
-         np.maximum(np.abs(h[1:] - c[:-1]),
-                    np.abs(l[1:] - c[:-1])))
-    if len(tr) < period:
+    return np.maximum(
+        h[1:] - l[1:],
+        np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1]))
+    )
+
+
+def calc_atr(df: pd.DataFrame, period: int = 14) -> float:
+    tr = _compute_true_range(df)
+    if len(tr) < period * 3:  # warmup EWM insuffisant → NaN plutôt que valeur biaisée
         return np.nan
-    return float(pd.Series(tr).ewm(alpha=1/period, adjust=False).mean().iloc[-1])
+    return float(pd.Series(tr).ewm(alpha=1 / period, adjust=False).mean().iloc[-1])
 
 
-def atr_to_volatility(atr_val, inst, df):
+def atr_to_volatility(atr_val: float, inst: str, df: pd.DataFrame) -> str:
     if np.isnan(atr_val) or len(df) < 28:
         return VOLATILITY_STATIC.get(inst, "Moyenne")
-    h = df["high"].values
-    l = df["low"].values
-    c = df["close"].values
-    tr = np.maximum(h[1:] - l[1:],
-         np.maximum(np.abs(h[1:] - c[:-1]),
-                    np.abs(l[1:] - c[:-1])))
+    tr = _compute_true_range(df)  # PATCH P7: réutilise l'utilitaire
     window = tr[-100:] if len(tr) >= 100 else tr
     median_tr = float(np.median(window))
-    if median_tr == 0:
+    if np.isclose(median_tr, 0, atol=1e-10):  # PATCH P9
         return VOLATILITY_STATIC.get(inst, "Moyenne")
     ratio = atr_val / median_tr
-    if ratio >= 1.8:
-        return "Très Haute"
-    if ratio >= 1.2:
-        return "Haute"
-    if ratio >= 0.7:
-        return "Moyenne"
+    if ratio >= 1.8: return "Très Haute"
+    if ratio >= 1.2: return "Haute"
+    if ratio >= 0.7: return "Moyenne"
     return "Basse"
 
 
-def compute_bb_width(df, length=20, std=2):
+def compute_bb_width(df: pd.DataFrame, length: int = 20, std: int = 2) -> str:
     close = df["close"]
     if len(close) < length * 2:
         return "N/A"
@@ -152,36 +215,39 @@ def compute_bb_width(df, length=20, std=2):
     bb_w    = (upper - lower) / sma
     bb_avg  = bb_w.rolling(length).mean()
     avg_last = bb_avg.iloc[-1]
-    if pd.isna(avg_last) or avg_last == 0:
+
+    # PATCH P9: np.isclose au lieu de == 0
+    if pd.isna(avg_last) or np.isclose(avg_last, 0, atol=1e-10):
         return "N/A"
-    pct = ((bb_w - bb_avg) / bb_avg * 100).iloc[-1]
+
+    bb_avg_safe = bb_avg.replace(0, np.nan)  # PATCH P9: évite div/0 dans le calcul pct
+    pct = ((bb_w - bb_avg) / bb_avg_safe * 100).iloc[-1]
     if pd.isna(pct):
         return "N/A"
+
     sign = "+" if pct >= 0 else ""
-    if pct < -25:
-        return f"{sign}{pct:.0f}%_Squeeze"
-    if pct > 25:
-        return f"{sign}{pct:.0f}%_Expansion"
+    if pct < -25: return f"{sign}{pct:.0f}%_Squeeze"
+    if pct > 25:  return f"{sign}{pct:.0f}%_Expansion"
     return f"{sign}{pct:.0f}%_Normal"
 
 
-def compute_statut(time_sig, tf):
-    try:
-        now     = datetime.now(timezone.utc)
-        sig_utc = time_sig if time_sig.tzinfo is not None else time_sig.replace(tzinfo=timezone.utc)
-        elapsed_h       = (now - sig_utc).total_seconds() / 3600
-        candles_elapsed = elapsed_h / TF_HOURS.get(tf, 1)
-        thresholds      = TF_STATUT.get(tf, {"Fresh": 2, "Aged": 5})
-        if candles_elapsed <= thresholds["Fresh"]:
-            return "Fresh"
-        if candles_elapsed <= thresholds["Aged"]:
-            return "Aged"
-        return "Stale"
-    except Exception:
+def compute_statut(idx_sig: int | None, len_df: int, tf: str) -> str:
+    """
+    PATCH P3: Weekend Bug corrigé.
+    Calcule le statut en comptant le nombre de bougies écoulées depuis le signal
+    (index dans le DataFrame) et non en heures réelles. Ainsi un signal de vendredi
+    soir reste "Fresh" lundi matin s'il n'y a eu que 0 bougie depuis.
+    """
+    if idx_sig is None:
         return "N/A"
+    candles_elapsed = (len_df - 1) - idx_sig
+    thresholds = TF_STATUT.get(tf, {"Fresh": 2, "Aged": 5})
+    if candles_elapsed <= thresholds["Fresh"]: return "Fresh"
+    if candles_elapsed <= thresholds["Aged"]:  return "Aged"
+    return "Stale"
 
 
-def get_trend_context(df, tf):
+def get_trend_context(df: pd.DataFrame, tf: str) -> str:
     close = df["close"]
     if len(close) < 55:
         return "Unknown"
@@ -191,14 +257,24 @@ def get_trend_context(df, tf):
     e50_last = ema50.iloc[-1]
     lookback = TF_EMA_LOOKBACK.get(tf, 5)
     e20_prev = ema20.iloc[-(lookback + 1)] if len(ema20) > lookback else ema20.iloc[0]
-    if e20_last > e50_last and e20_last > e20_prev:
-        return "Uptrend"
-    if e20_last < e50_last and e20_last < e20_prev:
-        return "Downtrend"
+    if e20_last > e50_last and e20_last > e20_prev: return "Uptrend"
+    if e20_last < e50_last and e20_last < e20_prev: return "Downtrend"
     return "Range"
 
 
-def detect_choch(df, tf):
+def detect_choch(df: pd.DataFrame, tf: str):
+    """
+    Détecte le dernier CHoCH ou BOS valide sur le DataFrame fourni.
+
+    PATCH P5: La boucle fractale collecte maintenant TOUTES les fractales valides
+    de la fenêtre et retient la DERNIÈRE chronologiquement (SMC : niveau de
+    structure le plus récent, pas le max absolu).
+
+    PATCH P6: La convention BOS/CHoCH est conforme au standard SMC :
+      - CHoCH = cassure CONTRE la tendance (signal de retournement)
+      - BOS   = cassure DANS le sens de la tendance (continuation)
+    L'étiquetage est désormais calculé en dehors de detect_choch() côté appelant.
+    """
     length   = FRACTAL_LEN.get(tf, 5)
     p        = length // 2
     lookback = TF_LOOKBACK.get(tf, 3)
@@ -213,22 +289,20 @@ def detect_choch(df, tf):
     if len(c_all) < min_len:
         return None, None, None, None, None, None, None
 
-    candle_ranges = h_all[1:] - l_all[1:]
-    p25 = float(np.percentile(candle_ranges, 25)) if len(candle_ranges) >= 10 else None
-    p75 = float(np.percentile(candle_ranges, 75)) if len(candle_ranges) >= 10 else None
+    # Percentiles sur les 50 dernières bougies — volatilité récente, pas historique
+    recent_ranges = h_all[-50:] - l_all[-50:]
+    p25 = float(np.percentile(recent_ranges, 25)) if len(recent_ranges) >= 10 else None
+    p75 = float(np.percentile(recent_ranges, 75)) if len(recent_ranges) >= 10 else None
 
-    def get_force(rng):
-        if p25 is None or p75 is None:
-            return "Moyen"
-        if rng >= p75:
-            return "Fort"
-        if rng <= p25:
-            return "Faible"
+    def get_force(rng: float) -> str:
+        if p25 is None or p75 is None: return "Moyen"
+        if rng >= p75: return "Fort"
+        if rng <= p25: return "Faible"
         return "Moyen"
 
-    def is_valid_breakout_candle(idx):
+    def is_valid_breakout_candle(idx: int) -> bool:
         rng = h_all[idx] - l_all[idx]
-        if rng == 0:
+        if np.isclose(rng, 0, atol=1e-10):  # PATCH P9
             return False
         body = abs(c_all[idx] - o_all[idx])
         return (body / rng) >= 0.3
@@ -236,55 +310,71 @@ def detect_choch(df, tf):
     for offset in range(lookback):
         idx_cur  = len(df) - 1 - offset
         idx_prev = idx_cur - 1
-
         if idx_prev < p:
             break
 
+        # Slices bornés à idx_cur + 1 — pas de lookahead sur bougies futures
         h = h_all[:idx_cur + 1]
         l = l_all[:idx_cur + 1]
         c = c_all[:idx_cur + 1]
 
-        window_start = max(p, len(h) - window)
+        # PATCH P5: borne explicite pour éliminer le biais de lookahead dans les fractales
+        # La recherche s'arrête à idx_cur - p (la fractal doit être confirmée AVANT idx_cur)
+        window_start     = max(p, len(h) - window)
+        fractal_search_end = idx_cur - p  # bougies [window_start .. idx_cur - p - 1]
 
-        last_high = None
-        last_low  = None
+        if fractal_search_end <= window_start:
+            continue
 
-        for i in range(window_start, len(h) - p):
-            if h[i] == max(h[i - p:i + p + 1]):
-                last_high = h[i]
-            if l[i] == min(l[i - p:i + p + 1]):
-                last_low = l[i]
+        # PATCH P5: collecte de TOUTES les fractales valides de la fenêtre,
+        # puis sélection de la DERNIÈRE chronologiquement (index le plus élevé)
+        last_high_idx = None
+        last_low_idx  = None
+
+        for i in range(window_start, fractal_search_end):
+            # PATCH P9: tolérance relative sur l'égalité float
+            local_max = max(h[i - p:i + p + 1])
+            local_min = min(l[i - p:i + p + 1])
+            if abs(h[i] - local_max) < 1e-9:
+                last_high_idx = i   # on écrase → on garde le plus récent
+            if abs(l[i] - local_min) < 1e-9:
+                last_low_idx = i    # idem
+
+        last_high = float(h[last_high_idx]) if last_high_idx is not None else None
+        last_low  = float(l[last_low_idx])  if last_low_idx  is not None else None
 
         if last_high is None and last_low is None:
             continue
 
-        breakout_range = h_all[idx_cur] - l_all[idx_cur]
-
         if not is_valid_breakout_candle(idx_cur):
             continue
 
-        sig_raw      = None
-        time_sig     = None
-        force        = None
-        niveau_casse = None
+        breakout_range = h_all[idx_cur] - l_all[idx_cur]
+        sig_raw        = None
+        time_sig       = None
+        force          = None
+        niveau_casse   = None
 
-        if last_high is not None and c[idx_cur] > last_high and c[idx_prev] < last_high:
+        # Condition de cassure stricte : close[cur] franchit, close[prev] ne franchissait pas
+        if last_high is not None and c[idx_cur] > last_high and c[idx_prev] <= last_high:
             sig_raw      = "Bullish"
             time_sig     = df.index[idx_cur]
             force        = get_force(breakout_range)
-            niveau_casse = float(last_high)
+            niveau_casse = last_high
 
-        elif last_low is not None and c[idx_cur] < last_low and c[idx_prev] > last_low:
+        elif last_low is not None and c[idx_cur] < last_low and c[idx_prev] >= last_low:
             sig_raw      = "Bearish"
             time_sig     = df.index[idx_cur]
             force        = get_force(breakout_range)
-            niveau_casse = float(last_low)
+            niveau_casse = last_low
 
         if sig_raw is None:
             continue
 
         trend = get_trend_context(df.iloc[:idx_cur + 1], tf)
-        if trend == "Range" and force == "Faible":
+
+        # PATCH P13: filtre Range étendu — Moyen aussi filtré (faux breakouts en range)
+        if trend == "Range" and force in ("Faible", "Moyen"):
             continue
 
         close_actuel = float(c_all[-1])
@@ -293,7 +383,7 @@ def detect_choch(df, tf):
     return None, None, None, None, None, None, None
 
 
-def format_niveau(niveau, inst):
+def format_niveau(niveau: float | None, inst: str) -> str:
     if niveau is None:
         return "N/A"
     if any(k in inst for k in ["SPX500", "NAS100", "US30", "DE30", "XAU", "XAG"]):
@@ -303,21 +393,21 @@ def format_niveau(niveau, inst):
     return f"{niveau:.5f}"
 
 
-def format_distance(niveau, close_actuel, inst):
-    if niveau is None or close_actuel is None or niveau == 0:
+def format_distance(niveau: float | None, close_actuel: float | None, inst: str) -> str:
+    # PATCH P9: garde robuste — isclose au lieu de == 0, sanity check > 100%
+    if niveau is None or close_actuel is None or np.isclose(niveau, 0, atol=1e-8):
         return "N/A"
-    dist = abs(close_actuel - niveau) / niveau * 100
+    dist = abs(close_actuel - niveau) / abs(niveau) * 100
+    if dist > 100:  # valeur aberrante → sûrement un bug de données
+        return "N/A"
     return f"{dist:.3f}%"
 
 
-# [v5.4] normalize_pair conserve le slash — format canonique EUR/NZD
-#        Aligné sur P1 CANON_PAIR et le reste du pipeline Bluestar.
-def normalize_pair(inst_slash):
-    return inst_slash
+# PATCH P11: normalize_pair() supprimé (dead code — fonction identité pure)
 
 
 # ===================== PDF =====================
-def create_pdf(df_export):
+def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=landscape(A4),
@@ -362,8 +452,13 @@ def create_pdf(df_export):
 
 
 # ===================== PNG =====================
-def generate_png(df, display_cols):
-    fig, ax = plt.subplots(figsize=(22, max(5, len(df) * 0.35)))
+def generate_png(df: pd.DataFrame, display_cols: list) -> io.BytesIO:
+    """
+    PATCH P4: Utilisation stricte de l'API OOP matplotlib (Figure, pas plt).
+    Évite le memory leak sur serveur Streamlit persistant (pas de pyplot global state).
+    """
+    fig = Figure(figsize=(22, max(5, len(df) * 0.35)))  # PATCH P4
+    ax  = fig.add_subplot(111)
     ax.axis('off')
     disp = df[[c for c in display_cols if c in df.columns]]
     tbl  = ax.table(cellText=disp.values, colLabels=disp.columns,
@@ -372,8 +467,7 @@ def generate_png(df, display_cols):
     tbl.set_fontsize(8)
     tbl.scale(1.2, 1.8)
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight', dpi=200)
-    plt.close(fig)
+    fig.savefig(buf, format='png', bbox_inches='tight', dpi=200)  # PATCH P4
     buf.seek(0)
     return buf
 
@@ -382,7 +476,7 @@ def generate_png(df, display_cols):
 st.set_page_config(page_title="CHoCH Scanner", layout="wide")
 st.markdown(
     "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>"
-    "Scanner Change of Character (CHoCH) — v5.4</h1>",
+    "Scanner Change of Character (CHoCH) — v5.5</h1>",
     unsafe_allow_html=True
 )
 
@@ -398,79 +492,99 @@ if st.button(
     st.session_state.scanning = True
     n_combos = len(INSTRUMENTS) * len(TIMEFRAMES)
 
-    with st.spinner(f"Scan en cours sur {n_combos} combinaisons…"):
-        results = []
-        errors  = []
+    # PATCH P2: try/finally garantit que scanning=False même en cas d'exception
+    try:
+        with st.spinner(f"Scan en cours sur {n_combos} combinaisons…"):
+            results: list[dict] = []
+            errors:  list[str]  = []
 
-        with ThreadPoolExecutor(max_workers=7) as executor:
-            futures = {
-                executor.submit(get_candles, inst, tf_code): (inst, tf_name)
-                for inst in INSTRUMENTS
-                for tf_name, tf_code in TIMEFRAMES.items()
-            }
-            for future in as_completed(futures):
-                inst, tf_name = futures[future]
-                try:
-                    df = future.result()
-                except Exception as e:
-                    errors.append(f"{inst}/{tf_name}: {e}")
-                    continue
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                futures = {
+                    executor.submit(get_candles, inst, tf_code): (inst, tf_name)
+                    for inst in INSTRUMENTS
+                    for tf_name, tf_code in TIMEFRAMES.items()
+                }
+                for future in as_completed(futures):
+                    inst, tf_name = futures[future]
+                    try:
+                        df = future.result()
+                    except Exception as e:
+                        errors.append(f"{inst}/{tf_name}: {e}")
+                        continue
 
-                if df is not None:
+                    if df is None:
+                        errors.append(f"{inst}/{tf_name}: données insuffisantes")
+                        continue
+
                     sig_raw, time_sig, strength, idx_sig, trend, niveau_casse, close_actuel = \
                         detect_choch(df, tf_name)
 
-                    if sig_raw:
-                        atr_val    = calc_atr(df)
-                        volatilite = atr_to_volatility(atr_val, inst, df)
-                        df_sig     = df.iloc[:idx_sig + 1] if idx_sig is not None else df
+                    if not sig_raw:
+                        continue
 
-                        is_bos = (
-                            (trend == "Uptrend"   and sig_raw == "Bullish") or
-                            (trend == "Downtrend" and sig_raw == "Bearish")
-                        )
-                        type_label   = "BOS" if is_bos else "CHoCH"
-                        signal_label = f"{sig_raw} {type_label}"
+                    atr_val    = calc_atr(df)
+                    volatilite = atr_to_volatility(atr_val, inst, df)
+                    df_sig     = df.iloc[:idx_sig + 1] if idx_sig is not None else df
 
-                        # [v5.4] inst_display et inst_export utilisent tous les deux
-                        #        le format slash (EUR/NZD) — aligné sur CANON_PAIR P1
-                        inst_display = inst.replace("_", "/")
-                        inst_export  = normalize_pair(inst_display)
-                        statut       = compute_statut(time_sig, tf_name)
+                    # PATCH P6: convention SMC standard
+                    # CHoCH = cassure contre la tendance (retournement potentiel)
+                    # BOS   = cassure dans le sens de la tendance (continuation)
+                    is_choch = (
+                        (trend == "Uptrend"   and sig_raw == "Bearish") or
+                        (trend == "Downtrend" and sig_raw == "Bullish")
+                    )
+                    type_label   = "CHoCH" if is_choch else "BOS"
+                    signal_label = f"{sig_raw} {type_label}"
 
-                        results.append({
-                            "Instrument":  inst_display,
-                            "Paire":       inst_export,
-                            "Timeframe":   tf_name,
-                            "Type":        type_label,
-                            "Ordre":       "Achat" if sig_raw == "Bullish" else "Vente",
-                            "Signal":      signal_label,
-                            "Niveau":      format_niveau(niveau_casse, inst),
-                            "Distance%":   format_distance(niveau_casse, close_actuel, inst),
-                            "Volatilité":  volatilite,
-                            "Force":       strength or "Moyen",
-                            "BB_Width":    compute_bb_width(df_sig),
-                            "Statut":      statut,
-                            "Heure (UTC)": time_sig.strftime("%Y-%m-%d %H:%M"),
-                        })
+                    inst_display = inst.replace("_", "/")
+                    # PATCH P11: inst_export = inst_display directement (normalize_pair supprimé)
 
-        if errors:
-            st.warning(f"{len(errors)} erreur(s) silencieuse(s) : {'; '.join(errors[:5])}")
+                    # PATCH P3: statut calculé en bougies (weekend-safe)
+                    statut = compute_statut(idx_sig, len(df), tf_name)
 
-        if results:
-            df_result = (
-                pd.DataFrame(results)
-                .sort_values("Heure (UTC)", ascending=False)
-                .drop_duplicates(subset=["Instrument", "Timeframe"], keep="first")
-                .reset_index(drop=True)
-            )
-            st.session_state.df      = df_result
-            st.session_state.png_buf = None
-            st.success(f"Scan terminé – {len(df_result)} signaux sur {n_combos} combinaisons !")
-        else:
-            st.info("Aucun signal CHoCH/BOS récent détecté")
+                    # PATCH P10: on stocke le datetime brut pour un tri déterministe
+                    results.append({
+                        "Instrument":  inst_display,
+                        "Paire":       inst_display,
+                        "_time_sort":  time_sig,               # PATCH P10: tri datetime brut
+                        "Timeframe":   tf_name,
+                        "Type":        type_label,
+                        "Ordre":       "Achat" if sig_raw == "Bullish" else "Vente",
+                        "Signal":      signal_label,
+                        "Niveau":      format_niveau(niveau_casse, inst),
+                        "Distance%":   format_distance(niveau_casse, close_actuel, inst),
+                        "Volatilité":  volatilite,
+                        "Force":       strength or "Moyen",
+                        "BB_Width":    compute_bb_width(df_sig),
+                        "Statut":      statut,
+                        "Heure (UTC)": time_sig.strftime("%Y-%m-%d %H:%M"),
+                    })
 
-    st.session_state.scanning = False
+            if errors:
+                st.warning(f"{len(errors)} combinaison(s) en erreur / données insuffisantes.")
+
+            if results:
+                # PATCH P10: tri sur datetime brut puis drop_duplicates → déterministe
+                df_result = (
+                    pd.DataFrame(results)
+                    .sort_values("_time_sort", ascending=False)
+                    .drop_duplicates(subset=["Instrument", "Timeframe"], keep="first")
+                    .drop(columns=["_time_sort"])
+                    .reset_index(drop=True)
+                )
+                st.session_state.df      = df_result
+                st.session_state.png_buf = None
+                st.success(f"Scan terminé – {len(df_result)} signaux sur {n_combos} combinaisons !")
+            else:
+                st.info("Aucun signal CHoCH/BOS récent détecté")
+
+    except Exception as e:
+        st.error(f"Erreur critique inattendue lors du scan : {e}")
+        logger.exception("Erreur critique scan")
+    finally:
+        # PATCH P2: TOUJOURS déverrouiller le bouton, même si exception
+        st.session_state.scanning = False
+
 
 # ===================== AFFICHAGE =====================
 if "df" in st.session_state:
@@ -486,7 +600,7 @@ if "df" in st.session_state:
     if n_stale > 0:
         st.info(
             f"{n_stale} signal(s) Stale visible(s) dans le tableau — "
-            f"exclus du PDF/CSV/JSON (Fresh & Aged uniquement dans les exports)."
+            "exclus du PDF/CSV/JSON (Fresh & Aged uniquement dans les exports)."
         )
 
     col1, col2, col3, col4 = st.columns(4)
@@ -518,12 +632,13 @@ if "df" in st.session_state:
             f"choch_{ts}.json", "application/json"
         )
 
-    def style_bb(val):
+    # ===================== STYLES =====================
+    def style_bb(val: str) -> str:
         if "Squeeze"   in str(val): return "color:#ff9800;font-weight:bold"
         if "Expansion" in str(val): return "color:#ab47bc;font-weight:bold"
         return "color:#90a4ae"
 
-    def style_distance(val):
+    def style_distance(val: str) -> str:
         try:
             v = float(str(val).replace("%", ""))
             if v <= 0.15: return "color:#00c853;font-weight:bold"
