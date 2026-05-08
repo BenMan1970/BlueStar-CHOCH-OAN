@@ -1,31 +1,29 @@
 # ============================================================
-# SCANNER CHOCH OANDA — v5.5 PATCHED
-# Corrections appliquées (voir commentaires # PATCH:) :
-#   P1  - Thread-safe API via threading.local()
-#   P2  - try/finally sur le bouton (deadlock UI)
-#   P3  - Weekend Bug : statut calculé en bougies, pas en heures
-#   P4  - Memory leak Matplotlib : API OOP Figure()
-#   P5  - Logique fractale : dernier swing chronologique (SMC correct)
-#   P6  - BOS/CHoCH : convention SMC standard corrigée
-#   P7  - DRY : True Range extrait en utilitaire
-#   P8  - Gestion d'erreur API non silencieuse + logging
-#   P9  - Division par zéro robuste (np.isclose)
-#   P10 - Tri déterministe sur datetime brut avant drop_duplicates
-#   P11 - normalize_pair() supprimé (dead code)
-#   P12 - Count API adaptatif par timeframe
-#   P13 - Filtre Range étendu (Range + Moyen aussi filtré)
+# SCANNER CHOCH OANDA — v5.6 PIPELINE
+# Nouveautés v5.6 (sur base v5.5 patchée) :
+#   P14 - JSON pipeline-grade : types natifs (float, int, bool)
+#   P14 - signal_id unique par signal (pair + tf + timestamp)
+#   P14 - signal_time en ISO 8601 strict avec timezone
+#   P14 - bb_width_pct (float) et bb_regime séparés
+#   P14 - distance_pct float sans symbole %
+#   P14 - level et close_price en float natif
+#   P14 - champ trend exposé dans le payload
+#   P14 - champ session (London/NewYork/Asia/Off)
+#   P14 - scanner_version et generated_at dans chaque signal
+#   P14 - export JSON pipeline séparé de l'export UI
 # ============================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import io
+import json
 import logging
 import threading
 
 import matplotlib
-matplotlib.use('Agg')  # PATCH P4: backend non-interactif, évite memory leak
-from matplotlib.figure import Figure  # PATCH P4: API OOP stricte
+matplotlib.use('Agg')
+from matplotlib.figure import Figure
 
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -40,7 +38,6 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 
 # ===================== LOGGING =====================
-# PATCH P8: logging structuré au lieu d'exceptions silencieuses
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -48,15 +45,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+SCANNER_VERSION = "5.6"
+
 # ===================== CONFIG =====================
 INSTRUMENTS = [
-    # 28 paires Forex
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
     "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
     "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
     "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY",
     "NZD_JPY", "NZD_CAD", "NZD_CHF",
-    # 5 indices et métaux
     "DE30_EUR", "XAU_USD", "SPX500_USD", "NAS100_USD", "US30_USD",
 ]
 
@@ -90,27 +87,23 @@ TF_STATUT = {
 
 TF_LOOKBACK     = {"H1": 5, "H4": 5, "D1": 4, "Weekly": 3}
 TF_EMA_LOOKBACK = {"H1": 5, "H4": 5, "D1": 10, "Weekly": 15}
+GRAN_COUNT      = {"H1": 400, "H4": 300, "D": 200, "W": 120}
 
-# PATCH P12: nombre de bougies adaptatif — inutile de demander 500 bougies Weekly
-TF_COUNT = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
-GRAN_COUNT = {"H1": 400, "H4": 300, "D": 200, "W": 120}
-
+# Colonnes pour l'affichage UI (inchangé)
 DISPLAY_COLS = [
     "Instrument", "Timeframe", "Type", "Ordre", "Signal",
     "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
 ]
+# Colonnes pour les exports UI (PDF / CSV / PNG)
 EXPORT_COLS = [
     "Paire", "Timeframe", "Type", "Ordre", "Signal",
     "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
 ]
 
 # ===================== API THREAD-SAFE =====================
-# PATCH P1: threading.local() — chaque thread possède sa propre instance API
-# Évite la corruption de requêtes concurrentes sur l'objet requests.Session partagé
 _thread_local = threading.local()
 
 def _get_api() -> API:
-    """Retourne une instance API isolée par thread (thread-local singleton)."""
     if not hasattr(_thread_local, "api"):
         try:
             _thread_local.api = API(
@@ -122,7 +115,6 @@ def _get_api() -> API:
             raise
     return _thread_local.api
 
-# Validation du secret au démarrage (fail-fast, avant le scan)
 try:
     _ = st.secrets["OANDA_ACCESS_TOKEN"]
 except Exception as e:
@@ -130,20 +122,60 @@ except Exception as e:
     st.stop()
 
 
-# ===================== FONCTIONS =====================
+# ===================== UTILITAIRES =====================
+
+def _compute_true_range(df: pd.DataFrame) -> np.ndarray:
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
+    return np.maximum(
+        h[1:] - l[1:],
+        np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1]))
+    )
+
+
+def get_session(dt: datetime) -> str:
+    """
+    P14: Retourne la session de trading active au moment du signal.
+    Basé sur l'heure UTC. Utilisé dans le payload JSON pipeline.
+    Sessions : Sydney (21-06), Tokyo (00-09), London (07-16), NewYork (13-22).
+    On retient la session dominante (London > NewYork > Tokyo > Off).
+    """
+    h = dt.hour
+    if 7 <= h < 16:
+        return "London"
+    if 13 <= h < 22:
+        return "NewYork"
+    if 0 <= h < 9:
+        return "Tokyo"
+    return "Off"
+
+
+def _parse_bb_components(bb_str: str) -> tuple[float | None, str]:
+    """
+    P14: Décompose la string BB_Width en (pct_float, regime_str).
+    Entrée : "+23%_Normal" | "-32%_Squeeze" | "+28%_Expansion" | "N/A"
+    Sortie : (23.0, "Normal") | (-32.0, "Squeeze") | (28.0, "Expansion") | (None, "N/A")
+    """
+    if bb_str == "N/A":
+        return None, "N/A"
+    try:
+        pct_part, regime = bb_str.split("%_")
+        return round(float(pct_part), 2), regime
+    except Exception:
+        return None, "N/A"
+
+
+# ===================== FONCTIONS CORE =====================
 
 def get_candles(inst: str, gran: str) -> pd.DataFrame | None:
-    """
-    Récupère les bougies OANDA pour un instrument et une granularité.
-    Thread-safe via _get_api(). Erreurs loguées, jamais silencieuses.
-    """
-    count = GRAN_COUNT.get(gran, 300)  # PATCH P12
+    count = GRAN_COUNT.get(gran, 300)
     try:
         r = instruments.InstrumentsCandles(
             instrument=inst,
             params={"count": count, "granularity": gran}
         )
-        _get_api().request(r)  # PATCH P1
+        _get_api().request(r)
         candles = [c for c in r.response.get("candles", []) if c.get("complete")]
         if len(candles) < 50:
             return None
@@ -156,35 +188,22 @@ def get_candles(inst: str, gran: str) -> pd.DataFrame | None:
         } for c in candles])
         df.set_index("time", inplace=True)
         return df
-
     except V20Error as e:
-        # PATCH P8: distingue les erreurs d'auth (critiques) des erreurs passagères
         if e.code in (401, 403):
-            logger.error(f"Authentification OANDA échouée [{inst}/{gran}]: {e}")
+            logger.error(f"Auth OANDA échouée [{inst}/{gran}]: {e}")
         elif e.code == 429:
-            logger.warning(f"Rate limit OANDA [{inst}/{gran}] — signal ignoré ce tick")
+            logger.warning(f"Rate limit [{inst}/{gran}]")
         else:
             logger.warning(f"V20Error [{inst}/{gran}] code={e.code}: {e}")
         return None
     except Exception as e:
-        logger.error(f"Erreur inattendue get_candles [{inst}/{gran}]: {type(e).__name__}: {e}")
+        logger.error(f"Erreur get_candles [{inst}/{gran}]: {type(e).__name__}: {e}")
         return None
-
-
-# PATCH P7: True Range extrait en utilitaire — calcul DRY (une seule source de vérité)
-def _compute_true_range(df: pd.DataFrame) -> np.ndarray:
-    h = df["high"].values
-    l = df["low"].values
-    c = df["close"].values
-    return np.maximum(
-        h[1:] - l[1:],
-        np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1]))
-    )
 
 
 def calc_atr(df: pd.DataFrame, period: int = 14) -> float:
     tr = _compute_true_range(df)
-    if len(tr) < period * 3:  # warmup EWM insuffisant → NaN plutôt que valeur biaisée
+    if len(tr) < period * 3:
         return np.nan
     return float(pd.Series(tr).ewm(alpha=1 / period, adjust=False).mean().iloc[-1])
 
@@ -192,10 +211,10 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> float:
 def atr_to_volatility(atr_val: float, inst: str, df: pd.DataFrame) -> str:
     if np.isnan(atr_val) or len(df) < 28:
         return VOLATILITY_STATIC.get(inst, "Moyenne")
-    tr = _compute_true_range(df)  # PATCH P7: réutilise l'utilitaire
+    tr = _compute_true_range(df)
     window = tr[-100:] if len(tr) >= 100 else tr
     median_tr = float(np.median(window))
-    if np.isclose(median_tr, 0, atol=1e-10):  # PATCH P9
+    if np.isclose(median_tr, 0, atol=1e-10):
         return VOLATILITY_STATIC.get(inst, "Moyenne")
     ratio = atr_val / median_tr
     if ratio >= 1.8: return "Très Haute"
@@ -205,26 +224,23 @@ def atr_to_volatility(atr_val: float, inst: str, df: pd.DataFrame) -> str:
 
 
 def compute_bb_width(df: pd.DataFrame, length: int = 20, std: int = 2) -> str:
+    """Retourne la string UI. La décomposition pour pipeline est faite via _parse_bb_components."""
     close = df["close"]
     if len(close) < length * 2:
         return "N/A"
-    sma     = close.rolling(length).mean()
-    std_dev = close.rolling(length).std()
-    upper   = sma + std * std_dev
-    lower   = sma - std * std_dev
-    bb_w    = (upper - lower) / sma
-    bb_avg  = bb_w.rolling(length).mean()
+    sma      = close.rolling(length).mean()
+    std_dev  = close.rolling(length).std()
+    upper    = sma + std * std_dev
+    lower    = sma - std * std_dev
+    bb_w     = (upper - lower) / sma
+    bb_avg   = bb_w.rolling(length).mean()
     avg_last = bb_avg.iloc[-1]
-
-    # PATCH P9: np.isclose au lieu de == 0
     if pd.isna(avg_last) or np.isclose(avg_last, 0, atol=1e-10):
         return "N/A"
-
-    bb_avg_safe = bb_avg.replace(0, np.nan)  # PATCH P9: évite div/0 dans le calcul pct
+    bb_avg_safe = bb_avg.replace(0, np.nan)
     pct = ((bb_w - bb_avg) / bb_avg_safe * 100).iloc[-1]
     if pd.isna(pct):
         return "N/A"
-
     sign = "+" if pct >= 0 else ""
     if pct < -25: return f"{sign}{pct:.0f}%_Squeeze"
     if pct > 25:  return f"{sign}{pct:.0f}%_Expansion"
@@ -232,12 +248,6 @@ def compute_bb_width(df: pd.DataFrame, length: int = 20, std: int = 2) -> str:
 
 
 def compute_statut(idx_sig: int | None, len_df: int, tf: str) -> str:
-    """
-    PATCH P3: Weekend Bug corrigé.
-    Calcule le statut en comptant le nombre de bougies écoulées depuis le signal
-    (index dans le DataFrame) et non en heures réelles. Ainsi un signal de vendredi
-    soir reste "Fresh" lundi matin s'il n'y a eu que 0 bougie depuis.
-    """
     if idx_sig is None:
         return "N/A"
     candles_elapsed = (len_df - 1) - idx_sig
@@ -251,8 +261,8 @@ def get_trend_context(df: pd.DataFrame, tf: str) -> str:
     close = df["close"]
     if len(close) < 55:
         return "Unknown"
-    ema20 = close.ewm(span=20, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema20    = close.ewm(span=20, adjust=False).mean()
+    ema50    = close.ewm(span=50, adjust=False).mean()
     e20_last = ema20.iloc[-1]
     e50_last = ema50.iloc[-1]
     lookback = TF_EMA_LOOKBACK.get(tf, 5)
@@ -263,18 +273,6 @@ def get_trend_context(df: pd.DataFrame, tf: str) -> str:
 
 
 def detect_choch(df: pd.DataFrame, tf: str):
-    """
-    Détecte le dernier CHoCH ou BOS valide sur le DataFrame fourni.
-
-    PATCH P5: La boucle fractale collecte maintenant TOUTES les fractales valides
-    de la fenêtre et retient la DERNIÈRE chronologiquement (SMC : niveau de
-    structure le plus récent, pas le max absolu).
-
-    PATCH P6: La convention BOS/CHoCH est conforme au standard SMC :
-      - CHoCH = cassure CONTRE la tendance (signal de retournement)
-      - BOS   = cassure DANS le sens de la tendance (continuation)
-    L'étiquetage est désormais calculé en dehors de detect_choch() côté appelant.
-    """
     length   = FRACTAL_LEN.get(tf, 5)
     p        = length // 2
     lookback = TF_LOOKBACK.get(tf, 3)
@@ -289,7 +287,6 @@ def detect_choch(df: pd.DataFrame, tf: str):
     if len(c_all) < min_len:
         return None, None, None, None, None, None, None
 
-    # Percentiles sur les 50 dernières bougies — volatilité récente, pas historique
     recent_ranges = h_all[-50:] - l_all[-50:]
     p25 = float(np.percentile(recent_ranges, 25)) if len(recent_ranges) >= 10 else None
     p75 = float(np.percentile(recent_ranges, 75)) if len(recent_ranges) >= 10 else None
@@ -302,7 +299,7 @@ def detect_choch(df: pd.DataFrame, tf: str):
 
     def is_valid_breakout_candle(idx: int) -> bool:
         rng = h_all[idx] - l_all[idx]
-        if np.isclose(rng, 0, atol=1e-10):  # PATCH P9
+        if np.isclose(rng, 0, atol=1e-10):
             return False
         body = abs(c_all[idx] - o_all[idx])
         return (body / rng) >= 0.3
@@ -313,32 +310,26 @@ def detect_choch(df: pd.DataFrame, tf: str):
         if idx_prev < p:
             break
 
-        # Slices bornés à idx_cur + 1 — pas de lookahead sur bougies futures
         h = h_all[:idx_cur + 1]
         l = l_all[:idx_cur + 1]
         c = c_all[:idx_cur + 1]
 
-        # PATCH P5: borne explicite pour éliminer le biais de lookahead dans les fractales
-        # La recherche s'arrête à idx_cur - p (la fractal doit être confirmée AVANT idx_cur)
-        window_start     = max(p, len(h) - window)
-        fractal_search_end = idx_cur - p  # bougies [window_start .. idx_cur - p - 1]
+        window_start      = max(p, len(h) - window)
+        fractal_search_end = idx_cur - p
 
         if fractal_search_end <= window_start:
             continue
 
-        # PATCH P5: collecte de TOUTES les fractales valides de la fenêtre,
-        # puis sélection de la DERNIÈRE chronologiquement (index le plus élevé)
         last_high_idx = None
         last_low_idx  = None
 
         for i in range(window_start, fractal_search_end):
-            # PATCH P9: tolérance relative sur l'égalité float
             local_max = max(h[i - p:i + p + 1])
             local_min = min(l[i - p:i + p + 1])
             if abs(h[i] - local_max) < 1e-9:
-                last_high_idx = i   # on écrase → on garde le plus récent
+                last_high_idx = i
             if abs(l[i] - local_min) < 1e-9:
-                last_low_idx = i    # idem
+                last_low_idx = i
 
         last_high = float(h[last_high_idx]) if last_high_idx is not None else None
         last_low  = float(l[last_low_idx])  if last_low_idx  is not None else None
@@ -350,12 +341,8 @@ def detect_choch(df: pd.DataFrame, tf: str):
             continue
 
         breakout_range = h_all[idx_cur] - l_all[idx_cur]
-        sig_raw        = None
-        time_sig       = None
-        force          = None
-        niveau_casse   = None
+        sig_raw = time_sig = force = niveau_casse = None
 
-        # Condition de cassure stricte : close[cur] franchit, close[prev] ne franchissait pas
         if last_high is not None and c[idx_cur] > last_high and c[idx_prev] <= last_high:
             sig_raw      = "Bullish"
             time_sig     = df.index[idx_cur]
@@ -373,12 +360,10 @@ def detect_choch(df: pd.DataFrame, tf: str):
 
         trend = get_trend_context(df.iloc[:idx_cur + 1], tf)
 
-        # PATCH P13: filtre Range étendu — Moyen aussi filtré (faux breakouts en range)
         if trend == "Range" and force in ("Faible", "Moyen"):
             continue
 
-        close_actuel = float(c_all[-1])
-        return sig_raw, time_sig, force, idx_cur, trend, niveau_casse, close_actuel
+        return sig_raw, time_sig, force, idx_cur, trend, niveau_casse, float(c_all[-1])
 
     return None, None, None, None, None, None, None
 
@@ -394,16 +379,103 @@ def format_niveau(niveau: float | None, inst: str) -> str:
 
 
 def format_distance(niveau: float | None, close_actuel: float | None, inst: str) -> str:
-    # PATCH P9: garde robuste — isclose au lieu de == 0, sanity check > 100%
     if niveau is None or close_actuel is None or np.isclose(niveau, 0, atol=1e-8):
         return "N/A"
     dist = abs(close_actuel - niveau) / abs(niveau) * 100
-    if dist > 100:  # valeur aberrante → sûrement un bug de données
+    if dist > 100:
         return "N/A"
     return f"{dist:.3f}%"
 
 
-# PATCH P11: normalize_pair() supprimé (dead code — fonction identité pure)
+def _precision_for(inst: str) -> int:
+    """Retourne le nombre de décimales selon l'instrument — pour les floats pipeline."""
+    if any(k in inst for k in ["SPX500", "NAS100", "US30", "DE30", "XAU", "XAG"]):
+        return 2
+    if "JPY" in inst:
+        return 3
+    return 5
+
+
+# ===================== PAYLOAD PIPELINE =====================
+
+def build_pipeline_payload(
+    inst: str,
+    inst_display: str,
+    tf_name: str,
+    sig_raw: str,
+    time_sig,
+    strength: str,
+    idx_sig: int,
+    trend: str,
+    niveau_casse: float,
+    close_actuel: float,
+    type_label: str,
+    statut: str,
+    volatilite: str,
+    bb_str: str,
+    scan_time: datetime,
+    len_df: int,
+) -> dict:
+    """
+    P14: Construit le payload JSON pipeline-grade.
+    Contrat strict :
+      - Tous les nombres sont des types natifs Python (float/int), jamais des strings
+      - signal_time en ISO 8601 avec timezone explicite (+00:00)
+      - signal_id unique et déterministe
+      - bb_width_pct et bb_regime séparés
+      - distance_pct sans symbole %
+      - champ trend exposé
+      - champ session (London/NewYork/Tokyo/Off)
+      - scanner_version et generated_at dans chaque signal
+    """
+    prec = _precision_for(inst)
+    bb_pct, bb_regime = _parse_bb_components(bb_str)
+
+    # distance_pct : float pur, None si non calculable
+    dist_pct: float | None = None
+    if not np.isclose(niveau_casse, 0, atol=1e-8):
+        raw_dist = abs(close_actuel - niveau_casse) / abs(niveau_casse) * 100
+        if raw_dist <= 100:
+            dist_pct = round(raw_dist, 4)
+
+    candles_since_signal = (len_df - 1) - idx_sig
+
+    return {
+        # ── Identité du signal ──────────────────────────────────────────
+        "signal_id":       f"{inst}__{tf_name}__{time_sig.strftime('%Y%m%dT%H%M')}",
+        "scanner_version": SCANNER_VERSION,
+        "generated_at":    scan_time.isoformat(),          # ISO 8601 + timezone
+
+        # ── Instrument ──────────────────────────────────────────────────
+        "pair":            inst_display,                   # "EUR/USD"
+        "pair_oanda":      inst,                           # "EUR_USD" (lookup interne)
+        "timeframe":       tf_name,                        # "H1" | "H4" | "D1" | "Weekly"
+
+        # ── Classification du signal ────────────────────────────────────
+        "type":            type_label,                     # "CHoCH" | "BOS"
+        "direction":       sig_raw,                        # "Bullish" | "Bearish"
+        "is_bullish":      sig_raw == "Bullish",           # bool — filtrage facile pipeline
+        "order":           "buy" if sig_raw == "Bullish" else "sell",
+        "trend":           trend,                          # "Uptrend"|"Downtrend"|"Range"|"Unknown"
+        "is_choch":        type_label == "CHoCH",          # bool
+        "status":          statut,                         # "Fresh" | "Aged" | "Stale"
+
+        # ── Niveaux — floats natifs, jamais strings ─────────────────────
+        "level":           round(float(niveau_casse), prec),
+        "close_price":     round(float(close_actuel), prec),
+        "distance_pct":    dist_pct,                       # float | None
+
+        # ── Contexte marché ─────────────────────────────────────────────
+        "volatility":      volatilite,                     # "Basse"|"Moyenne"|"Haute"|"Très Haute"
+        "force":           strength or "Moyen",            # "Fort" | "Moyen" | "Faible"
+        "bb_width_pct":    bb_pct,                         # float | None
+        "bb_regime":       bb_regime,                      # "Squeeze"|"Expansion"|"Normal"|"N/A"
+
+        # ── Horodatage ──────────────────────────────────────────────────
+        "signal_time":     time_sig.isoformat(),           # ISO 8601 strict "2026-05-07T17:00:00+00:00"
+        "session":         get_session(time_sig),          # "London"|"NewYork"|"Tokyo"|"Off"
+        "candles_elapsed": candles_since_signal,           # int — âge en bougies
+    }
 
 
 # ===================== PDF =====================
@@ -415,20 +487,17 @@ def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
     )
     elements = []
     styles   = getSampleStyleSheet()
-
     elements.append(Paragraph("Rapport des Signaux CHoCH", styles["Title"]))
     elements.append(Paragraph(
         f"Généré le {datetime.now(timezone.utc).strftime('%d/%m/%Y à %H:%M')} UTC"
-        " — Fresh & Aged uniquement — Monthly exclu",
+        " — Fresh & Aged uniquement",
         styles["Normal"]
     ))
     elements.append(Spacer(1, 20))
-
     cols_present = [c for c in EXPORT_COLS if c in df_export.columns]
     data         = [cols_present] + df_export[cols_present].values.tolist()
     col_widths   = [65, 48, 42, 42, 82, 68, 52, 58, 45, 90, 45, 105]
     col_widths   = col_widths[:len(cols_present)]
-
     table = Table(data, colWidths=col_widths, repeatRows=1)
     table.setStyle(TableStyle([
         ('BACKGROUND',    (0, 0), (-1, 0), colors.HexColor("#1e40af")),
@@ -453,11 +522,7 @@ def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
 
 # ===================== PNG =====================
 def generate_png(df: pd.DataFrame, display_cols: list) -> io.BytesIO:
-    """
-    PATCH P4: Utilisation stricte de l'API OOP matplotlib (Figure, pas plt).
-    Évite le memory leak sur serveur Streamlit persistant (pas de pyplot global state).
-    """
-    fig = Figure(figsize=(22, max(5, len(df) * 0.35)))  # PATCH P4
+    fig = Figure(figsize=(22, max(5, len(df) * 0.35)))
     ax  = fig.add_subplot(111)
     ax.axis('off')
     disp = df[[c for c in display_cols if c in df.columns]]
@@ -467,7 +532,7 @@ def generate_png(df: pd.DataFrame, display_cols: list) -> io.BytesIO:
     tbl.set_fontsize(8)
     tbl.scale(1.2, 1.8)
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', dpi=200)  # PATCH P4
+    fig.savefig(buf, format='png', bbox_inches='tight', dpi=200)
     buf.seek(0)
     return buf
 
@@ -476,7 +541,7 @@ def generate_png(df: pd.DataFrame, display_cols: list) -> io.BytesIO:
 st.set_page_config(page_title="CHoCH Scanner", layout="wide")
 st.markdown(
     "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>"
-    "Scanner Change of Character (CHoCH) — v5.5</h1>",
+    "Scanner Change of Character (CHoCH) — v5.6</h1>",
     unsafe_allow_html=True
 )
 
@@ -490,13 +555,14 @@ if st.button(
     disabled=st.session_state.scanning
 ):
     st.session_state.scanning = True
-    n_combos = len(INSTRUMENTS) * len(TIMEFRAMES)
+    n_combos  = len(INSTRUMENTS) * len(TIMEFRAMES)
+    scan_time = datetime.now(timezone.utc)  # timestamp unique pour ce scan
 
-    # PATCH P2: try/finally garantit que scanning=False même en cas d'exception
     try:
         with st.spinner(f"Scan en cours sur {n_combos} combinaisons…"):
-            results: list[dict] = []
-            errors:  list[str]  = []
+            results:          list[dict] = []   # données UI
+            pipeline_signals: list[dict] = []   # payloads JSON pipeline
+            errors:           list[str]  = []
 
             with ThreadPoolExecutor(max_workers=6) as executor:
                 futures = {
@@ -513,7 +579,6 @@ if st.button(
                         continue
 
                     if df is None:
-                        errors.append(f"{inst}/{tf_name}: données insuffisantes")
                         continue
 
                     sig_raw, time_sig, strength, idx_sig, trend, niveau_casse, close_actuel = \
@@ -525,28 +590,23 @@ if st.button(
                     atr_val    = calc_atr(df)
                     volatilite = atr_to_volatility(atr_val, inst, df)
                     df_sig     = df.iloc[:idx_sig + 1] if idx_sig is not None else df
+                    bb_str     = compute_bb_width(df_sig)
 
-                    # PATCH P6: convention SMC standard
-                    # CHoCH = cassure contre la tendance (retournement potentiel)
-                    # BOS   = cassure dans le sens de la tendance (continuation)
+                    # Convention SMC : CHoCH = contre tendance, BOS = dans la tendance
                     is_choch = (
                         (trend == "Uptrend"   and sig_raw == "Bearish") or
                         (trend == "Downtrend" and sig_raw == "Bullish")
                     )
                     type_label   = "CHoCH" if is_choch else "BOS"
                     signal_label = f"{sig_raw} {type_label}"
-
                     inst_display = inst.replace("_", "/")
-                    # PATCH P11: inst_export = inst_display directement (normalize_pair supprimé)
+                    statut       = compute_statut(idx_sig, len(df), tf_name)
 
-                    # PATCH P3: statut calculé en bougies (weekend-safe)
-                    statut = compute_statut(idx_sig, len(df), tf_name)
-
-                    # PATCH P10: on stocke le datetime brut pour un tri déterministe
+                    # ── Payload UI (affichage + CSV/PDF/PNG) ──────────────
                     results.append({
                         "Instrument":  inst_display,
                         "Paire":       inst_display,
-                        "_time_sort":  time_sig,               # PATCH P10: tri datetime brut
+                        "_time_sort":  time_sig,
                         "Timeframe":   tf_name,
                         "Type":        type_label,
                         "Ordre":       "Achat" if sig_raw == "Bullish" else "Vente",
@@ -555,16 +615,37 @@ if st.button(
                         "Distance%":   format_distance(niveau_casse, close_actuel, inst),
                         "Volatilité":  volatilite,
                         "Force":       strength or "Moyen",
-                        "BB_Width":    compute_bb_width(df_sig),
+                        "BB_Width":    bb_str,
                         "Statut":      statut,
                         "Heure (UTC)": time_sig.strftime("%Y-%m-%d %H:%M"),
                     })
 
+                    # ── Payload pipeline JSON (P14) ───────────────────────
+                    # Construit uniquement pour Fresh et Aged
+                    if statut in ("Fresh", "Aged"):
+                        pipeline_signals.append(build_pipeline_payload(
+                            inst=inst,
+                            inst_display=inst_display,
+                            tf_name=tf_name,
+                            sig_raw=sig_raw,
+                            time_sig=time_sig,
+                            strength=strength,
+                            idx_sig=idx_sig,
+                            trend=trend,
+                            niveau_casse=niveau_casse,
+                            close_actuel=close_actuel,
+                            type_label=type_label,
+                            statut=statut,
+                            volatilite=volatilite,
+                            bb_str=bb_str,
+                            scan_time=scan_time,
+                            len_df=len(df),
+                        ))
+
             if errors:
-                st.warning(f"{len(errors)} combinaison(s) en erreur / données insuffisantes.")
+                st.warning(f"{len(errors)} combinaison(s) en erreur.")
 
             if results:
-                # PATCH P10: tri sur datetime brut puis drop_duplicates → déterministe
                 df_result = (
                     pd.DataFrame(results)
                     .sort_values("_time_sort", ascending=False)
@@ -572,9 +653,13 @@ if st.button(
                     .drop(columns=["_time_sort"])
                     .reset_index(drop=True)
                 )
-                st.session_state.df      = df_result
-                st.session_state.png_buf = None
-                st.success(f"Scan terminé – {len(df_result)} signaux sur {n_combos} combinaisons !")
+                st.session_state.df               = df_result
+                st.session_state.pipeline_signals = pipeline_signals
+                st.session_state.png_buf          = None
+                st.success(
+                    f"Scan terminé – {len(df_result)} signaux sur {n_combos} combinaisons "
+                    f"| {len(pipeline_signals)} signal(s) Fresh/Aged dans le pipeline JSON"
+                )
             else:
                 st.info("Aucun signal CHoCH/BOS récent détecté")
 
@@ -582,16 +667,16 @@ if st.button(
         st.error(f"Erreur critique inattendue lors du scan : {e}")
         logger.exception("Erreur critique scan")
     finally:
-        # PATCH P2: TOUJOURS déverrouiller le bouton, même si exception
         st.session_state.scanning = False
 
 
 # ===================== AFFICHAGE =====================
 if "df" in st.session_state:
-    df_all = st.session_state.df.copy()
-    ts     = datetime.now().strftime("%Y%m%d_%H%M")
-
+    df_all    = st.session_state.df.copy()
+    ts        = datetime.now().strftime("%Y%m%d_%H%M")
     df_export = df_all[df_all["Statut"].isin(["Fresh", "Aged"])].copy()
+
+    pipeline_signals = st.session_state.get("pipeline_signals", [])
 
     if st.session_state.get("png_buf") is None:
         st.session_state.png_buf = generate_png(df_all, DISPLAY_COLS)
@@ -600,10 +685,12 @@ if "df" in st.session_state:
     if n_stale > 0:
         st.info(
             f"{n_stale} signal(s) Stale visible(s) dans le tableau — "
-            "exclus du PDF/CSV/JSON (Fresh & Aged uniquement dans les exports)."
+            "exclus des exports."
         )
 
-    col1, col2, col3, col4 = st.columns(4)
+    # ── Boutons d'export ──────────────────────────────────────────────
+    col1, col2, col3, col4, col5 = st.columns(5)
+
     with col1:
         st.download_button(
             "CSV",
@@ -625,14 +712,38 @@ if "df" in st.session_state:
             f"choch_signaux_{ts}.pdf", "application/pdf"
         )
     with col4:
+        # JSON UI — format lisible, colonnes display
         st.download_button(
-            "JSON",
+            "JSON (UI)",
             df_export[[c for c in EXPORT_COLS if c in df_export.columns]]
                 .to_json(orient="records", force_ascii=False, indent=2).encode("utf-8"),
-            f"choch_{ts}.json", "application/json"
+            f"choch_ui_{ts}.json", "application/json",
+            help="Export lisible pour consultation — colonnes affichage"
+        )
+    with col5:
+        # JSON PIPELINE — types natifs, contrat strict pour le pipeline aval
+        pipeline_json = json.dumps(
+            {
+                "meta": {
+                    "scanner_version": SCANNER_VERSION,
+                    "generated_at":    scan_time.isoformat() if "scan_time" in dir() else datetime.now(timezone.utc).isoformat(),
+                    "signal_count":    len(pipeline_signals),
+                },
+                "signals": pipeline_signals,
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str   # fallback sécurisé pour tout type non sérialisable
+        ).encode("utf-8")
+
+        st.download_button(
+            "JSON (Pipeline)",
+            pipeline_json,
+            f"choch_pipeline_{ts}.json", "application/json",
+            help="Export pipeline — types natifs, ISO 8601, signal_id unique"
         )
 
-    # ===================== STYLES =====================
+    # ── Tableau UI ────────────────────────────────────────────────────
     def style_bb(val: str) -> str:
         if "Squeeze"   in str(val): return "color:#ff9800;font-weight:bold"
         if "Expansion" in str(val): return "color:#ab47bc;font-weight:bold"
@@ -682,3 +793,8 @@ if "df" in st.session_state:
         hide_index=True,
         use_container_width=True
     )
+
+    # ── Aperçu pipeline JSON dans l'UI ───────────────────────────────
+    if pipeline_signals:
+        with st.expander(f"Aperçu JSON Pipeline ({len(pipeline_signals)} signaux Fresh/Aged)"):
+            st.json(pipeline_signals[0])   # affiche le premier signal comme exemple
