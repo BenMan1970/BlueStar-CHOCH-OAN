@@ -17,7 +17,7 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
-from typing import Optional
+from typing import Optional, Dict, List, Any
 
 # ===================== LOGGING =====================
 logging.basicConfig(
@@ -37,6 +37,7 @@ INSTRUMENTS = [
     "NZD_JPY", "NZD_CAD", "NZD_CHF",
     "DE30_EUR", "XAU_USD", "SPX500_USD", "NAS100_USD", "US30_USD",
 ]
+
 VOLATILITY_STATIC = {
     "EUR_USD": "Basse", "GBP_USD": "Basse", "USD_JPY": "Basse", "USD_CHF": "Basse", "USD_CAD": "Basse",
     "AUD_USD": "Moyenne", "NZD_USD": "Moyenne", "EUR_GBP": "Moyenne", "EUR_JPY": "Moyenne",
@@ -49,11 +50,11 @@ VOLATILITY_STATIC = {
 }
 
 TIMEFRAMES     = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
-GRAN_COUNT     = {"H1": 400, "H4": 300, "D": 200, "W": 120}
 SWING_LOOKBACK = {"H1": 5, "H4": 5, "D1": 4, "Weekly": 3}
 SWING_HISTORY  = {"H1": 120, "H4": 90, "D1": 60, "Weekly": 26}
 ATR_DIST_MULT  = 1.8  # Filtre dynamique : distance max = ATR * 1.8
 MIN_SCORE      = 65   # Seuil de confluence pour affichage
+
 SCAN_GLOBAL_TIMEOUT   = 180
 FUTURE_RESULT_TIMEOUT = 20
 
@@ -69,6 +70,8 @@ DISPLAY_COLS = [
     "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
 ]
 EXPORT_COLS = DISPLAY_COLS
+
+GRAN_COUNT     = {"H1": 400, "H4": 300, "D": 200, "W": 120}
 
 # ===================== API THREAD-SAFE =====================
 _thread_local = threading.local()
@@ -143,14 +146,6 @@ def get_session(dt: datetime) -> str:
 
 def is_premium_session(s: str) -> bool:
     return s in ("London", "NewYork", "London_NY_Overlap")
-
-def _parse_bb_components(bb_str: str) -> tuple[Optional[float], str]:
-    if bb_str == "N/A": return None, "N/A"
-    try:
-        pct_part, regime = bb_str.split("%")
-        return round(float(pct_part), 2), regime.strip()
-    except Exception:
-        return None, "N/A"
 
 def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
     count = GRAN_COUNT.get(gran, 300)
@@ -245,7 +240,7 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[dict]:
     atr_val, _ = calc_atr_bundle(df, inst)
     if np.isnan(atr_val) or atr_val <= 0: return None
     
-    lookback_check = 5  # Vérifie les 5 dernières bougies
+    lookback_check = 5
     for offset in range(lookback_check):
         idx = n - 1 - offset
         if idx < 3: break
@@ -278,13 +273,18 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[dict]:
 
         # Filtre Liquidity Sweep (mèche traverse un swing récent de ≥ 0.25 ATR)
         has_sweep = False
-        sweep_candidates = [s for s in prev_swings if s["kind"] in ("HH","LH") if direction=="Bearish" 
-                            else (s for s in prev_swings if s["kind"] in ("HL","LL"))]
+        if direction == "Bearish":
+            sweep_candidates = [s for s in prev_swings if s["kind"] in ("HH", "LH")]
+        else:
+            sweep_candidates = [s for s in prev_swings if s["kind"] in ("HL", "LL")]
+        
         for s in sweep_candidates:
             if direction == "Bearish" and h[idx] > s["price"] and (h[idx] - s["price"]) > (atr_val * 0.25):
-                has_sweep = True; break
+                has_sweep = True
+                break
             if direction == "Bullish" and l[idx] < s["price"] and (s["price"] - l[idx]) > (atr_val * 0.25):
-                has_sweep = True; break
+                has_sweep = True
+                break
 
         # Filtre Distance ATR
         dist_atr = abs(c[-1] - level) / atr_val
@@ -295,7 +295,7 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[dict]:
         if dist_atr <= 1.0: score += 15
         if is_premium_session(get_session(df.index[idx])): score += 20
         if has_sweep: score += 15
-        if sig_type == "MSS" or sig_type == "CHoCH": score += 10  # Retournement priorisé
+        if sig_type == "CHoCH": score += 10
         score = min(score, 100)
         if score < MIN_SCORE: continue
 
@@ -306,17 +306,17 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[dict]:
         }
     return None
 
-# ===================== PAYLOAD V5.8 =====================
-def build_pipeline_payload_v58(inst, inst_disp, tf_name, sig, trend, atr_val, scan_time, len_df):
-    time_sig = sig["time_sig"]
+def build_pipeline_payload_v58(df, inst, inst_disp, tf_name, sig, trend, atr_val, scan_time, len_df):
+    time_sig = df.index[sig["idx_break"]]
     session = get_session(time_sig)
     dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
-    bb_str = compute_bb_width(df.iloc[:sig["idx_break"]+1] if sig["idx_break"] is not None else df)
-    _, volatilite = calc_atr_bundle(df.iloc[:sig["idx_break"]+1] if sig["idx_break"] is not None else df, inst)
+    
+    df_context = df.iloc[:sig["idx_break"]+1]
+    bb_str = compute_bb_width(df_context)
+    _, volatilite = calc_atr_bundle(df_context, inst)
     
     candles_since = (len_df - 1) - sig["idx_break"]
     statut = compute_statut(sig["idx_break"], len_df, tf_name)
-    is_choch = sig["type"] == "CHoCH"
     
     return {
         "signal_id": f"{inst}__{tf_name}__{time_sig.strftime('%Y%m%dT%H%M')}",
@@ -325,20 +325,20 @@ def build_pipeline_payload_v58(inst, inst_disp, tf_name, sig, trend, atr_val, sc
         "pair": inst_disp,
         "pair_oanda": inst,
         "timeframe": tf_name,
-        "type": sig["type"],
+        "type": sig["sig_type"],
         "direction": sig["direction"],
         "is_bullish": sig["direction"] == "Bullish",
         "order": "buy" if sig["direction"] == "Bullish" else "sell",
         "trend": trend,
-        "is_choch": is_choch,
+        "is_choch": sig["sig_type"] == "CHoCH",
         "status": statut,
-        "confluence_score": sig["confluence_score"],
+        "confluence_score": sig["score"],
         "level": round(float(sig["level"]), instrument_precision(inst)),
         "close_price": round(float(sig["close_price"]), instrument_precision(inst)),
         "distance_pct": round(dist_pct, 4) if dist_pct is not None else None,
         "distance_atr_multiple": round(sig["dist_atr"], 2),
         "volatility": volatilite,
-        "force": sig["force"],
+        "force": "Fort" if (abs(df["close"].values[sig["idx_break"]] - df["open"].values[sig["idx_break"]]) / (df["high"].values[sig["idx_break"]] - df["low"].values[sig["idx_break"]])) >= 0.6 else "Moyen",
         "bb_width_pct": bb_str.split("%")[0].replace("+","").strip() if "%" in bb_str else None,
         "bb_regime": bb_str.split("%")[-1].strip() if "%" in bb_str else "N/A",
         "session": session,
@@ -353,16 +353,20 @@ def build_pipeline_payload_v58(inst, inst_disp, tf_name, sig, trend, atr_val, sc
         }
     }
 
-# ===================== PDF / PNG =====================
+# ===================== EXPORT =====================
 def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=20, rightMargin=20, topMargin=40, bottomMargin=40)
     elements, styles = [], getSampleStyleSheet()
-    elements.append(Paragraph("Rapport des Signaux CHoCH v5.8", styles["Title"]))
-    elements.append(Paragraph(f"Généré le {datetime.now(timezone.utc).strftime('%d/%m/%Y à %H:%M')} UTC — Fresh & Aged uniquement", styles["Normal"]))
+    elements.append(Paragraph(f"Rapport des Signaux CHoCH v{SCANNER_VERSION}", styles["Title"]))
+    elements.append(Paragraph(f"Généré le {datetime.now(timezone.utc).strftime('%d/%m/%Y à %H:%M')} UTC", styles["Normal"]))
     elements.append(Spacer(1, 20))
+    
     cols_present = [c for c in EXPORT_COLS if c in df_export.columns]
-    col_widths = [65, 48, 42, 42, 82, 68, 52, 58, 45, 90, 45, 105][:len(cols_present)]
+    col_widths_map = {c: 60 for c in cols_present}
+    col_widths_map.update({"Instrument": 65, "Distance%": 52, "Statut": 45, "Heure (UTC)": 105})
+    col_widths = [col_widths_map.get(c, 60) for c in cols_present]
+    
     data = [cols_present] + df_export[cols_present].values.tolist()
     table = Table(data, colWidths=col_widths, repeatRows=1)
     table.setStyle(TableStyle([
@@ -370,8 +374,6 @@ def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
         ('ALIGN', (0,0),(-1,-1), 'CENTER'), ('FONTNAME', (0,0),(-1,0), 'Helvetica-Bold'),
         ('FONTSIZE', (0,0),(-1,0), 9), ('FONTSIZE', (0,1),(-1,-1), 8),
         ('GRID', (0,0),(-1,-1), 0.5, colors.grey), ('ROWBACKGROUNDS',(0,1),(-1,-1), [colors.white, colors.beige]),
-        ('VALIGN', (0,0),(-1,-1), 'MIDDLE'), ('LEFTPADDING', (0,0),(-1,-1), 5), ('RIGHTPADDING', (0,0),(-1,-1), 5),
-        ('TOPPADDING', (0,0),(-1,-1), 7), ('BOTTOMPADDING', (0,0),(-1,-1), 7)
     ]))
     elements.append(table); doc.build(elements); buffer.seek(0); return buffer
 
@@ -383,7 +385,7 @@ def generate_png(df: pd.DataFrame, display_cols: list) -> io.BytesIO:
     tbl.auto_set_font_size(False); tbl.set_fontsize(8); tbl.scale(1.2, 1.8)
     buf = io.BytesIO(); fig.savefig(buf, format='png', bbox_inches='tight', dpi=200); buf.seek(0); return buf
 
-# ===================== UI EXACTE V5.7 =====================
+# ===================== UI =====================
 st.set_page_config(page_title="CHoCH Scanner v5.8", layout="wide")
 st.markdown(
     "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>"
@@ -420,33 +422,33 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True, disable
                     if not sig: continue
 
                     trend = get_structural_trend(detect_swing_points(df, tf_name))
-                    sig["time_sig"] = df.index[sig["idx_break"]]
-                    sig["close_price"] = sig["close_price"]
-                    sig["type"] = sig["sig_type"]
-                    rng = df["high"].values[sig["idx_break"]] - df["low"].values[sig["idx_break"]]
-                    body = abs(df["close"].values[sig["idx_break"]] - df["open"].values[sig["idx_break"]])
-                    sig["force"] = "Fort" if (body/rng) >= 0.6 else "Moyen" if (body/rng) >= 0.4 else "Faible"
-
+                    
+                    # Construction payload UI
                     df_sub = df.iloc[:sig["idx_break"]+1]
                     _, volatilite = calc_atr_bundle(df_sub, inst)
                     bb_str = compute_bb_width(df_sub)
                     dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
                     inst_display = inst.replace("_", "/")
                     statut = compute_statut(sig["idx_break"], len(df), tf_name)
+                    rng = df["high"].values[sig["idx_break"]] - df["low"].values[sig["idx_break"]]
+                    body = abs(df["close"].values[sig["idx_break"]] - df["open"].values[sig["idx_break"]])
+                    force = "Fort" if (rng > 0 and body/rng >= 0.6) else "Moyen" if (rng > 0 and body/rng >= 0.4) else "Faible"
 
                     results.append({
-                        "Instrument": inst_display, "Paire": inst_display, "_time_sort": sig["time_sig"],
-                        "Timeframe": tf_name, "Type": sig["type"],
+                        "Instrument": inst_display, "Paire": inst_display, "_time_sort": df.index[sig["idx_break"]],
+                        "Timeframe": tf_name, "Type": sig["sig_type"],
                         "Ordre": "Achat" if sig["direction"] == "Bullish" else "Vente",
-                        "Signal": f"{sig['direction']} {sig['type']}",
+                        "Signal": f"{sig['direction']} {sig['sig_type']}",
                         "Niveau": format_niveau(sig["level"], inst),
                         "Distance%": format_distance(dist_pct),
-                        "Volatilité": volatilite, "Force": sig["force"], "BB_Width": bb_str,
-                        "Statut": statut, "Heure (UTC)": sig["time_sig"].strftime("%Y-%m-%d %H:%M")
+                        "Volatilité": volatilite, "Force": force, "BB_Width": bb_str,
+                        "Statut": statut, "Heure (UTC)": df.index[sig["idx_break"]].strftime("%Y-%m-%d %H:%M")
                     })
 
                     if statut in ("Fresh", "Aged"):
-                        pipeline_signals.append(build_pipeline_payload_v58(inst, inst_display, tf_name, sig, trend, sig["atr_val"], scan_time, len(df)))
+                        pipeline_signals.append(build_pipeline_payload_v58(
+                            df, inst, inst_display, tf_name, sig, trend, sig["atr_val"], scan_time, len(df)
+                        ))
 
             if errors: st.warning(f"{len(errors)} erreur(s) : {'; '.join(errors[:5])}")
             if results:
@@ -462,7 +464,6 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True, disable
     except Exception as e: st.error(f"Erreur critique : {e}"); logger.exception(e)
     finally: st.session_state.scanning = False
 
-# ===================== AFFICHAGE IDENTIQUE =====================
 if "df" in st.session_state:
     df_all = st.session_state.df.copy()
     ts = datetime.now().strftime("%Y%m%d_%H%M")
