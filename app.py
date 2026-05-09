@@ -1,3 +1,26 @@
+# ============================================================
+# SCANNER SMC OANDA — v6.0  "INSTITUTIONAL GRADE"
+# Auteur    : refonte complète sur base v5.7
+# Style     : Swing Trading H4/D1
+# Méthode   : Smart Money Concepts (SMC) authentique
+#
+# ARCHITECTURE :
+#   1. Swing Points réels (HH/HL/LH/LL) — pas de fractals locaux
+#   2. Market Structure Shift (MSS) authentique
+#   3. Break of Structure (BOS) confirmé par clôture
+#   4. Order Block (OB) institutionnel — dernière bougie opposée avant le BOS/MSS
+#   5. Fair Value Gap (FVG) — imbalance 3 bougies autour du breakout
+#   6. Score de confluence (0-100) — seuil configurable
+#   7. Filtre multi-timeframe : H4 validé par D1, H1 validé par H4
+#   8. Filtre session : London open + NY open privilégiés
+#   9. Pipeline JSON pipeline-grade (types natifs, ISO 8601)
+#
+# PHILOSOPHIE :
+#   Moins de signaux, mais des signaux qui ont une raison d'exister.
+#   Un signal sans OB ET sans FVG n'a pas de zone d'entrée définie — il est ignoré.
+#   Un signal H4 contre la structure D1 est ignoré.
+# ============================================================
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,6 +35,8 @@ from matplotlib.figure import Figure
 
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass, field, asdict
+from typing import Optional
 
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
@@ -30,7 +55,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SCANNER_VERSION = "5.7"
+SCANNER_VERSION = "6.0"
 
 # ===================== CONFIG =====================
 INSTRUMENTS = [
@@ -39,8 +64,21 @@ INSTRUMENTS = [
     "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
     "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD", "CAD_JPY", "CAD_CHF", "CHF_JPY",
     "NZD_JPY", "NZD_CAD", "NZD_CHF",
-    "DE30_EUR", "XAU_USD", "SPX500_USD", "NAS100_USD", "US30_USD",
+    "XAU_USD", "SPX500_USD", "NAS100_USD", "US30_USD",
 ]
+
+# Timeframes principaux pour le swing trading
+# HTF = contexte de tendance, TF = timeframe de signal
+TIMEFRAMES = {
+    "H4": {"gran": "H4", "htf": "D",  "count": 350},
+    "D1": {"gran": "D",  "htf": "W",  "count": 250},
+}
+
+# Timeframe de confirmation (pour pipeline uniquement, pas de scan direct)
+HTF_ONLY = {
+    "W":  {"gran": "W", "count": 100},
+    "D":  {"gran": "D", "count": 250},
+}
 
 VOLATILITY_STATIC = {
     "EUR_USD": "Basse",   "GBP_USD": "Basse",   "USD_JPY": "Basse",
@@ -54,111 +92,113 @@ VOLATILITY_STATIC = {
     "AUD_NZD": "Moyenne", "CAD_JPY": "Haute",    "CAD_CHF": "Haute",
     "CHF_JPY": "Haute",   "NZD_JPY": "Haute",
     "NZD_CAD": "Moyenne", "NZD_CHF": "Haute",
-    "DE30_EUR":   "Très Haute", "XAU_USD":    "Très Haute",
-    "SPX500_USD": "Très Haute", "NAS100_USD": "Très Haute",
-    "US30_USD":   "Très Haute",
+    "XAU_USD": "Très Haute", "SPX500_USD": "Très Haute",
+    "NAS100_USD": "Très Haute", "US30_USD": "Très Haute",
 }
 
-TIMEFRAMES     = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
-FRACTAL_LEN    = {"H1": 5, "H4": 5, "D1": 7, "Weekly": 7}
-FRACTAL_WINDOW = {"H1": 120, "H4": 90, "D1": 60, "Weekly": 26}
+# ── Paramètres SMC ─────────────────────────────────────────────────────────────
+SWING_LOOKBACK   = 10   # bougies de chaque côté pour valider un swing point
+SWING_HISTORY    = 50   # nombre de bougies pour chercher les swing points
+OB_MAX_LOOKBACK  = 8    # bougies avant le breakout pour chercher l'OB
+FVG_MAX_LOOKBACK = 5    # bougies autour du breakout pour chercher le FVG
+MIN_FVG_PCT      = 0.03 # FVG minimum en % du prix (filtre micro-gaps)
 
-TF_STATUT = {
-    "H1":     {"Fresh": 4,  "Aged": 12},
-    "H4":     {"Fresh": 3,  "Aged": 8},
-    "D1":     {"Fresh": 2,  "Aged": 5},
-    "Weekly": {"Fresh": 2,  "Aged": 4},
-}
+# ── Score de confluence minimum pour générer un signal ─────────────────────────
+# Score 0-100 : OB=30, FVG=25, HTF aligné=25, Session=10, Structure forte=10
+MIN_CONFLUENCE_SCORE = 55   # en dessous → signal ignoré
 
-TF_LOOKBACK     = {"H1": 5, "H4": 5, "D1": 4, "Weekly": 3}
-TF_EMA_LOOKBACK = {"H1": 5, "H4": 5, "D1": 10, "Weekly": 15}
-GRAN_COUNT      = {"H1": 400, "H4": 300, "D": 200, "W": 120}
+# ── Filtre de distance ─────────────────────────────────────────────────────────
+MAX_DIST_PCT = {"H4": 1.5, "D1": 4.0}
 
-# Distance maximale tolérée (%) selon le timeframe — au-delà le signal est ignoré
-MAX_DIST_PCT = {"H1": 1.0, "H4": 2.0, "D1": 5.0, "Weekly": 10.0}
+# ── Timeouts ───────────────────────────────────────────────────────────────────
+SCAN_GLOBAL_TIMEOUT   = 240
+FUTURE_RESULT_TIMEOUT = 25
+MAX_WORKERS           = 8
 
-# Timeouts (secondes)
-SCAN_GLOBAL_TIMEOUT  = 180   # timeout global as_completed
-FUTURE_RESULT_TIMEOUT = 20   # timeout par future individuel
-
+# ── Colonnes UI / export ───────────────────────────────────────────────────────
 DISPLAY_COLS = [
-    "Instrument", "Timeframe", "Type", "Ordre", "Signal",
-    "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
+    "Paire", "TF", "Type", "Dir", "Score",
+    "OB_Zone", "FVG_Zone", "Distance%",
+    "HTF_Trend", "Session", "Statut", "Heure (UTC)"
 ]
-EXPORT_COLS = [
-    "Paire", "Timeframe", "Type", "Ordre", "Signal",
-    "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)"
-]
+EXPORT_COLS = DISPLAY_COLS
+
+
+# ===================== DATACLASSES =====================
+
+@dataclass
+class SwingPoint:
+    idx:   int
+    price: float
+    kind:  str   # "HH" | "HL" | "LH" | "LL"
+
+
+@dataclass
+class OrderBlock:
+    top:      float
+    bottom:   float
+    idx:      int
+    polarity: str   # "Bullish" | "Bearish"
+
+
+@dataclass
+class FairValueGap:
+    top:      float
+    bottom:   float
+    idx:      int
+    polarity: str   # "Bullish" | "Bearish"
+
+
+@dataclass
+class SMCSignal:
+    # ── Identité ──────────────────────────────────────
+    instrument:  str
+    timeframe:   str
+    direction:   str          # "Bullish" | "Bearish"
+    sig_type:    str          # "MSS" | "BOS"
+    signal_time: datetime
+
+    # ── Niveaux ───────────────────────────────────────
+    broken_level: float       # niveau de structure cassé
+    close_price:  float
+    distance_pct: Optional[float]
+
+    # ── Confluence ────────────────────────────────────
+    ob:              Optional[OrderBlock]
+    fvg:             Optional[FairValueGap]
+    htf_trend:       str      # "Bullish" | "Bearish" | "Range" | "Unknown"
+    htf_aligned:     bool
+    session:         str
+    confluence_score: int
+
+    # ── Contexte ──────────────────────────────────────
+    volatility:   str
+    statut:       str         # "Fresh" | "Aged" | "Stale"
+    candles_since: int
+    scan_time:    datetime
+
 
 # ===================== API THREAD-SAFE =====================
 _thread_local = threading.local()
 
 def _get_api() -> API:
     if not hasattr(_thread_local, "api"):
-        try:
-            _thread_local.api = API(
-                access_token=st.secrets["OANDA_ACCESS_TOKEN"],
-                request_params={"timeout": 12}
-            )
-        except Exception as e:
-            logger.critical(f"Impossible d'initialiser l'API OANDA : {e}")
-            raise
+        _thread_local.api = API(
+            access_token=st.secrets["OANDA_ACCESS_TOKEN"],
+            request_params={"timeout": 15}
+        )
     return _thread_local.api
 
 try:
     _ = st.secrets["OANDA_ACCESS_TOKEN"]
 except Exception as e:
-    st.error(f"Token OANDA manquant dans les secrets Streamlit : {e}")
+    st.error(f"Token OANDA manquant : {e}")
     st.stop()
 
 
 # ===================== UTILITAIRES =====================
 
-def _compute_true_range(df: pd.DataFrame) -> np.ndarray:
-    """Calcule le True Range. Appelé UNE seule fois via calc_atr_bundle() — FIX R1."""
-    h = df["high"].values
-    l = df["low"].values
-    c = df["close"].values
-    return np.maximum(
-        h[1:] - l[1:],
-        np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1]))
-    )
-
-
-def calc_atr_bundle(df: pd.DataFrame, inst: str, period: int = 14) -> tuple[float, str]:
-    """
-    FIX R1 : Calcule ATR et volatilité en un seul passage sur le TR.
-    Retourne (atr_val, volatilite_label).
-    """
-    tr = _compute_true_range(df)
-    if len(tr) < period * 3:
-        return float("nan"), VOLATILITY_STATIC.get(inst, "Moyenne")
-
-    atr_val = float(pd.Series(tr).ewm(alpha=1 / period, adjust=False).mean().iloc[-1])
-
-    window      = tr[-100:] if len(tr) >= 100 else tr
-    median_tr   = float(np.median(window))
-    if np.isnan(atr_val) or np.isclose(median_tr, 0, atol=1e-10):
-        return atr_val, VOLATILITY_STATIC.get(inst, "Moyenne")
-
-    ratio = atr_val / median_tr
-    if ratio >= 1.8:
-        volatilite = "Très Haute"
-    elif ratio >= 1.2:
-        volatilite = "Haute"
-    elif ratio >= 0.7:
-        volatilite = "Moyenne"
-    else:
-        volatilite = "Basse"
-
-    return atr_val, volatilite
-
-
 def instrument_precision(inst: str) -> int:
-    """
-    FIX R3 : Retourne la précision décimale pour un instrument.
-    Unifie l'ancienne _precision_for() et la logique de format_niveau().
-    """
     if any(k in inst for k in ["SPX500", "NAS100", "US30", "DE30", "XAU", "XAG"]):
         return 2
     if "JPY" in inst:
@@ -166,91 +206,73 @@ def instrument_precision(inst: str) -> int:
     return 5
 
 
-def format_niveau(niveau: float | None, inst: str) -> str:
-    if niveau is None:
-        return "N/A"
-    prec = instrument_precision(inst)
-    return f"{niveau:.{prec}f}"
+def fmt_price(price: float, inst: str) -> str:
+    return f"{price:.{instrument_precision(inst)}f}"
 
 
-def calc_distance_pct(niveau: float | None, close_actuel: float | None) -> float | None:
-    """
-    FIX R7 : Calcule la distance % entre le niveau et le prix actuel.
-    Retourne None si non calculable ou > 100%.
-    """
-    if niveau is None or close_actuel is None:
-        return None
-    if np.isclose(niveau, 0, atol=1e-8):
-        return None
-    dist = abs(close_actuel - niveau) / abs(niveau) * 100
-    if dist > 100:
-        return None
-    return dist
-
-
-def format_distance(dist_pct: float | None) -> str:
-    """Formatte la distance pour l'affichage UI."""
-    if dist_pct is None:
-        return "N/A"
-    return f"{dist_pct:.3f}%"
+def fmt_zone(top: float, bot: float, inst: str) -> str:
+    return f"{fmt_price(bot, inst)} – {fmt_price(top, inst)}"
 
 
 def get_session(dt: datetime) -> str:
-    """
-    FIX M4 : Retourne la session de trading active, overlap London/NY exposé.
-    Sessions : Tokyo (00-09 UTC), London (07-16 UTC), NewYork (13-22 UTC).
-    L'overlap London/NewYork (13-16 UTC) est la période de liquidité maximale.
-    """
     h = dt.hour
-    london_open = 7 <= h < 16
-    ny_open     = 13 <= h < 22
-    tokyo_open  = 0 <= h < 9
-
-    if london_open and ny_open:
-        return "London_NY_Overlap"
-    if london_open:
-        return "London"
-    if ny_open:
-        return "NewYork"
-    if tokyo_open:
-        return "Tokyo"
+    london = 7 <= h < 16
+    ny     = 13 <= h < 22
+    tokyo  = 0 <= h < 9
+    if london and ny: return "London_NY_Overlap"
+    if london:        return "London"
+    if ny:            return "NewYork"
+    if tokyo:         return "Tokyo"
     return "Off"
 
 
-def _parse_bb_components(bb_str: str) -> tuple[float | None, str]:
-    """
-    Décompose la string BB_Width en (pct_float, regime_str).
-    Entrée : "+23%_Normal" | "-32%_Squeeze" | "+28%_Expansion" | "N/A"
-    Sortie : (23.0, "Normal") | (-32.0, "Squeeze") | (28.0, "Expansion") | (None, "N/A")
-    """
-    if bb_str == "N/A":
-        return None, "N/A"
-    try:
-        pct_part, regime = bb_str.split("%_")
-        return round(float(pct_part), 2), regime
-    except Exception:
-        return None, "N/A"
+def is_session_premium(session: str) -> bool:
+    """London open (07-09) et NY open (13-15) sont les sessions de liquidité maximale."""
+    return session in ("London", "NewYork", "London_NY_Overlap")
 
 
-# ===================== VALIDATION BREAKOUT (FIX R6) =====================
-
-def is_valid_breakout_candle(idx: int, h_all: np.ndarray, l_all: np.ndarray,
-                              c_all: np.ndarray, o_all: np.ndarray) -> bool:
-    """
-    FIX R6 : Extraite au niveau module pour être testable unitairement.
-    Valide qu'une bougie constitue un vrai breakout (corps >= 30% de la range).
-    """
-    rng = h_all[idx] - l_all[idx]
-    if np.isclose(rng, 0, atol=1e-10):
-        return False
-    body = abs(c_all[idx] - o_all[idx])
-    return (body / rng) >= 0.3
+def calc_distance_pct(level: float, close: float) -> Optional[float]:
+    if level is None or close is None or np.isclose(level, 0, atol=1e-8):
+        return None
+    dist = abs(close - level) / abs(level) * 100
+    return dist if dist <= 100 else None
 
 
-# ===================== FONCTIONS CORE =====================
+def calc_atr(df: pd.DataFrame, period: int = 14) -> float:
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
+    tr = np.maximum(h[1:] - l[1:], np.maximum(
+        np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])
+    ))
+    if len(tr) < period * 2:
+        return float("nan")
+    return float(pd.Series(tr).ewm(alpha=1 / period, adjust=False).mean().iloc[-1])
 
-def get_candles(inst: str, gran: str) -> pd.DataFrame | None:
-    count = GRAN_COUNT.get(gran, 300)
+
+def calc_volatility(atr: float, df: pd.DataFrame, inst: str) -> str:
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
+    tr = np.maximum(h[1:] - l[1:], np.maximum(
+        np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])
+    ))
+    if np.isnan(atr) or len(tr) < 10:
+        return VOLATILITY_STATIC.get(inst, "Moyenne")
+    window    = tr[-100:] if len(tr) >= 100 else tr
+    median_tr = float(np.median(window))
+    if np.isclose(median_tr, 0, atol=1e-10):
+        return VOLATILITY_STATIC.get(inst, "Moyenne")
+    ratio = atr / median_tr
+    if ratio >= 1.8: return "Très Haute"
+    if ratio >= 1.2: return "Haute"
+    if ratio >= 0.7: return "Moyenne"
+    return "Basse"
+
+
+# ===================== CANDLES =====================
+
+def get_candles(inst: str, gran: str, count: int) -> Optional[pd.DataFrame]:
     try:
         r = instruments.InstrumentsCandles(
             instrument=inst,
@@ -258,7 +280,7 @@ def get_candles(inst: str, gran: str) -> pd.DataFrame | None:
         )
         _get_api().request(r)
         candles = [c for c in r.response.get("candles", []) if c.get("complete")]
-        if len(candles) < 50:
+        if len(candles) < 60:
             return None
         df = pd.DataFrame([{
             "time":  pd.to_datetime(c["time"], utc=True),
@@ -270,292 +292,511 @@ def get_candles(inst: str, gran: str) -> pd.DataFrame | None:
         df.set_index("time", inplace=True)
         return df
     except V20Error as e:
-        if e.code in (401, 403):
-            logger.error(f"Auth OANDA échouée [{inst}/{gran}]: {e}")
-        elif e.code == 429:
-            logger.warning(f"Rate limit [{inst}/{gran}]")
-        else:
-            logger.warning(f"V20Error [{inst}/{gran}] code={e.code}: {e}")
+        logger.warning(f"V20Error [{inst}/{gran}] code={e.code}: {e}")
         return None
     except Exception as e:
         logger.error(f"Erreur get_candles [{inst}/{gran}]: {type(e).__name__}: {e}")
         return None
 
 
-def compute_bb_width(df: pd.DataFrame, length: int = 20, std: int = 2) -> str:
+# ===================== SMC CORE — SWING POINTS =====================
+
+def detect_swing_points(df: pd.DataFrame, lookback: int = SWING_LOOKBACK,
+                         history: int = SWING_HISTORY) -> list[SwingPoint]:
     """
-    FIX M7 : Frontières corrigées : <= -25 pour Squeeze, >= 25 pour Expansion.
-    Retourne la string UI. La décomposition pour pipeline est faite via _parse_bb_components().
+    Détecte les vrais swing points (pivots significatifs) en regardant
+    `lookback` bougies de chaque côté. Plus robuste que les fractals de 5 bougies.
+    Classifie ensuite chaque pivot en HH/HL/LH/LL selon la structure.
     """
-    close = df["close"]
-    if len(close) < length * 2:
-        return "N/A"
-    sma      = close.rolling(length).mean()
-    std_dev  = close.rolling(length).std()
-    upper    = sma + std * std_dev
-    lower    = sma - std * std_dev
-    bb_w     = (upper - lower) / sma
-    bb_avg   = bb_w.rolling(length).mean()
-    avg_last = bb_avg.iloc[-1]
-    if pd.isna(avg_last) or np.isclose(avg_last, 0, atol=1e-10):
-        return "N/A"
-    bb_avg_safe = bb_avg.replace(0, np.nan)
-    pct = ((bb_w - bb_avg) / bb_avg_safe * 100).iloc[-1]
-    if pd.isna(pct):
-        return "N/A"
-    sign = "+" if pct >= 0 else ""
-    # FIX M7 : <= et >= (au lieu de < et >) pour inclure exactement ±25%
-    if pct <= -25:
-        return f"{sign}{pct:.0f}%_Squeeze"
-    if pct >= 25:
-        return f"{sign}{pct:.0f}%_Expansion"
-    return f"{sign}{pct:.0f}%_Normal"
+    h = df["high"].values
+    l = df["low"].values
+    n = len(h)
+
+    start = max(lookback, n - history - lookback)
+    end   = n - lookback - 1
+
+    raw_highs: list[tuple[int, float]] = []
+    raw_lows:  list[tuple[int, float]] = []
+
+    for i in range(start, end):
+        window_h = h[i - lookback:i + lookback + 1]
+        window_l = l[i - lookback:i + lookback + 1]
+        if h[i] == max(window_h):
+            raw_highs.append((i, h[i]))
+        if l[i] == min(window_l):
+            raw_lows.append((i, l[i]))
+
+    # Construire la séquence alternée highs/lows pour classifier HH/HL/LH/LL
+    swings: list[SwingPoint] = []
+    prev_high: Optional[float] = None
+    prev_low:  Optional[float] = None
+
+    # Fusion : interleave highs et lows par ordre d'index
+    all_pivots = [(idx, price, "H") for idx, price in raw_highs] + \
+                 [(idx, price, "L") for idx, price in raw_lows]
+    all_pivots.sort(key=lambda x: x[0])
+
+    for idx, price, kind in all_pivots:
+        if kind == "H":
+            label = "HH" if (prev_high is None or price > prev_high) else "LH"
+            swings.append(SwingPoint(idx=idx, price=price, kind=label))
+            prev_high = price
+        else:
+            label = "HL" if (prev_low is None or price > prev_low) else "LL"
+            swings.append(SwingPoint(idx=idx, price=price, kind=label))
+            prev_low = price
+
+    return swings
 
 
-def compute_statut(idx_sig: int | None, len_df: int, tf: str) -> str:
-    if idx_sig is None:
-        return "N/A"
-    candles_elapsed = (len_df - 1) - idx_sig
-    thresholds = TF_STATUT.get(tf, {"Fresh": 2, "Aged": 5})
-    if candles_elapsed <= thresholds["Fresh"]:
-        return "Fresh"
-    if candles_elapsed <= thresholds["Aged"]:
-        return "Aged"
-    return "Stale"
-
-
-def get_trend_context(df: pd.DataFrame, tf: str) -> str:
-    close = df["close"]
-    if len(close) < 55:
+def get_market_structure(swings: list[SwingPoint]) -> str:
+    """
+    Détermine la structure de marché à partir des swing points.
+    Uptrend   = derniers pivots sont HH + HL
+    Downtrend = derniers pivots sont LH + LL
+    Range     = mixte
+    """
+    if len(swings) < 4:
         return "Unknown"
-    ema20    = close.ewm(span=20, adjust=False).mean()
-    ema50    = close.ewm(span=50, adjust=False).mean()
-    e20_last = ema20.iloc[-1]
-    e50_last = ema50.iloc[-1]
-    lookback = TF_EMA_LOOKBACK.get(tf, 5)
-    e20_prev = ema20.iloc[-(lookback + 1)] if len(ema20) > lookback else ema20.iloc[0]
-    if e20_last > e50_last and e20_last > e20_prev:
-        return "Uptrend"
-    if e20_last < e50_last and e20_last < e20_prev:
-        return "Downtrend"
+    recent = swings[-6:]
+    highs  = [s for s in recent if s.kind in ("HH", "LH")]
+    lows   = [s for s in recent if s.kind in ("HL", "LL")]
+    if not highs or not lows:
+        return "Unknown"
+    last_high_is_hh = highs[-1].kind == "HH"
+    last_low_is_hl  = lows[-1].kind  == "HL"
+    if last_high_is_hh and last_low_is_hl:
+        return "Bullish"
+    last_high_is_lh = highs[-1].kind == "LH"
+    last_low_is_ll  = lows[-1].kind  == "LL"
+    if last_high_is_lh and last_low_is_ll:
+        return "Bearish"
     return "Range"
 
 
-def detect_choch(df: pd.DataFrame, tf: str):
+# ===================== SMC CORE — MSS / BOS =====================
+
+def detect_mss_bos(df: pd.DataFrame, swings: list[SwingPoint],
+                   structure: str) -> tuple[Optional[str], Optional[str],
+                                            Optional[float], Optional[int]]:
     """
-    FIX C2 : Toutes les opérations utilisent désormais h_all/l_all/c_all/o_all
-    (tableaux complets) avec des indices explicites — plus d'ambiguïté d'indexation
-    entre tableaux tronqués et complets.
+    Détecte un MSS ou BOS authentique sur les dernières bougies.
+
+    MSS (Market Structure Shift) = cassure CONTRE la structure courante
+        → En Uptrend  : cassure d'un HL (swing low) → signal Bearish
+        → En Downtrend: cassure d'un LH (swing high) → signal Bullish
+
+    BOS (Break of Structure) = cassure DANS la structure courante
+        → En Uptrend  : cassure d'un HH → signal Bullish (continuation)
+        → En Downtrend: cassure d'un LL → signal Bearish (continuation)
+
+    Règle de confirmation : la bougie DOIT clôturer au-delà du niveau.
+    Le niveau doit avoir tenu au moins 3 bougies (évite les faux breakouts immédiats).
+
+    Retourne : (sig_type, direction, broken_level, idx_breakout)
     """
-    length   = FRACTAL_LEN.get(tf, 5)
-    p        = length // 2
-    lookback = TF_LOOKBACK.get(tf, 3)
-    window   = FRACTAL_WINDOW.get(tf, 60)
+    if structure == "Unknown" or not swings:
+        return None, None, None, None
 
-    h_all = df["high"].values
-    l_all = df["low"].values
-    c_all = df["close"].values
-    o_all = df["open"].values
-    n     = len(c_all)
+    c  = df["close"].values
+    h  = df["high"].values
+    l  = df["low"].values
+    n  = len(c)
 
-    min_len = p * 2 + 1 + lookback + 1
-    if n < min_len:
-        return None, None, None, None, None, None, None
-
-    recent_ranges = h_all[-50:] - l_all[-50:]
-    p25 = float(np.percentile(recent_ranges, 25)) if len(recent_ranges) >= 10 else None
-    p75 = float(np.percentile(recent_ranges, 75)) if len(recent_ranges) >= 10 else None
-
-    def get_force(rng: float) -> str:
-        if p25 is None or p75 is None:
-            return "Moyen"
-        if rng >= p75:
-            return "Fort"
-        if rng <= p25:
-            return "Faible"
-        return "Moyen"
-
-    for offset in range(lookback):
-        idx_cur  = n - 1 - offset
-        idx_prev = idx_cur - 1
-        if idx_prev < p:
+    # On cherche sur les 5 dernières bougies max (signal récent uniquement)
+    for offset in range(5):
+        idx = n - 1 - offset
+        if idx < 3:
             break
 
-        # FIX C2 : borne de recherche de fractales sur h_all directement
-        window_start       = max(p, idx_cur - window)
-        fractal_search_end = idx_cur - p
+        # ── Uptrend : cherche MSS (cassure d'un HL) ou BOS (cassure d'un HH) ──
+        if structure == "Bullish":
+            # MSS : clôture sous le dernier HL → retournement baissier
+            hl_swings = [s for s in swings if s.kind == "HL" and s.idx < idx - 2]
+            if hl_swings:
+                last_hl = hl_swings[-1]
+                if c[idx] < last_hl.price and c[idx - 1] >= last_hl.price:
+                    return "MSS", "Bearish", last_hl.price, idx
+            # BOS : clôture au-dessus du dernier HH → continuation haussière
+            hh_swings = [s for s in swings if s.kind == "HH" and s.idx < idx - 2]
+            if hh_swings:
+                last_hh = hh_swings[-1]
+                if c[idx] > last_hh.price and c[idx - 1] <= last_hh.price:
+                    return "BOS", "Bullish", last_hh.price, idx
 
-        if fractal_search_end <= window_start:
-            continue
+        # ── Downtrend : cherche MSS (cassure d'un LH) ou BOS (cassure d'un LL) ──
+        elif structure == "Bearish":
+            # MSS : clôture au-dessus du dernier LH → retournement haussier
+            lh_swings = [s for s in swings if s.kind == "LH" and s.idx < idx - 2]
+            if lh_swings:
+                last_lh = lh_swings[-1]
+                if c[idx] > last_lh.price and c[idx - 1] <= last_lh.price:
+                    return "MSS", "Bullish", last_lh.price, idx
+            # BOS : clôture sous le dernier LL → continuation baissière
+            ll_swings = [s for s in swings if s.kind == "LL" and s.idx < idx - 2]
+            if ll_swings:
+                last_ll = ll_swings[-1]
+                if c[idx] < last_ll.price and c[idx - 1] >= last_ll.price:
+                    return "BOS", "Bearish", last_ll.price, idx
 
-        last_high_idx = None
-        last_low_idx  = None
+        # ── Range : uniquement les MSS (cassures des extrêmes de range) ──
+        else:
+            all_highs = [s for s in swings if s.kind in ("HH", "LH") and s.idx < idx - 2]
+            all_lows  = [s for s in swings if s.kind in ("HL", "LL") and s.idx < idx - 2]
+            if all_highs:
+                range_high = max(all_highs, key=lambda s: s.price)
+                if c[idx] > range_high.price and c[idx - 1] <= range_high.price:
+                    return "MSS", "Bullish", range_high.price, idx
+            if all_lows:
+                range_low = min(all_lows, key=lambda s: s.price)
+                if c[idx] < range_low.price and c[idx - 1] >= range_low.price:
+                    return "MSS", "Bearish", range_low.price, idx
 
-        for i in range(window_start, fractal_search_end):
-            # FIX C2 : utilisation des tableaux complets avec slices bornées
-            local_max = max(h_all[i - p:i + p + 1])
-            local_min = min(l_all[i - p:i + p + 1])
-            if abs(h_all[i] - local_max) < 1e-9:
-                last_high_idx = i
-            if abs(l_all[i] - local_min) < 1e-9:
-                last_low_idx = i
-
-        last_high = float(h_all[last_high_idx]) if last_high_idx is not None else None
-        last_low  = float(l_all[last_low_idx])  if last_low_idx  is not None else None
-
-        if last_high is None and last_low is None:
-            continue
-
-        # FIX C2 + R6 : is_valid_breakout_candle travaille sur les tableaux complets
-        if not is_valid_breakout_candle(idx_cur, h_all, l_all, c_all, o_all):
-            continue
-
-        breakout_range = h_all[idx_cur] - l_all[idx_cur]
-        sig_raw = time_sig = force = niveau_casse = None
-
-        # FIX C2 : c_all[idx_cur] et c_all[idx_prev] — indices cohérents sur tableau complet
-        if last_high is not None and c_all[idx_cur] > last_high and c_all[idx_prev] <= last_high:
-            sig_raw      = "Bullish"
-            time_sig     = df.index[idx_cur]
-            force        = get_force(breakout_range)
-            niveau_casse = last_high
-
-        elif last_low is not None and c_all[idx_cur] < last_low and c_all[idx_prev] >= last_low:
-            sig_raw      = "Bearish"
-            time_sig     = df.index[idx_cur]
-            force        = get_force(breakout_range)
-            niveau_casse = last_low
-
-        if sig_raw is None:
-            continue
-
-        trend = get_trend_context(df.iloc[:idx_cur + 1], tf)
-
-        if trend == "Range" and force in ("Faible", "Moyen"):
-            continue
-
-        return sig_raw, time_sig, force, idx_cur, trend, niveau_casse, float(c_all[-1])
-
-    return None, None, None, None, None, None, None
+    return None, None, None, None
 
 
-# ===================== PAYLOAD PIPELINE =====================
+# ===================== SMC CORE — ORDER BLOCK =====================
 
-def build_pipeline_payload(
-    inst: str,
-    inst_display: str,
-    tf_name: str,
-    sig_raw: str,
-    time_sig,
-    strength: str,
-    idx_sig: int,
-    trend: str,
-    niveau_casse: float,
-    close_actuel: float,
-    type_label: str,
-    statut: str,
-    volatilite: str,
-    bb_str: str,
-    scan_time: datetime,
-    len_df: int,
-) -> dict:
+def detect_order_block(df: pd.DataFrame, direction: str,
+                       breakout_idx: int) -> Optional[OrderBlock]:
     """
-    Construit le payload JSON pipeline-grade.
-    FIX R7 : utilise calc_distance_pct() centralisée.
-    FIX M4 : session avec overlap London/NY.
-    FIX C1 : scan_time provient de session_state (plus de var hors scope).
+    L'Order Block institutionnel = la DERNIÈRE bougie de couleur opposée
+    au breakout, juste avant le mouvement impulsif.
+
+    Pour un BOS/MSS Bullish : on cherche la dernière bougie baissière
+    (close < open) dans les OB_MAX_LOOKBACK bougies précédant le breakout.
+
+    Pour un BOS/MSS Bearish : on cherche la dernière bougie haussière
+    (close > open) dans les OB_MAX_LOOKBACK bougies précédant le breakout.
+
+    Règle de qualité : le corps de la bougie doit représenter > 40% de sa range.
     """
-    prec    = instrument_precision(inst)
-    bb_pct, bb_regime = _parse_bb_components(bb_str)
+    o = df["open"].values
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
 
-    # FIX R7 : distance via fonction centralisée
-    raw_dist = calc_distance_pct(niveau_casse, close_actuel)
-    dist_pct = round(raw_dist, 4) if raw_dist is not None else None
+    search_start = max(0, breakout_idx - OB_MAX_LOOKBACK)
+    search_end   = breakout_idx  # on n'inclut pas la bougie de breakout
 
-    candles_since_signal = (len_df - 1) - idx_sig
+    last_ob_idx: Optional[int] = None
 
+    for i in range(search_start, search_end):
+        body = abs(c[i] - o[i])
+        rng  = h[i] - l[i]
+        if np.isclose(rng, 0, atol=1e-10) or (body / rng) < 0.40:
+            continue
+
+        if direction == "Bullish" and c[i] < o[i]:   # bougie baissière → OB haussier
+            last_ob_idx = i
+        elif direction == "Bearish" and c[i] > o[i]:  # bougie haussière → OB baissier
+            last_ob_idx = i
+
+    if last_ob_idx is None:
+        return None
+
+    # Zone OB = high/low de la bougie OB
+    return OrderBlock(
+        top      = float(h[last_ob_idx]),
+        bottom   = float(l[last_ob_idx]),
+        idx      = last_ob_idx,
+        polarity = direction,
+    )
+
+
+# ===================== SMC CORE — FAIR VALUE GAP =====================
+
+def detect_fvg(df: pd.DataFrame, direction: str,
+               breakout_idx: int) -> Optional[FairValueGap]:
+    """
+    Fair Value Gap (imbalance) = gap entre la mèche de la bougie i-1
+    et la mèche de la bougie i+1, autour du mouvement impulsif (bougie i).
+
+    Structure : [bougie_avant] [bougie_impulsive] [bougie_après]
+    FVG Bullish : high[i-1] < low[i+1]  → gap non comblé au-dessus
+    FVG Bearish : low[i-1]  > high[i+1] → gap non comblé en-dessous
+
+    On cherche dans les FVG_MAX_LOOKBACK bougies autour du breakout.
+    Filtre : le gap doit être > MIN_FVG_PCT% du prix (évite les micro-gaps).
+    """
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
+    n = len(c)
+
+    search_start = max(1, breakout_idx - FVG_MAX_LOOKBACK)
+    search_end   = min(n - 1, breakout_idx + 1)
+
+    best_fvg: Optional[FairValueGap] = None
+    best_size = 0.0
+
+    for i in range(search_start, search_end):
+        if i + 1 >= n:
+            break
+
+        if direction == "Bullish":
+            gap_bottom = h[i - 1]
+            gap_top    = l[i + 1]
+            if gap_top > gap_bottom:
+                size = gap_top - gap_bottom
+                mid  = (gap_top + gap_bottom) / 2
+                if mid > 0 and (size / mid * 100) >= MIN_FVG_PCT and size > best_size:
+                    best_fvg  = FairValueGap(top=gap_top, bottom=gap_bottom,
+                                              idx=i, polarity="Bullish")
+                    best_size = size
+
+        elif direction == "Bearish":
+            gap_top    = l[i - 1]
+            gap_bottom = h[i + 1]
+            if gap_top > gap_bottom:
+                size = gap_top - gap_bottom
+                mid  = (gap_top + gap_bottom) / 2
+                if mid > 0 and (size / mid * 100) >= MIN_FVG_PCT and size > best_size:
+                    best_fvg  = FairValueGap(top=gap_top, bottom=gap_bottom,
+                                              idx=i, polarity="Bearish")
+                    best_size = size
+
+    return best_fvg
+
+
+# ===================== SMC CORE — CONFLUENCE SCORE =====================
+
+def compute_confluence_score(ob: Optional[OrderBlock], fvg: Optional[FairValueGap],
+                              htf_aligned: bool, session: str,
+                              sig_type: str, direction: str,
+                              structure: str) -> int:
+    """
+    Score de confluence 0-100.
+    Un signal ne passe le filtre que si score >= MIN_CONFLUENCE_SCORE (55).
+
+    Décomposition :
+      OB présent          +30  (zone d'entrée institutionnelle définie)
+      FVG présent         +25  (imbalance = zone de retour probable)
+      HTF aligné          +25  (filtre de tendance supérieure)
+      Session premium     +10  (London/NY open = liquidité maximale)
+      MSS (vs BOS)        +10  (signal de retournement = plus fort)
+    """
+    score = 0
+    if ob  is not None: score += 30
+    if fvg is not None: score += 25
+    if htf_aligned:     score += 25
+    if is_session_premium(session): score += 10
+    if sig_type == "MSS":           score += 10
+    return min(score, 100)
+
+
+# ===================== SMC CORE — STATUT =====================
+
+def compute_statut(candles_since: int, tf: str) -> str:
+    thresholds = {
+        "H4": {"Fresh": 3,  "Aged": 8},
+        "D1": {"Fresh": 2,  "Aged": 5},
+    }
+    t = thresholds.get(tf, {"Fresh": 2, "Aged": 5})
+    if candles_since <= t["Fresh"]: return "Fresh"
+    if candles_since <= t["Aged"]:  return "Aged"
+    return "Stale"
+
+
+# ===================== HTF CONTEXT =====================
+
+def get_htf_trend(inst: str, htf_gran: str, htf_count: int) -> str:
+    """
+    Récupère la structure HTF (Daily pour H4, Weekly pour D1).
+    Utilise les mêmes swing points SMC pour la cohérence.
+    Retourne "Bullish" | "Bearish" | "Range" | "Unknown".
+    """
+    df_htf = get_candles(inst, htf_gran, htf_count)
+    if df_htf is None or len(df_htf) < 40:
+        return "Unknown"
+    swings_htf  = detect_swing_points(df_htf, lookback=5, history=30)
+    structure   = get_market_structure(swings_htf)
+    return structure
+
+
+# ===================== PIPELINE PRINCIPAL =====================
+
+def scan_instrument(inst: str, tf_name: str, tf_config: dict,
+                    scan_time: datetime) -> Optional[SMCSignal]:
+    """
+    Pipeline complet pour un instrument + timeframe.
+    Retourne un SMCSignal si toutes les conditions sont remplies, None sinon.
+    """
+    gran      = tf_config["gran"]
+    htf_gran  = tf_config["htf"]
+    count     = tf_config["count"]
+    htf_count = HTF_ONLY[htf_gran]["count"]
+
+    # ── 1. Récupération des données ───────────────────────────────────────────
+    df = get_candles(inst, gran, count)
+    if df is None or len(df) < 80:
+        return None
+
+    # ── 2. Détection des swing points et structure ────────────────────────────
+    swings    = detect_swing_points(df)
+    structure = get_market_structure(swings)
+
+    # ── 3. Détection MSS / BOS ────────────────────────────────────────────────
+    sig_type, direction, broken_level, breakout_idx = detect_mss_bos(df, swings, structure)
+    if not sig_type:
+        return None
+
+    # ── 4. Contexte HTF (filtre de tendance supérieure) ───────────────────────
+    htf_trend   = get_htf_trend(inst, htf_gran, htf_count)
+    htf_aligned = (
+        (direction == "Bullish" and htf_trend == "Bullish") or
+        (direction == "Bearish" and htf_trend == "Bearish")
+    )
+
+    # ── 5. Order Block ────────────────────────────────────────────────────────
+    df_context = df.iloc[:breakout_idx + 1]
+    ob = detect_order_block(df_context, direction, breakout_idx)
+
+    # ── 6. Fair Value Gap ─────────────────────────────────────────────────────
+    fvg = detect_fvg(df_context, direction, breakout_idx)
+
+    # ── 7. Session ────────────────────────────────────────────────────────────
+    signal_time = df.index[breakout_idx]
+    session     = get_session(signal_time)
+
+    # ── 8. Score de confluence ────────────────────────────────────────────────
+    score = compute_confluence_score(ob, fvg, htf_aligned, session, sig_type,
+                                     direction, structure)
+    if score < MIN_CONFLUENCE_SCORE:
+        logger.info(f"Signal ignoré {inst}/{tf_name}: score {score} < {MIN_CONFLUENCE_SCORE}")
+        return None
+
+    # ── 9. Filtre de distance ─────────────────────────────────────────────────
+    close_price  = float(df["close"].iloc[-1])
+    distance_pct = calc_distance_pct(broken_level, close_price)
+    max_dist     = MAX_DIST_PCT.get(tf_name, 3.0)
+    if distance_pct is not None and distance_pct > max_dist:
+        logger.info(f"Signal ignoré {inst}/{tf_name}: distance {distance_pct:.3f}% > {max_dist}%")
+        return None
+
+    # ── 10. Statut et volatilité ──────────────────────────────────────────────
+    candles_since = (len(df) - 1) - breakout_idx
+    statut        = compute_statut(candles_since, tf_name)
+    atr           = calc_atr(df_context)
+    volatility    = calc_volatility(atr, df_context, inst)
+
+    return SMCSignal(
+        instrument    = inst,
+        timeframe     = tf_name,
+        direction     = direction,
+        sig_type      = sig_type,
+        signal_time   = signal_time,
+        broken_level  = float(broken_level),
+        close_price   = close_price,
+        distance_pct  = distance_pct,
+        ob            = ob,
+        fvg           = fvg,
+        htf_trend     = htf_trend,
+        htf_aligned   = htf_aligned,
+        session       = session,
+        confluence_score = score,
+        volatility    = volatility,
+        statut        = statut,
+        candles_since = candles_since,
+        scan_time     = scan_time,
+    )
+
+
+# ===================== PAYLOAD JSON PIPELINE =====================
+
+def build_pipeline_payload(sig: SMCSignal) -> dict:
+    prec = instrument_precision(sig.instrument)
     return {
-        # ── Identité du signal ──────────────────────────────────────────
-        "signal_id":       f"{inst}__{tf_name}__{time_sig.strftime('%Y%m%dT%H%M')}",
+        "signal_id":       f"{sig.instrument}__{sig.timeframe}__{sig.signal_time.strftime('%Y%m%dT%H%M')}",
         "scanner_version": SCANNER_VERSION,
-        "generated_at":    scan_time.isoformat(),
+        "generated_at":    sig.scan_time.isoformat(),
 
-        # ── Instrument ──────────────────────────────────────────────────
-        "pair":            inst_display,
-        "pair_oanda":      inst,
-        "timeframe":       tf_name,
+        "pair":            sig.instrument.replace("_", "/"),
+        "pair_oanda":      sig.instrument,
+        "timeframe":       sig.timeframe,
 
-        # ── Classification du signal ────────────────────────────────────
-        "type":            type_label,
-        "direction":       sig_raw,
-        "is_bullish":      sig_raw == "Bullish",
-        "order":           "buy" if sig_raw == "Bullish" else "sell",
-        "trend":           trend,
-        "is_choch":        type_label == "CHoCH",
-        "status":          statut,
+        "type":            sig.sig_type,
+        "direction":       sig.direction,
+        "is_bullish":      sig.direction == "Bullish",
+        "order":           "buy" if sig.direction == "Bullish" else "sell",
+        "htf_trend":       sig.htf_trend,
+        "htf_aligned":     sig.htf_aligned,
+        "status":          sig.statut,
 
-        # ── Niveaux — floats natifs ─────────────────────────────────────
-        "level":           round(float(niveau_casse), prec),
-        "close_price":     round(float(close_actuel), prec),
-        "distance_pct":    dist_pct,
+        "confluence_score": sig.confluence_score,
 
-        # ── Contexte marché ─────────────────────────────────────────────
-        "volatility":      volatilite,
-        "force":           strength or "Moyen",
-        "bb_width_pct":    bb_pct,
-        "bb_regime":       bb_regime,
+        "level":           round(sig.broken_level, prec),
+        "close_price":     round(sig.close_price, prec),
+        "distance_pct":    round(sig.distance_pct, 4) if sig.distance_pct else None,
 
-        # ── Horodatage ──────────────────────────────────────────────────
-        "signal_time":     time_sig.isoformat(),
-        # FIX M4 : session avec overlap exposé
-        "session":         get_session(time_sig),
-        "candles_elapsed": candles_since_signal,
+        "order_block": {
+            "top":    round(sig.ob.top,    prec),
+            "bottom": round(sig.ob.bottom, prec),
+        } if sig.ob else None,
+
+        "fair_value_gap": {
+            "top":    round(sig.fvg.top,    prec),
+            "bottom": round(sig.fvg.bottom, prec),
+        } if sig.fvg else None,
+
+        "volatility":       sig.volatility,
+        "signal_time":      sig.signal_time.isoformat(),
+        "session":          sig.session,
+        "candles_elapsed":  sig.candles_since,
     }
 
 
-# ===================== PDF =====================
-def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
+# ===================== EXPORT PDF =====================
+
+def create_pdf(rows: list[dict]) -> io.BytesIO:
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, pagesize=landscape(A4),
-        leftMargin=20, rightMargin=20, topMargin=40, bottomMargin=40
-    )
+    doc    = SimpleDocTemplate(buffer, pagesize=landscape(A4),
+                               leftMargin=15, rightMargin=15,
+                               topMargin=30, bottomMargin=30)
     elements = []
     styles   = getSampleStyleSheet()
-    elements.append(Paragraph("Rapport des Signaux CHoCH", styles["Title"]))
+    elements.append(Paragraph(f"SMC Scanner v{SCANNER_VERSION} — Signaux qualifiés", styles["Title"]))
     elements.append(Paragraph(
-        f"Généré le {datetime.now(timezone.utc).strftime('%d/%m/%Y à %H:%M')} UTC"
-        " — Fresh & Aged uniquement",
+        f"Généré le {datetime.now(timezone.utc).strftime('%d/%m/%Y à %H:%M')} UTC "
+        f"| Confluence minimum : {MIN_CONFLUENCE_SCORE}/100",
         styles["Normal"]
     ))
-    elements.append(Spacer(1, 20))
-    cols_present = [c for c in EXPORT_COLS if c in df_export.columns]
+    elements.append(Spacer(1, 16))
 
-    # FIX M12 : construction des col_widths uniquement pour les colonnes présentes
-    # évite le décalage silencieux si une colonne manque
-    col_widths_map = {
-        "Paire": 65, "Timeframe": 48, "Type": 42, "Ordre": 42, "Signal": 82,
-        "Niveau": 68, "Distance%": 52, "Volatilité": 58, "Force": 45,
-        "BB_Width": 90, "Statut": 45, "Heure (UTC)": 105,
-    }
-    col_widths = [col_widths_map.get(c, 60) for c in cols_present]
+    if not rows:
+        elements.append(Paragraph("Aucun signal qualifié.", styles["Normal"]))
+        doc.build(elements)
+        buffer.seek(0)
+        return buffer
 
-    data  = [cols_present] + df_export[cols_present].values.tolist()
-    table = Table(data, colWidths=col_widths, repeatRows=1)
+    headers = ["Paire", "TF", "Type", "Dir", "Score", "OB Zone", "FVG Zone",
+               "Dist%", "HTF", "Session", "Statut", "Heure UTC"]
+    data    = [headers]
+    for r in rows:
+        data.append([
+            r.get("Paire", ""),    r.get("TF", ""),      r.get("Type", ""),
+            r.get("Dir", ""),      str(r.get("Score", "")),
+            r.get("OB_Zone", ""),  r.get("FVG_Zone", ""), r.get("Distance%", ""),
+            r.get("HTF_Trend", ""), r.get("Session", ""), r.get("Statut", ""),
+            r.get("Heure (UTC)", ""),
+        ])
+
+    col_w = [52, 32, 38, 42, 36, 85, 85, 45, 55, 85, 40, 90]
+    table = Table(data, colWidths=col_w, repeatRows=1)
     table.setStyle(TableStyle([
-        ('BACKGROUND',    (0, 0), (-1, 0), colors.HexColor("#1e40af")),
-        ('TEXTCOLOR',     (0, 0), (-1, 0), colors.white),
+        ('BACKGROUND',    (0, 0), (-1, 0),  colors.HexColor("#0f172a")),
+        ('TEXTCOLOR',     (0, 0), (-1, 0),  colors.white),
         ('ALIGN',         (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME',      (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE',      (0, 0), (-1, 0), 9),
-        ('FONTSIZE',      (0, 1), (-1, -1), 8),
-        ('GRID',          (0, 0), (-1, -1), 0.5, colors.grey),
-        ('ROWBACKGROUNDS',(0, 1), (-1, -1), [colors.white, colors.beige]),
+        ('FONTNAME',      (0, 0), (-1, 0),  'Helvetica-Bold'),
+        ('FONTSIZE',      (0, 0), (-1, 0),  8),
+        ('FONTSIZE',      (0, 1), (-1, -1), 7),
+        ('GRID',          (0, 0), (-1, -1), 0.4, colors.HexColor("#334155")),
+        ('ROWBACKGROUNDS',(0, 1), (-1, -1), [colors.HexColor("#f8fafc"), colors.HexColor("#f1f5f9")]),
         ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
-        ('LEFTPADDING',   (0, 0), (-1, -1), 5),
-        ('RIGHTPADDING',  (0, 0), (-1, -1), 5),
-        ('TOPPADDING',    (0, 0), (-1, -1), 7),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
+        ('LEFTPADDING',   (0, 0), (-1, -1), 4),
+        ('RIGHTPADDING',  (0, 0), (-1, -1), 4),
+        ('TOPPADDING',    (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
     ]))
     elements.append(table)
     doc.build(elements)
@@ -563,312 +804,277 @@ def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
     return buffer
 
 
-# ===================== PNG =====================
-def generate_png(df: pd.DataFrame, display_cols: list) -> io.BytesIO:
-    fig = Figure(figsize=(22, max(5, len(df) * 0.35)))
-    ax  = fig.add_subplot(111)
-    ax.axis('off')
-    disp = df[[c for c in display_cols if c in df.columns]]
-    tbl  = ax.table(cellText=disp.values, colLabels=disp.columns,
-                    cellLoc='center', loc='center')
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8)
-    tbl.scale(1.2, 1.8)
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', dpi=200)
-    buf.seek(0)
-    return buf
+# ===================== SIGNAL → ROW UI =====================
+
+def signal_to_row(sig: SMCSignal) -> dict:
+    inst = sig.instrument
+    return {
+        "Paire":       inst.replace("_", "/"),
+        "TF":          sig.timeframe,
+        "Type":        sig.sig_type,
+        "Dir":         "↑ " + sig.direction if sig.direction == "Bullish" else "↓ " + sig.direction,
+        "Score":       sig.confluence_score,
+        "OB_Zone":     fmt_zone(sig.ob.top, sig.ob.bottom, inst) if sig.ob else "—",
+        "FVG_Zone":    fmt_zone(sig.fvg.top, sig.fvg.bottom, inst) if sig.fvg else "—",
+        "Distance%":   f"{sig.distance_pct:.3f}%" if sig.distance_pct else "N/A",
+        "HTF_Trend":   sig.htf_trend,
+        "Session":     sig.session,
+        "Statut":      sig.statut,
+        "Heure (UTC)": sig.signal_time.strftime("%Y-%m-%d %H:%M"),
+        # colonnes cachées pour tri
+        "_time_sort":  sig.signal_time,
+        "_score_sort": sig.confluence_score,
+        "_htf_align":  sig.htf_aligned,
+    }
 
 
 # ===================== UI =====================
-st.set_page_config(page_title="CHoCH Scanner", layout="wide")
-st.markdown(
-    "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>"
-    "Scanner Change of Character (CHoCH) — v5.7</h1>",
-    unsafe_allow_html=True
-)
+st.set_page_config(page_title="SMC Scanner v6", layout="wide")
+
+st.markdown("""
+<style>
+    .main-title {
+        text-align: center;
+        font-family: 'Courier New', monospace;
+        color: #e2e8f0;
+        font-size: 1.6rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        margin-bottom: 4px;
+    }
+    .sub-title {
+        text-align: center;
+        color: #64748b;
+        font-size: 0.85rem;
+        margin-bottom: 24px;
+    }
+    .metric-card {
+        background: #0f172a;
+        border: 1px solid #1e293b;
+        border-radius: 8px;
+        padding: 12px 18px;
+        text-align: center;
+    }
+</style>
+<div class="main-title">◈ SMC INSTITUTIONAL SCANNER v6.0</div>
+<div class="sub-title">Swing H4/D1 · MSS · BOS · Order Block · Fair Value Gap · Confluence Filter</div>
+""", unsafe_allow_html=True)
+
+# ── Paramètres sidebar ────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Paramètres")
+    min_score    = st.slider("Score confluence minimum", 40, 90, MIN_CONFLUENCE_SCORE, 5,
+                              help="En dessous de ce score, le signal est ignoré")
+    htf_only     = st.checkbox("HTF aligné obligatoire", value=True,
+                                help="N'affiche que les signaux alignés avec le timeframe supérieur")
+    show_stale   = st.checkbox("Afficher les signaux Stale", value=False)
+    selected_tfs = st.multiselect("Timeframes", list(TIMEFRAMES.keys()),
+                                   default=list(TIMEFRAMES.keys()))
+
+    st.markdown("---")
+    st.markdown(f"**Paires scannées :** {len(INSTRUMENTS)}")
+    st.markdown(f"**Combinaisons :** {len(INSTRUMENTS) * len(selected_tfs)}")
+    st.markdown(f"**Version :** {SCANNER_VERSION}")
+    st.markdown("---")
+    st.markdown("**Scoring :**")
+    st.markdown("🟦 OB présent : +30")
+    st.markdown("🟩 FVG présent : +25")
+    st.markdown("🟨 HTF aligné : +25")
+    st.markdown("🟧 Session premium : +10")
+    st.markdown("🟥 MSS (vs BOS) : +10")
 
 if "scanning" not in st.session_state:
     st.session_state.scanning = False
 
-if st.button(
-    "Lancer le Scan",
-    type="primary",
-    use_container_width=True,
-    disabled=st.session_state.scanning
-):
-    st.session_state.scanning = True
-    n_combos = len(INSTRUMENTS) * len(TIMEFRAMES)
+# ── Bouton scan ───────────────────────────────────────────────────────────────
+if st.button("🔍  Lancer le Scan SMC", type="primary",
+             use_container_width=True, disabled=st.session_state.scanning):
 
-    # FIX C1 : scan_time sauvegardé dans session_state — accessible lors du re-render
+    st.session_state.scanning  = True
     st.session_state.scan_time = datetime.now(timezone.utc)
-    scan_time = st.session_state.scan_time
+    scan_time  = st.session_state.scan_time
+    tfs_to_run = {k: v for k, v in TIMEFRAMES.items() if k in selected_tfs}
+    n_combos   = len(INSTRUMENTS) * len(tfs_to_run)
 
     try:
-        with st.spinner(f"Scan en cours sur {n_combos} combinaisons…"):
-            results:          list[dict] = []
-            pipeline_signals: list[dict] = []
-            errors:           list[str]  = []
+        with st.spinner(f"Scan SMC en cours — {n_combos} combinaisons…"):
+            signals:  list[SMCSignal] = []
+            payloads: list[dict]      = []
+            errors:   list[str]       = []
 
-            with ThreadPoolExecutor(max_workers=6) as executor:
-                futures = {
-                    executor.submit(get_candles, inst, tf_code): (inst, tf_name)
-                    for inst in INSTRUMENTS
-                    for tf_name, tf_code in TIMEFRAMES.items()
+            tasks = [
+                (inst, tf_name, tf_cfg)
+                for inst    in INSTRUMENTS
+                for tf_name, tf_cfg in tfs_to_run.items()
+            ]
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_map = {
+                    executor.submit(scan_instrument, inst, tf_name, tf_cfg, scan_time):
+                        (inst, tf_name)
+                    for inst, tf_name, tf_cfg in tasks
                 }
 
-                # FIX C3 : timeout global sur as_completed + timeout par future
                 try:
-                    completed_iter = as_completed(futures, timeout=SCAN_GLOBAL_TIMEOUT)
+                    for future in as_completed(future_map, timeout=SCAN_GLOBAL_TIMEOUT):
+                        inst, tf_name = future_map[future]
+                        try:
+                            result = future.result(timeout=FUTURE_RESULT_TIMEOUT)
+                            if result is not None:
+                                signals.append(result)
+                                if result.statut in ("Fresh", "Aged"):
+                                    payloads.append(build_pipeline_payload(result))
+                        except FuturesTimeoutError:
+                            errors.append(f"{inst}/{tf_name}: timeout")
+                            future.cancel()
+                        except Exception as e:
+                            errors.append(f"{inst}/{tf_name}: {e}")
                 except FuturesTimeoutError:
-                    st.warning("Timeout global du scan atteint — résultats partiels.")
-                    completed_iter = []
+                    st.warning("Timeout global atteint — résultats partiels.")
 
-                for future in completed_iter:
-                    inst, tf_name = futures[future]
-                    try:
-                        # FIX C3 : timeout individuel par future
-                        df = future.result(timeout=FUTURE_RESULT_TIMEOUT)
-                    except FuturesTimeoutError:
-                        errors.append(f"{inst}/{tf_name}: timeout individuel")
-                        future.cancel()
-                        continue
-                    except Exception as e:
-                        errors.append(f"{inst}/{tf_name}: {e}")
-                        continue
+        if errors:
+            with st.expander(f"⚠️ {len(errors)} erreur(s) de scan"):
+                for e in errors[:20]:
+                    st.text(e)
 
-                    if df is None:
-                        continue
+        st.session_state.signals  = signals
+        st.session_state.payloads = payloads
 
-                    sig_raw, time_sig, strength, idx_sig, trend, niveau_casse, close_actuel = \
-                        detect_choch(df, tf_name)
-
-                    if not sig_raw:
-                        continue
-
-                    # FIX M5 : ATR et BB calculés sur df_sig tronqué (cohérence temporelle)
-                    df_sig     = df.iloc[:idx_sig + 1] if idx_sig is not None else df
-                    _, volatilite = calc_atr_bundle(df_sig, inst)
-                    bb_str     = compute_bb_width(df_sig)
-
-                    # FIX R7 : distance via fonction centralisée
-                    dist_pct   = calc_distance_pct(niveau_casse, close_actuel)
-
-                    # Filtre de distance trop grande (signal probablement obsolète)
-                    max_dist = MAX_DIST_PCT.get(tf_name, 5.0)
-                    if dist_pct is not None and dist_pct > max_dist:
-                        logger.info(
-                            f"Signal ignoré {inst}/{tf_name} — distance {dist_pct:.3f}% > {max_dist}%"
-                        )
-                        continue
-
-                    # Convention SMC : CHoCH = contre tendance, BOS = dans la tendance
-                    is_choch = (
-                        (trend == "Uptrend"   and sig_raw == "Bearish") or
-                        (trend == "Downtrend" and sig_raw == "Bullish")
-                    )
-                    type_label   = "CHoCH" if is_choch else "BOS"
-                    signal_label = f"{sig_raw} {type_label}"
-                    inst_display = inst.replace("_", "/")
-                    statut       = compute_statut(idx_sig, len(df), tf_name)
-
-                    # ── Payload UI ────────────────────────────────────────
-                    results.append({
-                        "Instrument":  inst_display,
-                        "Paire":       inst_display,
-                        "_time_sort":  time_sig,
-                        "Timeframe":   tf_name,
-                        "Type":        type_label,
-                        "Ordre":       "Achat" if sig_raw == "Bullish" else "Vente",
-                        "Signal":      signal_label,
-                        "Niveau":      format_niveau(niveau_casse, inst),
-                        "Distance%":   format_distance(dist_pct),
-                        "Volatilité":  volatilite,
-                        "Force":       strength or "Moyen",
-                        "BB_Width":    bb_str,
-                        "Statut":      statut,
-                        "Heure (UTC)": time_sig.strftime("%Y-%m-%d %H:%M"),
-                    })
-
-                    # ── Payload pipeline JSON (Fresh et Aged uniquement) ──
-                    if statut in ("Fresh", "Aged"):
-                        pipeline_signals.append(build_pipeline_payload(
-                            inst=inst,
-                            inst_display=inst_display,
-                            tf_name=tf_name,
-                            sig_raw=sig_raw,
-                            time_sig=time_sig,
-                            strength=strength,
-                            idx_sig=idx_sig,
-                            trend=trend,
-                            niveau_casse=niveau_casse,
-                            close_actuel=close_actuel,
-                            type_label=type_label,
-                            statut=statut,
-                            volatilite=volatilite,
-                            bb_str=bb_str,
-                            scan_time=scan_time,
-                            len_df=len(df),
-                        ))
-
-            if errors:
-                st.warning(f"{len(errors)} combinaison(s) en erreur : {'; '.join(errors[:5])}")
-
-            if results:
-                df_sorted = (
-                    pd.DataFrame(results)
-                    .sort_values("_time_sort", ascending=False)
-                )
-
-                # FIX M6 : log explicite si doublons détectés
-                before_dedup = len(df_sorted)
-                df_result = (
-                    df_sorted
-                    .drop_duplicates(subset=["Instrument", "Timeframe"], keep="first")
-                    .drop(columns=["_time_sort"])
-                    .reset_index(drop=True)
-                )
-                n_dupes = before_dedup - len(df_result)
-                if n_dupes > 0:
-                    logger.warning(
-                        f"{n_dupes} doublon(s) instrument/timeframe éliminé(s) — à investiguer"
-                    )
-
-                st.session_state.df               = df_result
-                st.session_state.pipeline_signals = pipeline_signals
-                st.session_state.png_buf          = None
-                st.success(
-                    f"Scan terminé – {len(df_result)} signaux sur {n_combos} combinaisons "
-                    f"| {len(pipeline_signals)} signal(s) Fresh/Aged dans le pipeline JSON"
-                )
-            else:
-                st.info("Aucun signal CHoCH/BOS récent détecté")
+        n_htf = sum(1 for s in signals if s.htf_aligned)
+        st.success(
+            f"✅ Scan terminé — **{len(signals)} signaux qualifiés** "
+            f"({n_htf} alignés HTF) sur {n_combos} combinaisons "
+            f"| {len(payloads)} dans le pipeline JSON"
+        )
 
     except Exception as e:
-        st.error(f"Erreur critique inattendue lors du scan : {e}")
-        logger.exception("Erreur critique scan")
+        st.error(f"Erreur critique : {e}")
+        logger.exception("Erreur critique scan SMC")
     finally:
         st.session_state.scanning = False
 
 
 # ===================== AFFICHAGE =====================
-if "df" in st.session_state:
-    df_all    = st.session_state.df.copy()
-    ts        = datetime.now().strftime("%Y%m%d_%H%M")
-    df_export = df_all[df_all["Statut"].isin(["Fresh", "Aged"])].copy()
+if "signals" in st.session_state and st.session_state.signals:
+    signals: list[SMCSignal] = st.session_state.signals
+    payloads = st.session_state.get("payloads", [])
+    ts       = datetime.now().strftime("%Y%m%d_%H%M")
 
-    pipeline_signals = st.session_state.get("pipeline_signals", [])
+    # ── Filtres dynamiques ────────────────────────────────────────────────────
+    filtered = [s for s in signals if s.confluence_score >= min_score]
+    if htf_only:
+        filtered = [s for s in filtered if s.htf_aligned]
+    if not show_stale:
+        filtered = [s for s in filtered if s.statut != "Stale"]
 
-    # FIX C1 : scan_time lu depuis session_state — toujours disponible lors du re-render
-    scan_time_meta = st.session_state.get("scan_time", datetime.now(timezone.utc))
+    # ── Métriques ─────────────────────────────────────────────────────────────
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Signaux qualifiés",     len(filtered))
+    m2.metric("HTF alignés",           sum(1 for s in filtered if s.htf_aligned))
+    m3.metric("MSS (retournements)",   sum(1 for s in filtered if s.sig_type == "MSS"))
+    m4.metric("Avec OB + FVG",         sum(1 for s in filtered if s.ob and s.fvg))
+    m5.metric("Score moyen",
+              f"{np.mean([s.confluence_score for s in filtered]):.0f}/100"
+              if filtered else "—")
 
-    if st.session_state.get("png_buf") is None:
-        st.session_state.png_buf = generate_png(df_all, DISPLAY_COLS)
+    st.divider()
 
-    n_stale = len(df_all[df_all["Statut"] == "Stale"])
-    if n_stale > 0:
-        st.info(
-            f"{n_stale} signal(s) Stale visible(s) dans le tableau — "
-            "exclus des exports."
+    # ── Tableau ───────────────────────────────────────────────────────────────
+    if filtered:
+        rows = [signal_to_row(s) for s in filtered]
+        df_display = (
+            pd.DataFrame(rows)
+            .sort_values(["_score_sort", "_time_sort"], ascending=[False, False])
+            .drop(columns=["_time_sort", "_score_sort", "_htf_align"])
+            .reset_index(drop=True)
         )
 
-    # ── Boutons d'export ──────────────────────────────────────────────
-    col1, col2, col3, col4 = st.columns(4)
+        def style_type(val):
+            if val == "MSS": return "color:#f97316;font-weight:800"
+            return "color:#60a5fa;font-weight:600"
 
-    with col1:
-        st.download_button(
-            "CSV",
-            df_export[[c for c in EXPORT_COLS if c in df_export.columns]]
-                .to_csv(index=False).encode(),
-            f"choch_{ts}.csv", "text/csv"
+        def style_dir(val):
+            if "Bullish" in str(val): return "color:#4ade80;font-weight:700"
+            if "Bearish" in str(val): return "color:#f87171;font-weight:700"
+            return ""
+
+        def style_score(val):
+            try:
+                v = int(val)
+                if v >= 80: return "color:#4ade80;font-weight:800"
+                if v >= 65: return "color:#facc15;font-weight:700"
+                return "color:#94a3b8"
+            except: return ""
+
+        def style_statut(val):
+            if val == "Fresh": return "color:#4ade80;font-weight:700"
+            if val == "Aged":  return "color:#fb923c;font-weight:700"
+            return "color:#f87171"
+
+        def style_htf(val):
+            if val == "Bullish":  return "color:#4ade80"
+            if val == "Bearish":  return "color:#f87171"
+            if val == "Range":    return "color:#facc15"
+            return "color:#94a3b8"
+
+        def style_session(val):
+            if "Overlap" in str(val): return "color:#c084fc;font-weight:700"
+            if val in ("London", "NewYork"): return "color:#38bdf8"
+            return "color:#94a3b8"
+
+        cols_show = [c for c in DISPLAY_COLS if c in df_display.columns]
+        st.dataframe(
+            df_display[cols_show].style
+            .map(style_type,   subset=["Type"])
+            .map(style_dir,    subset=["Dir"])
+            .map(style_score,  subset=["Score"])
+            .map(style_statut, subset=["Statut"])
+            .map(style_htf,    subset=["HTF_Trend"])
+            .map(style_session,subset=["Session"]),
+            hide_index=True,
+            use_container_width=True,
+            height=min(600, 60 + len(df_display) * 38),
         )
-    with col2:
-        st.session_state.png_buf.seek(0)
-        st.download_button(
-            "PNG",
-            st.session_state.png_buf,
-            f"choch_{ts}.png", "image/png"
+    else:
+        st.info("Aucun signal ne satisfait les filtres actuels. Réduisez le score minimum ou désactivez 'HTF aligné obligatoire'.")
+
+    st.divider()
+
+    # ── Exports ───────────────────────────────────────────────────────────────
+    st.markdown("#### Exports")
+    c1, c2, c3 = st.columns(3)
+
+    rows_export = [signal_to_row(s) for s in filtered]
+
+    with c1:
+        df_csv = pd.DataFrame(rows_export).drop(
+            columns=["_time_sort", "_score_sort", "_htf_align"], errors="ignore"
         )
-    with col3:
-        st.download_button(
-            "PDF",
-            create_pdf(df_export),
-            f"choch_signaux_{ts}.pdf", "application/pdf"
-        )
-    with col4:
-        # FIX C1 : generated_at utilise scan_time_meta depuis session_state
-        pipeline_json = json.dumps(
-            {
-                "meta": {
-                    "scanner_version": SCANNER_VERSION,
-                    "generated_at":    scan_time_meta.isoformat(),
-                    "signal_count":    len(pipeline_signals),
-                },
-                "signals": pipeline_signals,
+        st.download_button("⬇️ CSV", df_csv.to_csv(index=False).encode(),
+                           f"smc_{ts}.csv", "text/csv", use_container_width=True)
+    with c2:
+        st.download_button("⬇️ PDF", create_pdf(rows_export),
+                           f"smc_{ts}.pdf", "application/pdf", use_container_width=True)
+    with c3:
+        scan_time_meta = st.session_state.get("scan_time", datetime.now(timezone.utc))
+        pipeline_json  = json.dumps({
+            "meta": {
+                "scanner_version":   SCANNER_VERSION,
+                "generated_at":      scan_time_meta.isoformat(),
+                "signal_count":      len(payloads),
+                "min_confluence":    min_score,
+                "htf_filter_active": htf_only,
             },
-            ensure_ascii=False,
-            indent=2,
-            default=str
-        ).encode("utf-8")
+            "signals": payloads,
+        }, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        st.download_button("⬇️ JSON Pipeline", pipeline_json,
+                           f"smc_pipeline_{ts}.json", "application/json",
+                           use_container_width=True)
 
-        st.download_button(
-            "JSON",
-            pipeline_json,
-            f"choch_pipeline_{ts}.json", "application/json"
-        )
+    # ── Aperçu JSON ───────────────────────────────────────────────────────────
+    if payloads:
+        with st.expander(f"Aperçu JSON Pipeline — premier signal"):
+            st.json(payloads[0])
 
-    # ── Tableau UI ────────────────────────────────────────────────────
-    def style_bb(val: str) -> str:
-        if "Squeeze"   in str(val): return "color:#ff9800;font-weight:bold"
-        if "Expansion" in str(val): return "color:#ab47bc;font-weight:bold"
-        return "color:#90a4ae"
-
-    def style_distance(val: str) -> str:
-        try:
-            v = float(str(val).replace("%", ""))
-            if v <= 0.15: return "color:#00c853;font-weight:bold"
-            if v <= 0.40: return "color:#ff9800;font-weight:bold"
-            return "color:#ff5252;font-weight:bold"
-        except Exception:
-            return "color:#90a4ae"
-
-    cols_display = [c for c in DISPLAY_COLS if c in df_all.columns]
-    st.dataframe(
-        df_all[cols_display].style
-        .map(
-            lambda x: "color:#e879f9;font-weight:bold" if x == "CHoCH"
-            else "color:#94a3b8" if x == "BOS" else "",
-            subset=["Type"]
-        )
-        .map(
-            lambda x: "color:#00c853;font-weight:bold" if x == "Achat"
-            else "color:#ff5252;font-weight:bold" if x == "Vente" else "",
-            subset=["Ordre"]
-        )
-        .map(
-            lambda x: "color:#00c853" if "Bull" in str(x)
-            else "color:#ff5252" if "Bear" in str(x) else "",
-            subset=["Signal"]
-        )
-        .map(
-            lambda x: "color:#00c853;font-weight:bold" if x == "Fort"
-            else "color:#ff5252" if x == "Faible"
-            else "color:#ff9800" if x == "Moyen" else "",
-            subset=["Force"]
-        )
-        .map(style_bb, subset=["BB_Width"])
-        .map(style_distance, subset=["Distance%"])
-        .map(
-            lambda x: "color:#00c853;font-weight:bold" if x == "Fresh"
-            else "color:#ff9800;font-weight:bold" if x == "Aged"
-            else "color:#ff5252;font-weight:bold" if x == "Stale" else "",
-            subset=["Statut"]
-        ),
-        hide_index=True,
-        use_container_width=True
-    )
-
-    # ── Aperçu pipeline JSON dans l'UI ───────────────────────────────
-    if pipeline_signals:
-        with st.expander(f"Aperçu JSON Pipeline ({len(pipeline_signals)} signaux Fresh/Aged)"):
-            st.json(pipeline_signals[0])
+elif "signals" in st.session_state and not st.session_state.signals:
+    st.info("Aucun signal SMC qualifié détecté sur ce scan.")
