@@ -9,7 +9,8 @@ import matplotlib
 matplotlib.use('Agg')
 from matplotlib.figure import Figure
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+# FIX #2 : as_completed remplacé par wait — plus de perte de résultats sur timeout
+from concurrent.futures import ThreadPoolExecutor, wait, TimeoutError as FuturesTimeoutError
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 from oandapyV20.exceptions import V20Error
@@ -271,7 +272,7 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[dict]:
         body = abs(c[idx] - o[idx])
         if rng <= 0 or (body / rng) < 0.40: continue
 
-        # Filtre Liquidity Sweep (mèche traverse un swing récent de ≥ 0.25 ATR)
+        # Filtre Liquidity Sweep
         has_sweep = False
         if direction == "Bearish":
             sweep_candidates = [s for s in prev_swings if s["kind"] in ("HH", "LH")]
@@ -286,8 +287,10 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[dict]:
                 has_sweep = True
                 break
 
-        # Filtre Distance ATR
-        dist_atr = abs(c[-1] - level) / atr_val
+        # FIX #1 : distance calculée sur la bougie de breakout (c[idx]), pas sur c[-1]
+        # Avant : dist_atr = abs(c[-1] - level) / atr_val  ← non-stationnaire
+        # Après : ancré sur l'instant réel du signal, résultat déterministe
+        dist_atr = abs(c[idx] - level) / atr_val
         if dist_atr > ATR_DIST_MULT: continue
 
         # Scoring Confluence
@@ -301,7 +304,12 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[dict]:
 
         return {
             "sig_type": sig_type, "direction": direction, "level": level,
-            "idx_break": idx, "close_price": c[-1], "has_sweep": has_sweep,
+            "idx_break": idx,
+            # FIX #1 : close_price = prix à la bougie du signal, pas le prix courant
+            "close_price": c[idx],
+            # Prix courant conservé séparément pour usage informatif dans le JSON
+            "current_price": c[-1],
+            "has_sweep": has_sweep,
             "atr_val": atr_val, "dist_atr": dist_atr, "score": score
         }
     return None
@@ -309,6 +317,7 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[dict]:
 def build_pipeline_payload_v58(df, inst, inst_disp, tf_name, sig, trend, atr_val, scan_time, len_df):
     time_sig = df.index[sig["idx_break"]]
     session = get_session(time_sig)
+    # Distance calculée depuis le close du breakout (cohérent avec dist_atr)
     dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
     
     df_context = df.iloc[:sig["idx_break"]+1]
@@ -334,7 +343,10 @@ def build_pipeline_payload_v58(df, inst, inst_disp, tf_name, sig, trend, atr_val
         "status": statut,
         "confluence_score": sig["score"],
         "level": round(float(sig["level"]), instrument_precision(inst)),
+        # Prix ancré sur la bougie du breakout (stationnaire)
         "close_price": round(float(sig["close_price"]), instrument_precision(inst)),
+        # Prix courant au moment du scan (informatif pour le Cascade System)
+        "current_price": round(float(sig["current_price"]), instrument_precision(inst)),
         "distance_pct": round(dist_pct, 4) if dist_pct is not None else None,
         "distance_atr_multiple": round(sig["dist_atr"], 2),
         "volatility": volatilite,
@@ -405,17 +417,30 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True, disable
         with st.spinner(f"Scan en cours sur {n_combos} combinaisons…"):
             results, pipeline_signals, errors = [], [], []
             with ThreadPoolExecutor(max_workers=6) as executor:
-                futures = {executor.submit(get_candles, inst, tf_code): (inst, tf_name) for inst in INSTRUMENTS for tf_name, tf_code in TIMEFRAMES.items()}
-                try: completed_iter = as_completed(futures, timeout=SCAN_GLOBAL_TIMEOUT)
-                except FuturesTimeoutError:
-                    st.warning("Timeout global atteint — résultats partiels.")
-                    completed_iter = []
+                futures = {
+                    executor.submit(get_candles, inst, tf_code): (inst, tf_name)
+                    for inst in INSTRUMENTS
+                    for tf_name, tf_code in TIMEFRAMES.items()
+                }
 
-                for future in completed_iter:
+                # FIX #2 : wait() sépare explicitement done / not_done
+                # Plus de perte de résultats déjà complétés en cas de timeout global
+                done, not_done = wait(futures.keys(), timeout=SCAN_GLOBAL_TIMEOUT)
+                if not_done:
+                    st.warning(f"Timeout global atteint — {len(not_done)} requête(s) ignorée(s), résultats partiels.")
+                    for f in not_done:
+                        f.cancel()
+
+                for future in done:
                     inst, tf_name = futures[future]
-                    try: df = future.result(timeout=FUTURE_RESULT_TIMEOUT)
-                    except FuturesTimeoutError: errors.append(f"{inst}/{tf_name}: timeout"); continue
-                    except Exception as e: errors.append(f"{inst}/{tf_name}: {e}"); continue
+                    try:
+                        df = future.result(timeout=FUTURE_RESULT_TIMEOUT)
+                    except FuturesTimeoutError:
+                        errors.append(f"{inst}/{tf_name}: timeout")
+                        continue
+                    except Exception as e:
+                        errors.append(f"{inst}/{tf_name}: {e}")
+                        continue
                     if df is None: continue
 
                     sig = detect_choch_v58(df, tf_name, inst)
@@ -427,6 +452,7 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True, disable
                     df_sub = df.iloc[:sig["idx_break"]+1]
                     _, volatilite = calc_atr_bundle(df_sub, inst)
                     bb_str = compute_bb_width(df_sub)
+                    # Distance affichée = depuis le close du breakout (cohérent avec le filtre)
                     dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
                     inst_display = inst.replace("_", "/")
                     statut = compute_statut(sig["idx_break"], len(df), tf_name)
@@ -454,43 +480,68 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True, disable
             if results:
                 df_sorted = pd.DataFrame(results).sort_values("_time_sort", ascending=False)
                 before_dedup = len(df_sorted)
-                df_result = df_sorted.drop_duplicates(subset=["Instrument", "Timeframe"], keep="first").drop(columns=["_time_sort"]).reset_index(drop=True)
-                if before_dedup > len(df_result): logger.warning(f"{before_dedup - len(df_result)} doublon(s) éliminé(s)")
+                # FIX #3 : déduplication sur (Instrument, Timeframe, Type, Ordre)
+                # Avant : subset=["Instrument","Timeframe"] — éliminait CHoCH si BOS présent sur même paire/TF
+                # Après : deux signaux de nature différente sur la même paire/TF sont conservés
+                df_result = (
+                    df_sorted
+                    .drop_duplicates(subset=["Instrument", "Timeframe", "Type", "Ordre"], keep="first")
+                    .drop(columns=["_time_sort"])
+                    .reset_index(drop=True)
+                )
+                if before_dedup > len(df_result):
+                    logger.warning(f"{before_dedup - len(df_result)} doublon(s) éliminé(s)")
                 st.session_state.df = df_result
                 st.session_state.pipeline_signals = pipeline_signals
-                st.session_state.png_buf = None
+                st.session_state.png_buf = None  # reset — sera généré à la demande
                 st.success(f"Scan terminé – {len(df_result)} signaux sur {n_combos} combinaisons | {len(pipeline_signals)} dans le pipeline JSON")
-            else: st.info("Aucun signal CHoCH/BOS récent qualifié (Score ≥ 65)")
-    except Exception as e: st.error(f"Erreur critique : {e}"); logger.exception(e)
-    finally: st.session_state.scanning = False
+            else:
+                st.info("Aucun signal CHoCH/BOS récent qualifié (Score ≥ 65)")
+    except Exception as e:
+        st.error(f"Erreur critique : {e}")
+        logger.exception(e)
+    finally:
+        st.session_state.scanning = False
 
 if "df" in st.session_state:
     df_all = st.session_state.df.copy()
-    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     df_export = df_all[df_all["Statut"].isin(["Fresh", "Aged"])].copy()
     pipeline_signals = st.session_state.get("pipeline_signals", [])
     scan_time_meta = st.session_state.get("scan_time", datetime.now(timezone.utc))
-
-    if st.session_state.get("png_buf") is None: st.session_state.png_buf = generate_png(df_all, DISPLAY_COLS)
 
     n_stale = len(df_all[df_all["Statut"] == "Stale"])
     if n_stale > 0: st.info(f"{n_stale} signal(s) Stale visible(s) dans le tableau — exclus des exports.")
 
     col1, col2, col3, col4 = st.columns(4)
-    with col1: st.download_button("CSV", df_export[[c for c in EXPORT_COLS if c in df_export.columns]].to_csv(index=False).encode(), f"choch_{ts}.csv", "text/csv")
+    with col1:
+        st.download_button("CSV", df_export[[c for c in EXPORT_COLS if c in df_export.columns]].to_csv(index=False).encode(), f"choch_{ts}.csv", "text/csv")
     with col2:
+        # FIX #4 : PNG généré à la demande (lazy) — pas de blocage du thread principal après chaque scan
+        if st.session_state.get("png_buf") is None:
+            st.session_state.png_buf = generate_png(df_all, DISPLAY_COLS)
         st.session_state.png_buf.seek(0)
         st.download_button("PNG", st.session_state.png_buf, f"choch_{ts}.png", "image/png")
-    with col3: st.download_button("PDF", create_pdf(df_export), f"choch_signaux_{ts}.pdf", "application/pdf")
+    with col3:
+        st.download_button("PDF", create_pdf(df_export), f"choch_signaux_{ts}.pdf", "application/pdf")
     with col4:
-        pipeline_json = json.dumps({"meta": {"scanner_version": SCANNER_VERSION, "generated_at": scan_time_meta.isoformat(), "signal_count": len(pipeline_signals)}, "signals": pipeline_signals}, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        pipeline_json = json.dumps({
+            "meta": {
+                "scanner_version": SCANNER_VERSION,
+                "generated_at": scan_time_meta.isoformat(),
+                "signal_count": len(pipeline_signals)
+            },
+            "signals": pipeline_signals
+        }, ensure_ascii=False, indent=2, default=str).encode("utf-8")
         st.download_button("JSON", pipeline_json, f"choch_pipeline_{ts}.json", "application/json")
 
     def style_bb(val): return "color:#ff9800;font-weight:bold" if "Squeeze" in str(val) else "color:#ab47bc;font-weight:bold" if "Expansion" in str(val) else "color:#90a4ae"
     def style_distance(val):
         try:
-            v = float(str(val).replace("%", "")); return "color:#00c853;font-weight:bold" if v <= 0.15 else "color:#ff9800;font-weight:bold" if v <= 0.40 else "color:#ff5252;font-weight:bold"
-        except: return "color:#90a4ae"
+            v = float(str(val).replace("%", ""))
+            return "color:#00c853;font-weight:bold" if v <= 0.15 else "color:#ff9800;font-weight:bold" if v <= 0.40 else "color:#ff5252;font-weight:bold"
+        except:
+            return "color:#90a4ae"
 
     cols_display = [c for c in DISPLAY_COLS if c in df_all.columns]
     st.dataframe(
@@ -505,4 +556,5 @@ if "df" in st.session_state:
     )
 
     if pipeline_signals:
-        with st.expander(f"Aperçu JSON Pipeline ({len(pipeline_signals)} signaux Fresh/Aged)"): st.json(pipeline_signals[0])
+        with st.expander(f"Aperçu JSON Pipeline ({len(pipeline_signals)} signaux Fresh/Aged)"):
+            st.json(pipeline_signals[0])
