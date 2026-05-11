@@ -254,16 +254,21 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[dict]:
             hl = [s for s in prev_swings if s["kind"]=="HL"]
             if hl and c[idx] < hl[-1]["price"] and c[idx-1] >= hl[-1]["price"]:
                 sig_type, direction, level = "CHoCH", "Bearish", hl[-1]["price"]
-            hh = [s for s in prev_swings if s["kind"]=="HH"]
-            if hh and c[idx] > hh[-1]["price"] and c[idx-1] <= hh[-1]["price"]:
-                sig_type, direction, level = "BOS", "Bullish", hh[-1]["price"]
+            # FIX F-002 : elif — empêche le BOS d'écraser silencieusement un CHoCH
+            # si les deux conditions sont vraies sur la même bougie
+            else:
+                hh = [s for s in prev_swings if s["kind"]=="HH"]
+                if hh and c[idx] > hh[-1]["price"] and c[idx-1] <= hh[-1]["price"]:
+                    sig_type, direction, level = "BOS", "Bullish", hh[-1]["price"]
         elif trend == "Bearish":
             lh = [s for s in prev_swings if s["kind"]=="LH"]
             if lh and c[idx] > lh[-1]["price"] and c[idx-1] <= lh[-1]["price"]:
                 sig_type, direction, level = "CHoCH", "Bullish", lh[-1]["price"]
-            ll = [s for s in prev_swings if s["kind"]=="LL"]
-            if ll and c[idx] < ll[-1]["price"] and c[idx-1] >= ll[-1]["price"]:
-                sig_type, direction, level = "BOS", "Bearish", ll[-1]["price"]
+            # FIX F-002 : elif — même logique côté bearish
+            else:
+                ll = [s for s in prev_swings if s["kind"]=="LL"]
+                if ll and c[idx] < ll[-1]["price"] and c[idx-1] >= ll[-1]["price"]:
+                    sig_type, direction, level = "BOS", "Bearish", ll[-1]["price"]
                 
         if sig_type is None: continue
 
