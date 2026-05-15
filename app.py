@@ -319,19 +319,13 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[dict]:
         }
     return None
 
-def build_pipeline_payload_v58(df, inst, inst_disp, tf_name, sig, trend, atr_val, scan_time, len_df):
+def build_pipeline_payload_v58(df, inst, inst_disp, tf_name, sig, trend, scan_time, len_df, bb_str, volatilite, force):
     time_sig = df.index[sig["idx_break"]]
     session = get_session(time_sig)
-    # Distance calculée depuis le close du breakout (cohérent avec dist_atr)
     dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
-    
-    df_context = df.iloc[:sig["idx_break"]+1]
-    bb_str = compute_bb_width(df_context)
-    _, volatilite = calc_atr_bundle(df_context, inst)
-    
     candles_since = (len_df - 1) - sig["idx_break"]
     statut = compute_statut(sig["idx_break"], len_df, tf_name)
-    
+
     return {
         "signal_id": f"{inst}__{tf_name}__{time_sig.strftime('%Y%m%dT%H%M')}",
         "scanner_version": SCANNER_VERSION,
@@ -350,24 +344,17 @@ def build_pipeline_payload_v58(df, inst, inst_disp, tf_name, sig, trend, atr_val
         "level": round(float(sig["level"]), instrument_precision(inst)),
         # Prix ancré sur la bougie du breakout (stationnaire)
         "close_price": round(float(sig["close_price"]), instrument_precision(inst)),
-        # Prix courant au moment du scan (informatif pour le Cascade System)
+        # Prix courant au moment du scan
         "current_price": round(float(sig["current_price"]), instrument_precision(inst)),
         "distance_pct": round(dist_pct, 4) if dist_pct is not None else None,
         "distance_atr_multiple": round(sig["dist_atr"], 2),
         "volatility": volatilite,
-        "force": "Fort" if (abs(df["close"].values[sig["idx_break"]] - df["open"].values[sig["idx_break"]]) / (df["high"].values[sig["idx_break"]] - df["low"].values[sig["idx_break"]])) >= 0.6 else "Moyen",
+        "force": force,
         "bb_width_pct": bb_str.split("%")[0].replace("+","").strip() if "%" in bb_str else None,
         "bb_regime": bb_str.split("%")[-1].strip() if "%" in bb_str else "N/A",
         "session": session,
         "signal_time": time_sig.isoformat(),
         "candles_elapsed": candles_since,
-        "cross_scanner_fields": {
-            "gps_mtf_bias_h4": None,
-            "sr_nearest_zone_level": None,
-            "sr_zone_distance_pct": None,
-            "rsi_h1_value": None,
-            "rsi_divergence": False
-        }
     }
 
 # ===================== EXPORT =====================
@@ -478,7 +465,8 @@ if st.button("Lancer le Scan", type="primary", use_container_width=True, disable
 
                     if statut in ("Fresh", "Aged"):
                         pipeline_signals.append(build_pipeline_payload_v58(
-                            df, inst, inst_display, tf_name, sig, trend, sig["atr_val"], scan_time, len(df)
+                            df, inst, inst_display, tf_name, sig, trend, scan_time, len(df),
+                            bb_str, volatilite, force
                         ))
 
             if errors: st.warning(f"{len(errors)} erreur(s) : {'; '.join(errors[:5])}")
