@@ -351,7 +351,7 @@ def build_pipeline_payload_v58(df, inst, inst_disp, tf_name, sig, trend, scan_ti
         "volatility": volatilite,
         "force": force,
         "bb_width_pct": bb_str.split("%")[0].replace("+","").strip() if "%" in bb_str else None,
-        "bb_regime": bb_str.split("%")[-1].strip() if "%" in bb_str else "N/A",
+        "bb_regime": bb_str.split("%")[-1].strip().lstrip("_") if "%" in bb_str else "N/A",
         "session": session,
         "signal_time": time_sig.isoformat(),
         "candles_elapsed": candles_since,
