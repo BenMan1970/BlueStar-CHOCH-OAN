@@ -6,9 +6,15 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import datetime, timezone
 from typing import Optional
 
-import matplotlib  # noqa: E402  (must set backend before importing Figure)
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+
+# matplotlib backend must be set before any matplotlib submodule import
+import matplotlib
 matplotlib.use("Agg")
-from matplotlib.figure import Figure  # noqa: E402
+from matplotlib.figure import Figure  # noqa: E402 — intentional: backend must precede this import
 
 import numpy as np
 import pandas as pd
@@ -96,7 +102,7 @@ DISPLAY_COLS = [
     "Instrument", "Timeframe", "Type", "Ordre", "Signal",
     "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)",
 ]
-EXPORT_COLS = DISPLAY_COLS
+EXPORT_COLS = list(DISPLAY_COLS)  # independent copy — mutations on one won't affect the other
 
 GRAN_COUNT = {"H1": 400, "H4": 300, "D": 200, "W": 120}
 
@@ -184,11 +190,21 @@ def format_distance(dist_pct: Optional[float]) -> str:
     return f"{dist_pct:.3f}%"
 
 
+def _local_hour(dt: datetime, tz_name: str) -> int:
+    """Return the local hour for *dt* (UTC) in the given IANA timezone, DST-aware."""
+    return dt.astimezone(ZoneInfo(tz_name)).hour
+
+
 def get_session(dt: datetime) -> str:
-    h = dt.hour
-    london = 7 <= h < 16
-    ny = 13 <= h < 22
-    tokyo = 0 <= h < 9
+    """Return the trading session name for a UTC datetime, DST-aware."""
+    london_h = _local_hour(dt, "Europe/London")
+    ny_h = _local_hour(dt, "America/New_York")
+    tokyo_h = _local_hour(dt, "Asia/Tokyo")
+
+    london = 8 <= london_h < 17   # London open: 08:00–17:00 local (BST or GMT)
+    ny = 9 <= ny_h < 17            # NY open: 09:00–17:00 local (EDT or EST)
+    tokyo = 9 <= tokyo_h < 18      # Tokyo open: 09:00–18:00 local JST (no DST)
+
     if london and ny:
         return "London_NY_Overlap"
     if london:
@@ -215,16 +231,22 @@ def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
         candles = [c for c in req.response.get("candles", []) if c.get("complete")]
         if len(candles) < 50:
             return None
-        df = pd.DataFrame([
-            {
+        rows = []
+        for c in candles:
+            open_v, high_v, low_v, close_v = (
+                float(c["mid"]["o"]), float(c["mid"]["h"]),
+                float(c["mid"]["l"]), float(c["mid"]["c"]),
+            )
+            if not all(np.isfinite(v) for v in (open_v, high_v, low_v, close_v)):
+                logger.warning("Prix non-fini ignoré [%s/%s] t=%s", inst, gran, c["time"])
+                continue
+            rows.append({
                 "time": pd.to_datetime(c["time"], utc=True),
-                "open": float(c["mid"]["o"]),
-                "high": float(c["mid"]["h"]),
-                "low": float(c["mid"]["l"]),
-                "close": float(c["mid"]["c"]),
-            }
-            for c in candles
-        ])
+                "open": open_v, "high": high_v, "low": low_v, "close": close_v,
+            })
+        if len(rows) < 50:
+            return None
+        df = pd.DataFrame(rows)
         df.set_index("time", inplace=True)
         df = df[~df.index.duplicated(keep="last")]  # guard against duplicate timestamps
         return df
@@ -233,7 +255,7 @@ def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
             del _thread_local.api  # force re-creation on next call
         logger.warning("V20Error [%s/%s] code=%s: %s", inst, gran, exc.code, exc)
         return None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # broad catch intended: OS/SSL/DNS errors are untyped
         logger.error(
             "Erreur get_candles [%s/%s]: %s: %s", inst, gran, type(exc).__name__, exc
         )
@@ -295,6 +317,15 @@ def detect_swing_points(data: pd.DataFrame, tf: str) -> list[dict]:
             pivots.append((i, low_arr[i], "L"))
     pivots.sort(key=lambda x: x[0])
 
+    # FIX C: deduplicate pivots with identical price (equal highs/lows on illiquid markets).
+    # Keep only the rightmost occurrence per (price, kind) to avoid phantom CHoCH on noise.
+    seen: dict[tuple, int] = {}
+    for pos, (i, price, k) in enumerate(pivots):
+        seen[(price, k)] = pos  # overwrite → last (rightmost) wins
+    dedup_positions = set(seen.values())
+    pivots = [p for pos, p in enumerate(pivots) if pos in dedup_positions]
+    pivots.sort(key=lambda x: x[0])
+
     swings, prev_h, prev_l = [], None, None
     for idx, price, k in pivots:
         if k == "H":
@@ -325,35 +356,64 @@ def get_structural_trend(swings: list[dict]) -> str:
 
 # ---- detect_choch_v58 helpers ------------------------------------------------
 
+_SigResult = tuple[Optional[str], Optional[str], Optional[float]]
+_NONE_SIG: _SigResult = (None, None, None)
+
+
+def _resolve_bullish_trend(
+    close_arr: np.ndarray,
+    idx: int,
+    prev_swings: list[dict],
+) -> _SigResult:
+    """Resolve signal when structural trend is Bullish (CHoCH has priority over BOS)."""
+    hl_list = [s for s in prev_swings if s["kind"] == "HL"]
+    if hl_list:
+        ref = hl_list[-1]["price"]
+        broke_below = close_arr[idx] < ref and close_arr[idx - 1] >= ref
+        if broke_below:
+            return "CHoCH", "Bearish", ref
+    hh_list = [s for s in prev_swings if s["kind"] == "HH"]
+    if hh_list:
+        ref = hh_list[-1]["price"]
+        broke_above = close_arr[idx] > ref and close_arr[idx - 1] <= ref
+        if broke_above:
+            return "BOS", "Bullish", ref
+    return _NONE_SIG
+
+
+def _resolve_bearish_trend(
+    close_arr: np.ndarray,
+    idx: int,
+    prev_swings: list[dict],
+) -> _SigResult:
+    """Resolve signal when structural trend is Bearish (CHoCH has priority over BOS)."""
+    lh_list = [s for s in prev_swings if s["kind"] == "LH"]
+    if lh_list:
+        ref = lh_list[-1]["price"]
+        broke_above = close_arr[idx] > ref and close_arr[idx - 1] <= ref
+        if broke_above:
+            return "CHoCH", "Bullish", ref
+    ll_list = [s for s in prev_swings if s["kind"] == "LL"]
+    if ll_list:
+        ref = ll_list[-1]["price"]
+        broke_below = close_arr[idx] < ref and close_arr[idx - 1] >= ref
+        if broke_below:
+            return "BOS", "Bearish", ref
+    return _NONE_SIG
+
+
 def _resolve_signal(
     trend: str,
     close_arr: np.ndarray,
     idx: int,
     prev_swings: list[dict],
-) -> tuple[Optional[str], Optional[str], Optional[float]]:
-    """Return (sig_type, direction, level) for the candle at *idx*, or (None, None, None)."""
-    sig_type = direction = level = None
-
+) -> _SigResult:
+    """Dispatch to the trend-specific resolver and return (sig_type, direction, level)."""
     if trend == "Bullish":
-        hl_list = [s for s in prev_swings if s["kind"] == "HL"]
-        if hl_list and close_arr[idx] < hl_list[-1]["price"] and close_arr[idx - 1] >= hl_list[-1]["price"]:
-            # FIX F-002: CHoCH takes priority; BOS only checked in else branch
-            sig_type, direction, level = "CHoCH", "Bearish", hl_list[-1]["price"]
-        else:
-            hh_list = [s for s in prev_swings if s["kind"] == "HH"]
-            if hh_list and close_arr[idx] > hh_list[-1]["price"] and close_arr[idx - 1] <= hh_list[-1]["price"]:
-                sig_type, direction, level = "BOS", "Bullish", hh_list[-1]["price"]
-
-    elif trend == "Bearish":
-        lh_list = [s for s in prev_swings if s["kind"] == "LH"]
-        if lh_list and close_arr[idx] > lh_list[-1]["price"] and close_arr[idx - 1] <= lh_list[-1]["price"]:
-            sig_type, direction, level = "CHoCH", "Bullish", lh_list[-1]["price"]
-        else:
-            ll_list = [s for s in prev_swings if s["kind"] == "LL"]
-            if ll_list and close_arr[idx] < ll_list[-1]["price"] and close_arr[idx - 1] >= ll_list[-1]["price"]:
-                sig_type, direction, level = "BOS", "Bearish", ll_list[-1]["price"]
-
-    return sig_type, direction, level
+        return _resolve_bullish_trend(close_arr, idx, prev_swings)
+    if trend == "Bearish":
+        return _resolve_bearish_trend(close_arr, idx, prev_swings)
+    return _NONE_SIG
 
 
 def _has_valid_body(
@@ -456,8 +516,13 @@ def detect_choch_v58(
         if not _has_valid_body(high_arr, low_arr, close_arr, open_arr, idx):
             continue
 
-        has_sweep = _detect_liquidity_sweep(
-            high_arr, low_arr, idx, prev_swings, atr_val, direction
+        # Liquidity sweep: only relevant for CHoCH (counter-trend breakout).
+        # A BOS is a continuation move — no stop-hunt logic applies.
+        has_sweep = (
+            sig_type == "CHoCH"
+            and _detect_liquidity_sweep(
+                high_arr, low_arr, idx, prev_swings, atr_val, direction
+            )
         )
 
         # FIX #1: distance anchored on the breakout candle, not on c[-1]
@@ -479,6 +544,7 @@ def detect_choch_v58(
             "has_sweep": has_sweep,
             "atr_val": atr_val,
             "volatilite": volatilite_label,  # FIX ATR: same value used for filtering
+            "trend": trend,                  # FIX A: avoid recomputing swing/trend in UI loop
             "dist_atr": dist_atr,
             "score": score,
         }
@@ -501,6 +567,7 @@ def build_pipeline_payload_v58(
     time_sig = df.index[sig["idx_break"]]
     session = get_session(time_sig)
     dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
+    current_dist_pct = calc_distance_pct(sig["level"], sig["current_price"])
     candles_since = (len_df - 1) - sig["idx_break"]
     statut = compute_statut(sig["idx_break"], len_df, tf_name)
     prec = instrument_precision(inst)
@@ -528,6 +595,7 @@ def build_pipeline_payload_v58(
         "close_price": round(float(sig["close_price"]), prec),
         "current_price": round(float(sig["current_price"]), prec),
         "distance_pct": round(dist_pct, 4) if dist_pct is not None else None,
+        "current_distance_pct": round(current_dist_pct, 4) if current_dist_pct is not None else None,
         "distance_atr_multiple": round(sig["dist_atr"], 2),
         "volatility": volatilite,
         "force": force,
@@ -673,7 +741,7 @@ if st.button(
                     except FuturesTimeoutError:
                         errors.append(f"{inst}/{tf_name}: timeout")
                         continue
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:  # broad catch intended: any worker exception must be caught
                         errors.append(f"{inst}/{tf_name}: {exc}")
                         continue
                     if df is None:
@@ -683,7 +751,7 @@ if st.button(
                     if not sig:
                         continue
 
-                    trend = get_structural_trend(detect_swing_points(df, tf_name))
+                    trend = sig["trend"]  # FIX A: reuse trend computed during detection
 
                     # Construction payload UI
                     df_sub = df.iloc[: sig["idx_break"] + 1]
