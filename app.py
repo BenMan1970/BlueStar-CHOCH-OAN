@@ -226,8 +226,11 @@ def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
             for c in candles
         ])
         df.set_index("time", inplace=True)
+        df = df[~df.index.duplicated(keep="last")]  # guard against duplicate timestamps
         return df
     except V20Error as exc:
+        if exc.code == 401 and hasattr(_thread_local, "api"):
+            del _thread_local.api  # force re-creation on next call
         logger.warning("V20Error [%s/%s] code=%s: %s", inst, gran, exc.code, exc)
         return None
     except Exception as exc:  # noqa: BLE001
@@ -433,7 +436,7 @@ def detect_choch_v58(
     open_arr = df["open"].values
     n = len(close_arr)
 
-    atr_val, _ = calc_atr_bundle(df, inst)
+    atr_val, volatilite_label = calc_atr_bundle(df, inst)
     if np.isnan(atr_val) or atr_val <= 0:
         return None
 
@@ -475,6 +478,7 @@ def detect_choch_v58(
             "current_price": close_arr[-1],  # current price kept for informational use
             "has_sweep": has_sweep,
             "atr_val": atr_val,
+            "volatilite": volatilite_label,  # FIX ATR: same value used for filtering
             "dist_atr": dist_atr,
             "score": score,
         }
@@ -501,7 +505,8 @@ def build_pipeline_payload_v58(
     statut = compute_statut(sig["idx_break"], len_df, tf_name)
     prec = instrument_precision(inst)
 
-    bb_pct = bb_str.split("%")[0].replace("+", "").strip() if "%" in bb_str else None
+    _bb_raw = bb_str.split("%")[0].replace("+", "").strip() if "%" in bb_str else None
+    bb_pct = float(_bb_raw) if _bb_raw is not None else None
     bb_regime = bb_str.split("%")[-1].strip().lstrip("_") if "%" in bb_str else "N/A"
 
     return {
@@ -535,6 +540,17 @@ def build_pipeline_payload_v58(
 
 
 # ===================== EXPORT =====================
+
+def _json_default(obj: object) -> object:
+    """JSON serializer that maps NaN/Inf to null and numpy scalars to Python natives."""
+    if isinstance(obj, float) and (np.isnan(obj) or np.isinf(obj)):
+        return None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        val = float(obj)
+        return None if (np.isnan(val) or np.isinf(val)) else val
+    return str(obj)
 
 def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
     buffer = io.BytesIO()
@@ -671,7 +687,7 @@ if st.button(
 
                     # Construction payload UI
                     df_sub = df.iloc[: sig["idx_break"] + 1]
-                    _, volatilite = calc_atr_bundle(df_sub, inst)
+                    volatilite = sig["volatilite"]  # FIX ATR: reuse value from detection
                     bb_str = compute_bb_width(df_sub)
                     dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
                     inst_display = inst.replace("_", "/")
@@ -744,6 +760,7 @@ if st.button(
                 st.session_state.df = df_result
                 st.session_state.pipeline_signals = pipeline_signals
                 st.session_state.png_buf = None  # reset — generated on demand
+                st.session_state.pdf_buf = None  # reset — generated on demand
                 st.success(
                     f"Scan terminé – {len(df_result)} signaux sur {n_combos} "
                     f"combinaisons | {len(pipeline_signals)} dans le pipeline JSON"
@@ -787,9 +804,12 @@ if "df" in st.session_state:
             "PNG", st.session_state.png_buf, f"choch_{ts}.png", "image/png"
         )
     with col3:
+        if st.session_state.get("pdf_buf") is None:
+            st.session_state.pdf_buf = create_pdf(df_export)
+        st.session_state.pdf_buf.seek(0)
         st.download_button(
             "PDF",
-            create_pdf(df_export),
+            st.session_state.pdf_buf,
             f"choch_signaux_{ts}.pdf",
             "application/pdf",
         )
@@ -805,7 +825,7 @@ if "df" in st.session_state:
             },
             ensure_ascii=False,
             indent=2,
-            default=str,
+            default=_json_default,
         ).encode("utf-8")
         st.download_button(
             "JSON",
