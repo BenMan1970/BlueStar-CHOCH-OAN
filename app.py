@@ -1,3 +1,20 @@
+"""
+CHoCH Scanner v5.9 — Change of Character & Break of Structure detector.
+
+Scans 33 Forex/Index instruments across 4 timeframes (H1, H4, D1, Weekly)
+using the OANDA v20 REST API. Signals are scored by confluence and exported
+as CSV, PNG, PDF and a structured JSON pipeline payload.
+
+Architecture
+------------
+- Config       : module-level constants (INSTRUMENTS, TF_STATUT, …)
+- API layer    : _get_api / get_candles (thread-safe, per-thread instance)
+- Indicators   : calc_atr_bundle, compute_bb_width, detect_swing_points
+- Detection    : detect_choch_v58 and its helpers (_resolve_*, _has_valid_body, …)
+- Payload      : build_pipeline_payload_v58
+- Export       : create_pdf, generate_png, _json_default
+- UI           : Streamlit scan button, dataframe, download buttons
+"""
 import io
 import json
 import logging
@@ -220,6 +237,29 @@ def is_premium_session(s: str) -> bool:
     return s in ("London", "NewYork", "London_NY_Overlap")
 
 
+def _parse_candle_row(c: dict, inst: str, gran: str) -> Optional[dict]:
+    """Parse and validate one OANDA candle dict.
+
+    Returns a row dict suitable for DataFrame construction, or None when
+    the candle is malformed (missing keys) or contains non-finite prices.
+    """
+    try:
+        open_v = float(c["mid"]["o"])
+        high_v = float(c["mid"]["h"])
+        low_v  = float(c["mid"]["l"])
+        close_v = float(c["mid"]["c"])
+    except (KeyError, ValueError):
+        logger.warning("Bougie malformée ignorée [%s/%s] t=%s", inst, gran, c.get("time"))
+        return None
+    if not all(np.isfinite(v) for v in (open_v, high_v, low_v, close_v)):
+        logger.warning("Prix non-fini ignoré [%s/%s] t=%s", inst, gran, c.get("time"))
+        return None
+    return {
+        "time": pd.to_datetime(c["time"], utc=True),
+        "open": open_v, "high": high_v, "low": low_v, "close": close_v,
+    }
+
+
 def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
     count = GRAN_COUNT.get(gran, 300)
     try:
@@ -231,19 +271,7 @@ def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
         candles = [c for c in req.response.get("candles", []) if c.get("complete")]
         if len(candles) < 50:
             return None
-        rows = []
-        for c in candles:
-            open_v, high_v, low_v, close_v = (
-                float(c["mid"]["o"]), float(c["mid"]["h"]),
-                float(c["mid"]["l"]), float(c["mid"]["c"]),
-            )
-            if not all(np.isfinite(v) for v in (open_v, high_v, low_v, close_v)):
-                logger.warning("Prix non-fini ignoré [%s/%s] t=%s", inst, gran, c["time"])
-                continue
-            rows.append({
-                "time": pd.to_datetime(c["time"], utc=True),
-                "open": open_v, "high": high_v, "low": low_v, "close": close_v,
-            })
+        rows = [r for c in candles if (r := _parse_candle_row(c, inst, gran)) is not None]
         if len(rows) < 50:
             return None
         df = pd.DataFrame(rows)
@@ -301,6 +329,23 @@ def compute_statut(idx_sig: Optional[int], len_df: int, tf: str) -> str:
 
 # ===================== CORE V5.9 =====================
 
+def _classify_swings(pivots: list) -> list[dict]:
+    """Classify sorted (idx, price, kind) pivot tuples into HH/LH/HL/LL swing dicts."""
+    swings: list[dict] = []
+    prev_h: Optional[float] = None
+    prev_l: Optional[float] = None
+    for idx, price, k in pivots:
+        if k == "H":
+            kind = "HH" if (prev_h is None or price > prev_h) else "LH"
+            swings.append({"idx": idx, "price": price, "kind": kind})
+            prev_h = price
+        else:
+            kind = "HL" if (prev_l is None or price > prev_l) else "LL"
+            swings.append({"idx": idx, "price": price, "kind": kind})
+            prev_l = price
+    return swings
+
+
 def detect_swing_points(data: pd.DataFrame, tf: str) -> list[dict]:
     lookback = SWING_LOOKBACK.get(tf, 5)
     history = SWING_HISTORY.get(tf, 60)
@@ -325,18 +370,7 @@ def detect_swing_points(data: pd.DataFrame, tf: str) -> list[dict]:
     dedup_positions = set(seen.values())
     pivots = [p for pos, p in enumerate(pivots) if pos in dedup_positions]
     pivots.sort(key=lambda x: x[0])
-
-    swings, prev_h, prev_l = [], None, None
-    for idx, price, k in pivots:
-        if k == "H":
-            kind = "HH" if (prev_h is None or price > prev_h) else "LH"
-            swings.append({"idx": idx, "price": price, "kind": kind})
-            prev_h = price
-        else:
-            kind = "HL" if (prev_l is None or price > prev_l) else "LL"
-            swings.append({"idx": idx, "price": price, "kind": kind})
-            prev_l = price
-    return swings
+    return _classify_swings(pivots)
 
 
 def get_structural_trend(swings: list[dict]) -> str:
@@ -369,13 +403,13 @@ def _resolve_bullish_trend(
     hl_list = [s for s in prev_swings if s["kind"] == "HL"]
     if hl_list:
         ref = hl_list[-1]["price"]
-        broke_below = close_arr[idx] < ref and close_arr[idx - 1] >= ref
+        broke_below = close_arr[idx] < ref <= close_arr[idx - 1]
         if broke_below:
             return "CHoCH", "Bearish", ref
     hh_list = [s for s in prev_swings if s["kind"] == "HH"]
     if hh_list:
         ref = hh_list[-1]["price"]
-        broke_above = close_arr[idx] > ref and close_arr[idx - 1] <= ref
+        broke_above = close_arr[idx - 1] <= ref < close_arr[idx]
         if broke_above:
             return "BOS", "Bullish", ref
     return _NONE_SIG
@@ -390,13 +424,13 @@ def _resolve_bearish_trend(
     lh_list = [s for s in prev_swings if s["kind"] == "LH"]
     if lh_list:
         ref = lh_list[-1]["price"]
-        broke_above = close_arr[idx] > ref and close_arr[idx - 1] <= ref
+        broke_above = close_arr[idx - 1] <= ref < close_arr[idx]
         if broke_above:
             return "CHoCH", "Bullish", ref
     ll_list = [s for s in prev_swings if s["kind"] == "LL"]
     if ll_list:
         ref = ll_list[-1]["price"]
-        broke_below = close_arr[idx] < ref and close_arr[idx - 1] >= ref
+        broke_below = close_arr[idx] < ref <= close_arr[idx - 1]
         if broke_below:
             return "BOS", "Bearish", ref
     return _NONE_SIG
@@ -609,7 +643,9 @@ def build_pipeline_payload_v58(
         "close_price": round(float(sig["close_price"]), prec),
         "current_price": round(float(sig["current_price"]), prec),
         "distance_pct": round(dist_pct, 4) if dist_pct is not None else None,
-        "current_distance_pct": round(current_dist_pct, 4) if current_dist_pct is not None else None,
+        "current_distance_pct": (
+            round(current_dist_pct, 4) if current_dist_pct is not None else None
+        ),
         "distance_atr_multiple": round(sig["dist_atr"], 2),
         "volatility": volatilite,
         "force": force,
@@ -755,7 +791,7 @@ if st.button(
                     except FuturesTimeoutError:
                         errors.append(f"{inst}/{tf_name}: timeout")
                         continue
-                    except Exception as exc:  # broad catch intended: any worker exception must be caught
+                    except Exception as exc:  # broad catch: any worker exception must be surfaced
                         errors.append(f"{inst}/{tf_name}: {exc}")
                         continue
                     if df is None:
