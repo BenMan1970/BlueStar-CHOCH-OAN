@@ -34,7 +34,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
-SCANNER_VERSION = "5.8"
+SCANNER_VERSION = "5.9"
 
 # ===================== CONFIG =====================
 INSTRUMENTS = [
@@ -299,7 +299,7 @@ def compute_statut(idx_sig: Optional[int], len_df: int, tf: str) -> str:
     return "Stale"
 
 
-# ===================== CORE V5.8 =====================
+# ===================== CORE V5.9 =====================
 
 def detect_swing_points(data: pd.DataFrame, tf: str) -> list[dict]:
     lookback = SWING_LOOKBACK.get(tf, 5)
@@ -534,17 +534,28 @@ def detect_choch_v58(
         if score < MIN_SCORE:
             continue
 
+        # Body ratio — computed once here, reused in UI loop and payload
+        rng_v = high_arr[idx] - low_arr[idx]
+        body_v = abs(close_arr[idx] - open_arr[idx])
+        if rng_v > 0 and body_v / rng_v >= 0.6:
+            force_label = "Fort"
+        elif rng_v > 0 and body_v / rng_v >= 0.4:
+            force_label = "Moyen"
+        else:
+            force_label = "Faible"
+
         return {
             "sig_type": sig_type,
             "direction": direction,
             "level": level,
             "idx_break": idx,
-            "close_price": close_arr[idx],   # FIX #1: breakout candle price
-            "current_price": close_arr[-1],  # current price kept for informational use
+            "close_price": close_arr[idx],
+            "current_price": close_arr[-1],
             "has_sweep": has_sweep,
             "atr_val": atr_val,
-            "volatilite": volatilite_label,  # FIX ATR: same value used for filtering
-            "trend": trend,                  # FIX A: avoid recomputing swing/trend in UI loop
+            "volatilite": volatilite_label,
+            "trend": trend,
+            "force": force_label,            # P3: single source of truth for body strength
             "dist_atr": dist_atr,
             "score": score,
         }
@@ -577,7 +588,10 @@ def build_pipeline_payload_v58(
     bb_regime = bb_str.split("%")[-1].strip().lstrip("_") if "%" in bb_str else "N/A"
 
     return {
-        "signal_id": f"{inst}__{tf_name}__{time_sig.strftime('%Y%m%dT%H%M')}",
+        "signal_id": (
+            f"{inst}__{tf_name}__{time_sig.strftime('%Y%m%dT%H%M')}"
+            f"__scan{scan_time.strftime('%Y%m%dT%H%M')}"
+        ),
         "scanner_version": SCANNER_VERSION,
         "generated_at": scan_time.isoformat(),
         "pair": inst_disp,
@@ -669,7 +683,7 @@ def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
 
 
 def generate_png(data: pd.DataFrame, display_cols: list) -> io.BytesIO:
-    fig = Figure(figsize=(22, max(5, len(data) * 0.35)))
+    fig = Figure(figsize=(22, min(max(5, len(data) * 0.35), 50)))
     ax = fig.add_subplot(111)
     ax.axis("off")
     disp = data[[c for c in display_cols if c in data.columns]]
@@ -689,10 +703,10 @@ def generate_png(data: pd.DataFrame, display_cols: list) -> io.BytesIO:
 
 
 # ===================== UI =====================
-st.set_page_config(page_title="CHoCH Scanner v5.8", layout="wide")
+st.set_page_config(page_title="CHoCH Scanner v5.9", layout="wide")
 st.markdown(
     "<h1 style='text-align:center;color:#1e40af;margin-bottom:30px;'>"
-    "Scanner Change of Character (CHoCH) — v5.8 Intraday</h1>",
+    "Scanner Change of Character (CHoCH) — v5.9 Intraday</h1>",
     unsafe_allow_html=True,
 )
 
@@ -751,29 +765,16 @@ if st.button(
                     if not sig:
                         continue
 
-                    trend = sig["trend"]  # FIX A: reuse trend computed during detection
+                    trend = sig["trend"]
+                    volatilite = sig["volatilite"]
+                    force = sig["force"]         # P3: reuse value computed during detection
 
                     # Construction payload UI
-                    df_sub = df.iloc[: sig["idx_break"] + 1]
-                    volatilite = sig["volatilite"]  # FIX ATR: reuse value from detection
-                    bb_str = compute_bb_width(df_sub)
-                    dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
                     inst_display = inst.replace("_", "/")
                     statut = compute_statut(sig["idx_break"], len(df), tf_name)
-                    rng = (
-                        df["high"].values[sig["idx_break"]]
-                        - df["low"].values[sig["idx_break"]]
-                    )
-                    body = abs(
-                        df["close"].values[sig["idx_break"]]
-                        - df["open"].values[sig["idx_break"]]
-                    )
-                    if rng > 0 and body / rng >= 0.6:
-                        force = "Fort"
-                    elif rng > 0 and body / rng >= 0.4:
-                        force = "Moyen"
-                    else:
-                        force = "Faible"
+                    df_sub = df.iloc[: sig["idx_break"] + 1]
+                    bb_str = compute_bb_width(df_sub)
+                    dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
 
                     results.append({
                         "Instrument": inst_display,
@@ -867,17 +868,15 @@ if "df" in st.session_state:
         # FIX #4: PNG generated lazily — no main-thread blocking after each scan
         if st.session_state.get("png_buf") is None:
             st.session_state.png_buf = generate_png(df_all, DISPLAY_COLS)
-        st.session_state.png_buf.seek(0)
         st.download_button(
-            "PNG", st.session_state.png_buf, f"choch_{ts}.png", "image/png"
+            "PNG", st.session_state.png_buf.getvalue(), f"choch_{ts}.png", "image/png"
         )
     with col3:
         if st.session_state.get("pdf_buf") is None:
             st.session_state.pdf_buf = create_pdf(df_export)
-        st.session_state.pdf_buf.seek(0)
         st.download_button(
             "PDF",
-            st.session_state.pdf_buf,
+            st.session_state.pdf_buf.getvalue(),
             f"choch_signaux_{ts}.pdf",
             "application/pdf",
         )
