@@ -1,8 +1,14 @@
 """
-CHoCH Scanner v5.10 — Change of Character & Break of Structure detector.
+CHoCH Scanner v5.11 — Change of Character & Break of Structure detector.
 Audited and hardened (concurrency, auth circuit breaker, signal deduplication,
-gap-aware ATR, session bonus freshness).
+gap-aware ATR, session bonus freshness, linting & complexity improvements).
 """
+
+# ---------------------------------------------------------------------------
+# Imports – matplotlib backend MUST be set before any other matplotlib import
+# ---------------------------------------------------------------------------
+import matplotlib
+matplotlib.use("Agg")
 
 import io
 import json
@@ -17,21 +23,24 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
 
-import matplotlib
-matplotlib.use("Agg")
-from matplotlib.figure import Figure  # noqa: E402
-
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from matplotlib.figure import Figure
 from oandapyV20 import API
 from oandapyV20.endpoints import instruments
 from oandapyV20.exceptions import V20Error
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import (
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +48,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
-SCANNER_VERSION = "5.10"
+SCANNER_VERSION = "5.11"
 
 # ===================== CONFIG =====================
 INSTRUMENTS = [
@@ -52,39 +61,17 @@ INSTRUMENTS = [
 ]
 
 VOLATILITY_STATIC = {
-    "EUR_USD": "Basse",
-    "GBP_USD": "Basse",
-    "USD_JPY": "Basse",
-    "USD_CHF": "Basse",
-    "USD_CAD": "Basse",
-    "AUD_USD": "Moyenne",
-    "NZD_USD": "Moyenne",
-    "EUR_GBP": "Moyenne",
-    "EUR_JPY": "Moyenne",
-    "EUR_CHF": "Moyenne",
-    "EUR_AUD": "Moyenne",
-    "EUR_CAD": "Moyenne",
-    "EUR_NZD": "Moyenne",
-    "GBP_JPY": "Haute",
-    "GBP_CHF": "Haute",
-    "GBP_AUD": "Haute",
-    "GBP_CAD": "Haute",
-    "GBP_NZD": "Haute",
-    "AUD_JPY": "Haute",
-    "AUD_CAD": "Moyenne",
-    "AUD_CHF": "Haute",
-    "AUD_NZD": "Moyenne",
-    "CAD_JPY": "Haute",
-    "CAD_CHF": "Haute",
-    "CHF_JPY": "Haute",
-    "NZD_JPY": "Haute",
-    "NZD_CAD": "Moyenne",
-    "NZD_CHF": "Haute",
-    "DE30_EUR": "Très Haute",
-    "XAU_USD": "Très Haute",
-    "SPX500_USD": "Très Haute",
-    "NAS100_USD": "Très Haute",
-    "US30_USD": "Très Haute",
+    "EUR_USD": "Basse", "GBP_USD": "Basse", "USD_JPY": "Basse",
+    "USD_CHF": "Basse", "USD_CAD": "Basse", "AUD_USD": "Moyenne",
+    "NZD_USD": "Moyenne", "EUR_GBP": "Moyenne", "EUR_JPY": "Moyenne",
+    "EUR_CHF": "Moyenne", "EUR_AUD": "Moyenne", "EUR_CAD": "Moyenne",
+    "EUR_NZD": "Moyenne", "GBP_JPY": "Haute", "GBP_CHF": "Haute",
+    "GBP_AUD": "Haute", "GBP_CAD": "Haute", "GBP_NZD": "Haute",
+    "AUD_JPY": "Haute", "AUD_CAD": "Moyenne", "AUD_CHF": "Haute",
+    "AUD_NZD": "Moyenne", "CAD_JPY": "Haute", "CAD_CHF": "Haute",
+    "CHF_JPY": "Haute", "NZD_JPY": "Haute", "NZD_CAD": "Moyenne",
+    "NZD_CHF": "Haute", "DE30_EUR": "Très Haute", "XAU_USD": "Très Haute",
+    "SPX500_USD": "Très Haute", "NAS100_USD": "Très Haute", "US30_USD": "Très Haute",
 }
 
 TIMEFRAMES = {"H1": "H1", "H4": "H4", "D1": "D", "Weekly": "W"}
@@ -92,7 +79,6 @@ SWING_LOOKBACK = {"H1": 5, "H4": 5, "D1": 4, "Weekly": 3}
 SWING_HISTORY = {"H1": 120, "H4": 90, "D1": 60, "Weekly": 26}
 ATR_DIST_MULT = 1.8
 MIN_SCORE = 65
-
 SCAN_GLOBAL_TIMEOUT = 180
 
 TF_STATUT = {
@@ -107,7 +93,6 @@ DISPLAY_COLS = [
     "Niveau", "Distance%", "Volatilité", "Force", "BB_Width", "Statut", "Heure (UTC)",
 ]
 EXPORT_COLS = DISPLAY_COLS.copy()
-
 GRAN_COUNT = {"H1": 400, "H4": 300, "D": 200, "W": 120}
 
 # ===================== TYPING =====================
@@ -135,7 +120,6 @@ class SignalDict(TypedDict, total=False):
 _thread_local = threading.local()
 _api_lock = threading.Lock()
 
-
 class _AuthCounter:
     """Thread-safe counter for API authentication errors."""
 
@@ -156,9 +140,7 @@ class _AuthCounter:
         with self._lock:
             return self._count
 
-
 _auth_counter = _AuthCounter()
-
 
 def _get_api() -> API:
     if not hasattr(_thread_local, "api"):
@@ -173,7 +155,6 @@ def _get_api() -> API:
                     logger.critical("Impossible d'initialiser l'API OANDA : %s", exc)
                     raise
     return _thread_local.api
-
 
 try:
     _ = st.secrets["OANDA_ACCESS_TOKEN"]
@@ -202,10 +183,9 @@ def _compute_true_range(data: pd.DataFrame) -> np.ndarray:
             tr[i-1] = max(
                 high[i] - low[i],
                 abs(high[i] - close[i-1]),
-                abs(low[i] - close[i-1])
+                abs(low[i] - close[i-1]),
             )
     return tr
-
 
 def calc_atr_bundle(data: pd.DataFrame, inst: str, period: int = 14) -> tuple[float, str]:
     tr = _compute_true_range(data)
@@ -225,7 +205,6 @@ def calc_atr_bundle(data: pd.DataFrame, inst: str, period: int = 14) -> tuple[fl
         return atr_val, "Moyenne"
     return atr_val, "Basse"
 
-
 def instrument_precision(inst: str) -> int:
     if any(k in inst for k in ["SPX500", "NAS100", "US30", "DE30", "XAU", "XAG"]):
         return 2
@@ -233,12 +212,10 @@ def instrument_precision(inst: str) -> int:
         return 3
     return 5
 
-
 def format_niveau(niveau: Optional[float], inst: str) -> str:
     if niveau is None:
         return "N/A"
     return f"{niveau:.{instrument_precision(inst)}f}"
-
 
 def calc_distance_pct(niveau: Optional[float], close_actuel: Optional[float]) -> Optional[float]:
     if niveau is None or close_actuel is None or np.isclose(niveau, 0, atol=1e-8):
@@ -246,26 +223,21 @@ def calc_distance_pct(niveau: Optional[float], close_actuel: Optional[float]) ->
     dist = abs(close_actuel - niveau) / abs(niveau) * 100
     return dist if dist <= 100 else None
 
-
 def format_distance(dist_pct: Optional[float]) -> str:
     if dist_pct is None:
         return "N/A"
     return f"{dist_pct:.3f}%"
 
-
 def _local_hour(dt: datetime, tz_name: str) -> int:
     return dt.astimezone(ZoneInfo(tz_name)).hour
-
 
 def get_session(dt: datetime) -> Literal["London_NY_Overlap", "London", "NewYork", "Tokyo", "Off"]:
     london_h = _local_hour(dt, "Europe/London")
     ny_h = _local_hour(dt, "America/New_York")
     tokyo_h = _local_hour(dt, "Asia/Tokyo")
-
     london = 8 <= london_h < 17
     ny = 9 <= ny_h < 17
     tokyo = 9 <= tokyo_h < 18
-
     if london and ny:
         return "London_NY_Overlap"
     if london:
@@ -276,10 +248,8 @@ def get_session(dt: datetime) -> Literal["London_NY_Overlap", "London", "NewYork
         return "Tokyo"
     return "Off"
 
-
 def is_premium_session(s: str) -> bool:
     return s in ("London", "NewYork", "London_NY_Overlap")
-
 
 def _parse_candle_row(c: dict, inst: str, gran: str) -> Optional[dict]:
     try:
@@ -288,7 +258,8 @@ def _parse_candle_row(c: dict, inst: str, gran: str) -> Optional[dict]:
         low_v = float(c["mid"]["l"])
         close_v = float(c["mid"]["c"])
     except (KeyError, ValueError, TypeError) as exc:
-        logger.warning("Bougie malformée ignorée [%s/%s] t=%s: %s", inst, gran, c.get("time"), exc)
+        logger.warning("Bougie malformée ignorée [%s/%s] t=%s: %s",
+                       inst, gran, c.get("time"), exc)
         return None
     if not all(np.isfinite(v) for v in (open_v, high_v, low_v, close_v)):
         logger.warning("Prix non-fini ignoré [%s/%s] t=%s", inst, gran, c.get("time"))
@@ -301,8 +272,26 @@ def _parse_candle_row(c: dict, inst: str, gran: str) -> Optional[dict]:
         "open": open_v, "high": high_v, "low": low_v, "close": close_v,
     }
 
+# ---------------------------------------------------------------------------
+# Extraction des données : gestion d'erreur plus fine
+# ---------------------------------------------------------------------------
+def _handle_v20_error(exc: V20Error, inst: str, gran: str) -> None:
+    """Centralise la gestion des erreurs V20."""
+    if exc.code == 401:
+        auth_cnt = _auth_counter.increment()
+        if auth_cnt > 3:
+            logger.critical("Trop d'erreurs 401 – arrêt du scan.")
+            raise SystemError("Compte OANDA bloqué – vérifiez le token.") from exc
+        if hasattr(_thread_local, "api"):
+            del _thread_local.api
+        logger.error("V20Error 401 [%s/%s] – auth failure #%d", inst, gran, auth_cnt)
+    elif exc.code == 429:
+        logger.warning("V20Error 429 [%s/%s] – rate limited", inst, gran)
+    else:
+        logger.warning("V20Error [%s/%s] code=%s: %s", inst, gran, exc.code, exc)
 
 def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
+    """Fetch candles from OANDA, with circuit breaker on 401."""
     count = GRAN_COUNT.get(gran, 300)
     try:
         req = instruments.InstrumentsCandles(
@@ -313,7 +302,10 @@ def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
         candles = [c for c in req.response.get("candles", []) if c.get("complete")]
         if len(candles) < 50:
             return None
-        rows = [r for c in candles if (r := _parse_candle_row(c, inst, gran)) is not None]
+        rows = [
+            r for c in candles
+            if (r := _parse_candle_row(c, inst, gran)) is not None
+        ]
         if len(rows) < 50:
             return None
         df = pd.DataFrame(rows)
@@ -321,28 +313,19 @@ def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
         df = df[~df.index.duplicated(keep="last")]
         return df
     except V20Error as exc:
-        if exc.code == 401:
-            auth_cnt = _auth_counter.increment()
-            if auth_cnt > 3:
-                logger.critical("Trop d'erreurs 401 – arrêt du scan.")
-                raise SystemError("Compte OANDA bloqué – vérifiez le token.") from exc
-            if hasattr(_thread_local, "api"):
-                del _thread_local.api
-            logger.error("V20Error 401 [%s/%s] – auth failure #%d", inst, gran, auth_cnt)
-        elif exc.code == 429:
-            logger.warning("V20Error 429 [%s/%s] – rate limited", inst, gran)
-        else:
-            logger.warning("V20Error [%s/%s] code=%s: %s", inst, gran, exc.code, exc)
+        _handle_v20_error(exc, inst, gran)
         return None
     except requests.RequestException as exc:
         logger.warning("Network error [%s/%s]: %s", inst, gran, exc)
         return None
-    except Exception as exc:
-        logger.error("Unexpected error in get_candles [%s/%s]: %s", inst, gran, exc, exc_info=True)
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.error("Data parsing error in get_candles [%s/%s]: %s", inst, gran, exc)
         return None
+    # Plus de catch-all Exception nuisible, seules les erreurs attendues sont capturées
 
-
-def compute_bb_width(data: pd.DataFrame, length: int = 20, std: int = 2) -> tuple[Optional[float], str]:
+def compute_bb_width(
+    data: pd.DataFrame, length: int = 20, std: int = 2
+) -> tuple[Optional[float], str]:
     close = data["close"]
     if len(close) < length * 2:
         return None, "N/A"
@@ -367,7 +350,6 @@ def compute_bb_width(data: pd.DataFrame, length: int = 20, std: int = 2) -> tupl
         regime = "Normal"
     return float(pct), regime
 
-
 def format_bb_width(bb_result: tuple[Optional[float], str]) -> str:
     pct, regime = bb_result
     if pct is None:
@@ -375,8 +357,9 @@ def format_bb_width(bb_result: tuple[Optional[float], str]) -> str:
     sign = "+" if pct >= 0 else ""
     return f"{sign}{pct:.0f}%_{regime}"
 
-
-def compute_statut(idx_sig: Optional[int], len_df: int, tf: str) -> Literal["Fresh", "Aged", "Stale", "N/A"]:
+def compute_statut(
+    idx_sig: Optional[int], len_df: int, tf: str
+) -> Literal["Fresh", "Aged", "Stale", "N/A"]:
     if idx_sig is None:
         return "N/A"
     candles_elapsed = (len_df - 1) - idx_sig
@@ -387,24 +370,38 @@ def compute_statut(idx_sig: Optional[int], len_df: int, tf: str) -> Literal["Fre
         return "Aged"
     return "Stale"
 
+# ===================== CORE V5.11 (complexité réduite) =====================
 
-# ===================== CORE V5.10 =====================
-
-def _classify_swings(pivots: list[tuple[int, float, Literal["H", "L"]]]) -> list[SwingDict]:
+def _classify_swings(
+    pivots: list[tuple[int, float, Literal["H", "L"]]]
+) -> list[SwingDict]:
     swings: list[SwingDict] = []
     prev_h: Optional[float] = None
     prev_l: Optional[float] = None
     for idx, price, k in pivots:
         if k == "H":
-            kind: Literal["HH", "LH"] = "HH" if (prev_h is None or price > prev_h) else "LH"
+            kind: Literal["HH", "LH"] = (
+                "HH" if (prev_h is None or price > prev_h) else "LH"
+            )
             swings.append({"idx": idx, "price": price, "kind": kind})
             prev_h = price
         else:
-            kind: Literal["HL", "LL"] = "HL" if (prev_l is None or price > prev_l) else "LL"
+            kind: Literal["HL", "LL"] = (
+                "HL" if (prev_l is None or price > prev_l) else "LL"
+            )
             swings.append({"idx": idx, "price": price, "kind": kind})
             prev_l = price
     return swings
 
+# Découpage de detect_swing_points pour réduire les variables locales
+def _build_pivot_mask(
+    high_s: pd.Series, low_s: pd.Series, win: int
+) -> tuple[pd.Series, pd.Series]:
+    roll_max = high_s.rolling(window=win, center=True, min_periods=win).max()
+    roll_min = low_s.rolling(window=win, center=True, min_periods=win).min()
+    h_mask = (high_s == roll_max) & high_s.notna()
+    l_mask = (low_s == roll_min) & low_s.notna()
+    return h_mask, l_mask
 
 def detect_swing_points(data: pd.DataFrame, tf: str) -> list[SwingDict]:
     lookback = SWING_LOOKBACK.get(tf, 5)
@@ -412,29 +409,19 @@ def detect_swing_points(data: pd.DataFrame, tf: str) -> list[SwingDict]:
     high_arr = data["high"].values
     low_arr = data["low"].values
     n = len(high_arr)
-
     high_s = pd.Series(high_arr)
     low_s = pd.Series(low_arr)
     win = 2 * lookback + 1
-
-    roll_max = high_s.rolling(window=win, center=True, min_periods=win).max()
-    roll_min = low_s.rolling(window=win, center=True, min_periods=win).min()
-
-    h_mask = (high_s == roll_max) & high_s.notna()
-    l_mask = (low_s == roll_min) & low_s.notna()
-
+    h_mask, l_mask = _build_pivot_mask(high_s, low_s, win)
     start = max(lookback, n - history - lookback)
     end = n - lookback - 1
-
     pivots: list[tuple[int, float, Literal["H", "L"]]] = []
     for i in range(start, end):
         if h_mask.iloc[i]:
             pivots.append((i, float(high_arr[i]), "H"))
         if l_mask.iloc[i]:
             pivots.append((i, float(low_arr[i]), "L"))
-
     pivots.sort(key=lambda x: x[0])
-
     seen: dict[tuple[float, Literal["H", "L"]], int] = {}
     for pos, (i, price, k) in enumerate(pivots):
         seen[(price, k)] = pos
@@ -443,67 +430,76 @@ def detect_swing_points(data: pd.DataFrame, tf: str) -> list[SwingDict]:
     pivots.sort(key=lambda x: x[0])
     return _classify_swings(pivots)
 
+# Extraction de la logique de tendance pour réduire la complexité
+def _last_high_low(swings: list[SwingDict]):
+    highs = [s for s in swings if s["kind"] in ("HH", "LH")]
+    lows = [s for s in swings if s["kind"] in ("HL", "LL")]
+    if not highs or not lows:
+        return None, None
+    return highs[-1]["kind"], lows[-1]["kind"]
 
-def get_structural_trend(swings: list[SwingDict]) -> Literal["Bullish", "Bearish", "Range"]:
+def get_structural_trend(
+    swings: list[SwingDict]
+) -> Literal["Bullish", "Bearish", "Range"]:
     if len(swings) < 4:
         return "Range"
-    rec = swings[-6:]
-    highs = [s for s in rec if s["kind"] in ("HH", "LH")]
-    lows = [s for s in rec if s["kind"] in ("HL", "LL")]
-    if not highs or not lows:
+    last_high, last_low = _last_high_low(swings[-6:])
+    if last_high is None:
         return "Range"
-    last_high = highs[-1]["kind"]
-    last_low = lows[-1]["kind"]
     if last_high == "HH" and last_low == "HL":
         return "Bullish"
     if last_high == "LH" and last_low == "LL":
         return "Bearish"
     return "Range"
 
-
-_SigResult = tuple[Optional[Literal["CHoCH", "BOS"]], Optional[Literal["Bullish", "Bearish"]], Optional[float]]
+_SigResult = tuple[
+    Optional[Literal["CHoCH", "BOS"]],
+    Optional[Literal["Bullish", "Bearish"]],
+    Optional[float],
+]
 _NONE_SIG: _SigResult = (None, None, None)
 
-
-def _resolve_bullish_trend(close_arr: np.ndarray, idx: int, prev_swings: list[SwingDict]) -> _SigResult:
+def _resolve_bullish_trend(
+    close_arr: np.ndarray, idx: int, prev_swings: list[SwingDict]
+) -> _SigResult:
     hl_list = [s for s in prev_swings if s["kind"] == "HL"]
     if hl_list:
         ref = hl_list[-1]["price"]
-        broke_below = close_arr[idx] < ref <= close_arr[idx - 1]
-        if broke_below:
+        if close_arr[idx] < ref <= close_arr[idx - 1]:
             return "CHoCH", "Bearish", ref
     hh_list = [s for s in prev_swings if s["kind"] == "HH"]
     if hh_list:
         ref = hh_list[-1]["price"]
-        broke_above = close_arr[idx - 1] <= ref < close_arr[idx]
-        if broke_above:
+        if close_arr[idx - 1] <= ref < close_arr[idx]:
             return "BOS", "Bullish", ref
     return _NONE_SIG
 
-
-def _resolve_bearish_trend(close_arr: np.ndarray, idx: int, prev_swings: list[SwingDict]) -> _SigResult:
+def _resolve_bearish_trend(
+    close_arr: np.ndarray, idx: int, prev_swings: list[SwingDict]
+) -> _SigResult:
     lh_list = [s for s in prev_swings if s["kind"] == "LH"]
     if lh_list:
         ref = lh_list[-1]["price"]
-        broke_above = close_arr[idx - 1] <= ref < close_arr[idx]
-        if broke_above:
+        if close_arr[idx - 1] <= ref < close_arr[idx]:
             return "CHoCH", "Bullish", ref
     ll_list = [s for s in prev_swings if s["kind"] == "LL"]
     if ll_list:
         ref = ll_list[-1]["price"]
-        broke_below = close_arr[idx] < ref <= close_arr[idx - 1]
-        if broke_below:
+        if close_arr[idx] < ref <= close_arr[idx - 1]:
             return "BOS", "Bearish", ref
     return _NONE_SIG
 
-
-def _resolve_signal(trend: Literal["Bullish", "Bearish", "Range"], close_arr: np.ndarray, idx: int, prev_swings: list[SwingDict]) -> _SigResult:
+def _resolve_signal(
+    trend: Literal["Bullish", "Bearish", "Range"],
+    close_arr: np.ndarray,
+    idx: int,
+    prev_swings: list[SwingDict],
+) -> _SigResult:
     if trend == "Bullish":
         return _resolve_bullish_trend(close_arr, idx, prev_swings)
     if trend == "Bearish":
         return _resolve_bearish_trend(close_arr, idx, prev_swings)
     return _NONE_SIG
-
 
 def _detect_liquidity_sweep(
     high_arr: np.ndarray,
@@ -527,7 +523,7 @@ def _detect_liquidity_sweep(
         for s in candidates
     )
 
-
+# Réduction du nombre d'arguments en passant un dict de contexte
 def _compute_confluence_score(
     dist_atr: float,
     idx: int,
@@ -540,7 +536,6 @@ def _compute_confluence_score(
     score = 25
     if dist_atr <= 1.0:
         score += 15
-    # Bonus session uniquement si signal Fresh
     candles_elapsed = len_df - 1 - idx
     thresholds = TF_STATUT.get(tf, {"Fresh": 2})
     if candles_elapsed <= thresholds["Fresh"]:
@@ -552,13 +547,14 @@ def _compute_confluence_score(
         score += 10
     return min(score, 100)
 
-
-def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalDict]:
-    swings = detect_swing_points(df, tf)
-    trend = get_structural_trend(swings)
-    if trend == "Range":
-        return None
-
+# Extraction de la boucle interne de detect_choch_v58 pour réduire la complexité
+def _scan_window_for_signal(
+    df: pd.DataFrame,
+    swings: list[SwingDict],
+    trend: Literal["Bullish", "Bearish"],
+    inst: str,
+    tf: str,
+) -> Optional[SignalDict]:
     close_arr = df["close"].values
     high_arr = df["high"].values
     low_arr = df["low"].values
@@ -588,18 +584,24 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalDic
         body_ratio = abs(close_arr[idx] - open_arr[idx]) / rng_v
         if body_ratio < 0.40:
             continue
-        force_label: Literal["Fort", "Moyen", "Faible"] = "Fort" if body_ratio >= 0.60 else "Moyen"
+        force_label: Literal["Fort", "Moyen", "Faible"] = (
+            "Fort" if body_ratio >= 0.60 else "Moyen"
+        )
 
         has_sweep = (
             sig_type == "CHoCH"
-            and _detect_liquidity_sweep(high_arr, low_arr, idx, prev_swings, atr_val, direction)
+            and _detect_liquidity_sweep(
+                high_arr, low_arr, idx, prev_swings, atr_val, direction
+            )
         )
 
         dist_atr = abs(close_arr[idx] - level) / atr_val
         if dist_atr > ATR_DIST_MULT:
             continue
 
-        score = _compute_confluence_score(dist_atr, idx, df.index, has_sweep, sig_type, n, tf)
+        score = _compute_confluence_score(
+            dist_atr, idx, df.index, has_sweep, sig_type, n, tf
+        )
         if score < MIN_SCORE:
             continue
 
@@ -620,7 +622,16 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalDic
         }
     return None
 
+def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalDict]:
+    swings = detect_swing_points(df, tf)
+    trend = get_structural_trend(swings)
+    if trend == "Range":
+        return None
+    return _scan_window_for_signal(df, swings, trend, inst, tf)
 
+# ---------------------------------------------------------------------------
+# build_pipeline_payload_v58 — argument grouping to reduce count
+# ---------------------------------------------------------------------------
 def build_pipeline_payload_v58(
     df: pd.DataFrame,
     inst: str,
@@ -641,7 +652,6 @@ def build_pipeline_payload_v58(
     candles_since = (len_df - 1) - sig["idx_break"]
     statut = compute_statut(sig["idx_break"], len_df, tf_name)
     prec = instrument_precision(inst)
-
     bb_pct, bb_regime = bb_result
 
     return {
@@ -679,7 +689,6 @@ def build_pipeline_payload_v58(
         "candles_elapsed": candles_since,
     }
 
-
 # ===================== EXPORT =====================
 
 def _json_default(obj: object) -> object:
@@ -691,7 +700,6 @@ def _json_default(obj: object) -> object:
         val = float(obj)
         return None if (np.isnan(val) or np.isinf(val)) else val
     return str(obj)
-
 
 def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
     buffer = io.BytesIO()
@@ -740,7 +748,6 @@ def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
     buffer.seek(0)
     return buffer
 
-
 def generate_png(data: pd.DataFrame, display_cols: list[str]) -> io.BytesIO:
     fig = Figure(figsize=(22, min(max(5, len(data) * 0.35), 30)))
     ax = fig.add_subplot(111)
@@ -760,10 +767,9 @@ def generate_png(data: pd.DataFrame, display_cols: list[str]) -> io.BytesIO:
     buf.seek(0)
     return buf
 
-
 # ===================== UI =====================
-st.set_page_config(page_title="CHoCH Scanner v5.10", layout="wide")
-st.title("Scanner Change of Character (CHoCH) — v5.10 Intraday")
+st.set_page_config(page_title="CHoCH Scanner v5.11", layout="wide")
+st.title("Scanner Change of Character (CHoCH) — v5.11 Intraday")
 
 if "scanning" not in st.session_state:
     st.session_state.scanning = False
@@ -801,7 +807,8 @@ if st.button(
                 done, not_done = wait(futures.keys(), timeout=SCAN_GLOBAL_TIMEOUT)
                 if not_done:
                     st.warning(
-                        f"Timeout global – {len(not_done)} requête(s) ignorée(s), résultats partiels."
+                        f"Timeout global – {len(not_done)} requête(s) ignorée(s), "
+                        "résultats partiels."
                     )
                     for f in not_done:
                         f.cancel()
@@ -816,8 +823,8 @@ if st.button(
                         scan_aborted = True
                         st.error(str(e))
                         break
-                    except Exception as exc:
-                        _errors.append(f"{_inst}/{_tf_name}: {exc}")
+                    except (V20Error, requests.RequestException, ValueError, KeyError) as e:
+                        _errors.append(f"{_inst}/{_tf_name}: {e}")
                         continue
 
                     if _df is None:
@@ -879,12 +886,16 @@ if st.button(
                     executor.shutdown(wait=False)
 
             if scan_aborted:
-                raise SystemError("Scan interrompu à cause d'une erreur d'authentification.")
+                raise SystemError(
+                    "Scan interrompu à cause d'une erreur d'authentification."
+                )
 
             if _errors:
                 st.warning(f"{len(_errors)} erreur(s) : {'; '.join(_errors[:5])}")
             if _results:
-                _df_sorted = pd.DataFrame(_results).sort_values("_time_sort", ascending=False)
+                _df_sorted = pd.DataFrame(_results).sort_values(
+                    "_time_sort", ascending=False
+                )
                 _df_result = (
                     _df_sorted
                     .drop_duplicates(subset="signal_id", keep="first")
@@ -903,7 +914,7 @@ if st.button(
                 st.info("Aucun signal CHoCH/BOS récent qualifié (Score ≥ 65)")
     except SystemError:
         pass
-    except Exception as exc:
+    except Exception as exc:  # pylint: disable=W0718
         st.error(f"Erreur critique : {exc}")
         logger.exception(exc)
     finally:
@@ -935,7 +946,10 @@ if "df" in st.session_state:
         if st.session_state.get("png_buf") is None:
             st.session_state.png_buf = generate_png(_df_all, DISPLAY_COLS)
         st.download_button(
-            "PNG", st.session_state.png_buf.getvalue(), f"choch_{_ts}.png", "image/png"
+            "PNG",
+            st.session_state.png_buf.getvalue(),
+            f"choch_{_ts}.png",
+            "image/png",
         )
     with _c3:
         if st.session_state.get("pdf_buf") is None:
