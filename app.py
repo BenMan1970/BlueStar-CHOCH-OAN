@@ -1,5 +1,5 @@
 """
-CHoCH Scanner v5.13 — Monolith, fully audited & hardened.
+CHoCH Scanner v5.14 — Monolith, fully audited & hardened.
 (Modules fusionnés pour compatibilité Streamlit Cloud)
 """
 # pylint: disable=wrong-import-position, wrong-import-order, import-error
@@ -13,6 +13,11 @@ import threading
 from concurrent.futures import CancelledError, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Literal, Optional, TypedDict
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
 
 import numpy as np
 import pandas as pd
@@ -39,7 +44,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
-SCANNER_VERSION = "5.13"
+SCANNER_VERSION = "5.14"
 
 # ===================== CONFIG =====================
 INSTRUMENTS = [
@@ -208,7 +213,9 @@ def format_niveau(niveau: Optional[float], inst: str) -> str:
         return "N/A"
     return f"{niveau:.{instrument_precision(inst)}f}"
 
-def calc_distance_pct(niveau: Optional[float], close_actuel: Optional[float]) -> Optional[float]:
+def calc_distance_pct(
+    niveau: Optional[float], close_actuel: Optional[float]
+) -> Optional[float]:
     if niveau is None or close_actuel is None or np.isclose(niveau, 0, atol=1e-8):
         return None
     dist = abs(close_actuel - niveau) / abs(niveau) * 100
@@ -219,14 +226,12 @@ def format_distance(dist_pct: Optional[float]) -> str:
         return "N/A"
     return f"{dist_pct:.3f}%"
 
-def _local_hour(dt, tz_name: str) -> int:
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        from backports.zoneinfo import ZoneInfo
+def _local_hour(dt: datetime, tz_name: str) -> int:
     return dt.astimezone(ZoneInfo(tz_name)).hour
 
-def get_session(dt) -> Literal["London_NY_Overlap", "London", "NewYork", "Tokyo", "Off"]:
+def get_session(
+    dt: datetime,
+) -> Literal["London_NY_Overlap", "London", "NewYork", "Tokyo", "Off"]:
     london_h = _local_hour(dt, "Europe/London")
     ny_h = _local_hour(dt, "America/New_York")
     tokyo_h = _local_hour(dt, "Asia/Tokyo")
@@ -253,18 +258,25 @@ def _parse_candle_row(c: dict, inst: str, gran: str) -> Optional[dict]:
         low_v = float(c["mid"]["l"])
         close_v = float(c["mid"]["c"])
     except (KeyError, ValueError, TypeError) as exc:
-        logger.warning("Bougie malformée ignorée [%s/%s] t=%s: %s",
-                       inst, gran, c.get("time"), exc)
+        logger.warning(
+            "Bougie malformée ignorée [%s/%s] t=%s: %s",
+            inst, gran, c.get("time"), exc,
+        )
         return None
     if not all(np.isfinite(v) for v in (open_v, high_v, low_v, close_v)):
         logger.warning("Prix non-fini ignoré [%s/%s] t=%s", inst, gran, c.get("time"))
         return None
     if low_v > min(open_v, close_v) or max(open_v, close_v) > high_v:
-        logger.warning("OHLC incohérent ignoré [%s/%s] t=%s", inst, gran, c.get("time"))
+        logger.warning(
+            "OHLC incohérent ignoré [%s/%s] t=%s", inst, gran, c.get("time")
+        )
         return None
     return {
         "time": pd.to_datetime(c["time"], utc=True),
-        "open": open_v, "high": high_v, "low": low_v, "close": close_v,
+        "open": open_v,
+        "high": high_v,
+        "low": low_v,
+        "close": close_v,
     }
 
 def _handle_v20_error(exc: V20Error, inst: str, gran: str) -> None:
@@ -275,11 +287,15 @@ def _handle_v20_error(exc: V20Error, inst: str, gran: str) -> None:
             raise SystemError("Compte OANDA bloqué – vérifiez le token.") from exc
         if hasattr(_thread_local, "api"):
             del _thread_local.api
-        logger.error("V20Error 401 [%s/%s] – auth failure #%d", inst, gran, auth_cnt)
+        logger.error(
+            "V20Error 401 [%s/%s] – auth failure #%d", inst, gran, auth_cnt
+        )
     elif exc.code == 429:
         logger.warning("V20Error 429 [%s/%s] – rate limited", inst, gran)
     else:
-        logger.warning("V20Error [%s/%s] code=%s: %s", inst, gran, exc.code, exc)
+        logger.warning(
+            "V20Error [%s/%s] code=%s: %s", inst, gran, exc.code, exc
+        )
 
 def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
     count = GRAN_COUNT.get(gran, 300)
@@ -293,7 +309,8 @@ def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
         if len(candles) < 50:
             return None
         rows = [
-            r for c in candles
+            r
+            for c in candles
             if (r := _parse_candle_row(c, inst, gran)) is not None
         ]
         if len(rows) < 50:
@@ -309,10 +326,14 @@ def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
         logger.warning("Network error [%s/%s]: %s", inst, gran, exc)
         return None
     except (ValueError, KeyError, TypeError) as exc:
-        logger.error("Data parsing error in get_candles [%s/%s]: %s", inst, gran, exc)
+        logger.error(
+            "Data parsing error in get_candles [%s/%s]: %s", inst, gran, exc
+        )
         return None
 
-def compute_bb_width(data: pd.DataFrame, length: int = 20, std: int = 2) -> tuple[Optional[float], str]:
+def compute_bb_width(
+    data: pd.DataFrame, length: int = 20, std: int = 2
+) -> tuple[Optional[float], str]:
     close = data["close"]
     if len(close) < length * 2:
         return None, "N/A"
@@ -344,7 +365,9 @@ def format_bb_width(bb_result: tuple[Optional[float], str]) -> str:
     sign = "+" if pct >= 0 else ""
     return f"{sign}{pct:.0f}%_{regime}"
 
-def compute_statut(idx_sig: Optional[int], len_df: int, tf: str) -> Literal["Fresh", "Aged", "Stale", "N/A"]:
+def compute_statut(
+    idx_sig: Optional[int], len_df: int, tf: str
+) -> Literal["Fresh", "Aged", "Stale", "N/A"]:
     if idx_sig is None:
         return "N/A"
     candles_elapsed = (len_df - 1) - idx_sig
@@ -412,7 +435,9 @@ def _last_high_low(swings: list[SwingDict]):
         return None, None
     return highs[-1]["kind"], lows[-1]["kind"]
 
-def get_structural_trend(swings: list[SwingDict]) -> Literal["Bullish", "Bearish", "Range"]:
+def get_structural_trend(
+    swings: list[SwingDict],
+) -> Literal["Bullish", "Bearish", "Range"]:
     if len(swings) < 4:
         return "Range"
     last_high, last_low = _last_high_low(swings[-6:])
@@ -466,7 +491,9 @@ def _resolve_signal(trend, close_arr, idx: int, prev_swings) -> _SigResult:
     return _NONE_SIG
 
 # pylint: disable=too-many-arguments
-def _detect_liquidity_sweep(high_arr, low_arr, idx, prev_swings, atr_val, direction) -> bool:
+def _detect_liquidity_sweep(
+    high_arr, low_arr, idx, prev_swings, atr_val, direction
+) -> bool:
     if direction == "Bearish":
         candidates = [s for s in prev_swings if s["kind"] in ("HH", "LH")]
         return any(
@@ -483,7 +510,9 @@ def _detect_liquidity_sweep(high_arr, low_arr, idx, prev_swings, atr_val, direct
 # pylint: enable=too-many-arguments
 
 # pylint: disable=too-many-arguments
-def _compute_confluence_score(dist_atr, idx, df_index, has_sweep, sig_type, len_df, tf) -> int:
+def _compute_confluence_score(
+    dist_atr, idx, df_index, has_sweep, sig_type, len_df, tf
+) -> int:
     score = 25
     if dist_atr <= 1.0:
         score += 15
@@ -501,9 +530,11 @@ def _compute_confluence_score(dist_atr, idx, df_index, has_sweep, sig_type, len_
 
 def _evaluate_candle(
     idx, close_arr, high_arr, low_arr, open_arr,
-    prev_swings, atr_val, trend, df_index, n, tf
+    prev_swings, atr_val, trend, df_index, n, tf,
 ) -> Optional[SignalDict]:
-    sig_type, direction, level = _resolve_signal(trend, close_arr, idx, prev_swings)
+    sig_type, direction, level = _resolve_signal(
+        trend, close_arr, idx, prev_swings
+    )
     if sig_type is None:
         return None
     rng_v = high_arr[idx] - low_arr[idx]
@@ -515,12 +546,16 @@ def _evaluate_candle(
     force_label = "Fort" if body_ratio >= 0.60 else "Moyen"
     has_sweep = (
         sig_type == "CHoCH"
-        and _detect_liquidity_sweep(high_arr, low_arr, idx, prev_swings, atr_val, direction)
+        and _detect_liquidity_sweep(
+            high_arr, low_arr, idx, prev_swings, atr_val, direction
+        )
     )
     dist_atr = abs(close_arr[idx] - level) / atr_val
     if dist_atr > ATR_DIST_MULT:
         return None
-    score = _compute_confluence_score(dist_atr, idx, df_index, has_sweep, sig_type, n, tf)
+    score = _compute_confluence_score(
+        dist_atr, idx, df_index, has_sweep, sig_type, n, tf
+    )
     if score < MIN_SCORE:
         return None
     return {
@@ -538,7 +573,9 @@ def _evaluate_candle(
         "score": int(score),
     }
 
-def _scan_window_for_signal(df, swings, trend, inst, tf) -> Optional[SignalDict]:
+def _scan_window_for_signal(
+    df, swings, trend, inst, tf
+) -> Optional[SignalDict]:
     close_arr = df["close"].values
     high_arr = df["high"].values
     low_arr = df["low"].values
@@ -556,7 +593,7 @@ def _scan_window_for_signal(df, swings, trend, inst, tf) -> Optional[SignalDict]
             continue
         signal = _evaluate_candle(
             idx, close_arr, high_arr, low_arr, open_arr,
-            prev_swings, atr_val, trend, df.index, n, tf
+            prev_swings, atr_val, trend, df.index, n, tf,
         )
         if signal is not None:
             signal["volatilite"] = volatilite_label
@@ -577,8 +614,12 @@ def build_pipeline_payload_v58(
 ) -> dict:
     time_sig = df.index[signal_info["idx_break"]]
     session = get_session(time_sig)
-    dist_pct = calc_distance_pct(signal_info["level"], signal_info["close_price"])
-    curr_dist_pct = calc_distance_pct(signal_info["level"], signal_info["current_price"])
+    dist_pct = calc_distance_pct(
+        signal_info["level"], signal_info["close_price"]
+    )
+    curr_dist_pct = calc_distance_pct(
+        signal_info["level"], signal_info["current_price"]
+    )
     candles_since = (len_df - 1) - signal_info["idx_break"]
     statut = compute_statut(signal_info["idx_break"], len_df, tf_name)
     prec = instrument_precision(inst)
@@ -644,7 +685,9 @@ def create_pdf(df_export: pd.DataFrame) -> io.BytesIO:
     elements = []
     styles = getSampleStyleSheet()
     elements.append(
-        Paragraph(f"Rapport des Signaux CHoCH v{SCANNER_VERSION}", styles["Title"])
+        Paragraph(
+            f"Rapport des Signaux CHoCH v{SCANNER_VERSION}", styles["Title"]
+        )
     )
     elements.append(
         Paragraph(
@@ -697,7 +740,7 @@ def generate_png(data: pd.DataFrame, display_cols: list[str]) -> io.BytesIO:
     buf.seek(0)
     return buf
 
-# ===================== UI RENDERING =====================
+# ===================== UI RENDERING (complexité < 10) =====================
 def _style_bb(val: object) -> str:
     val_str = str(val)
     if "Squeeze" in val_str:
@@ -717,55 +760,48 @@ def _style_distance(val: object) -> str:
     except (ValueError, TypeError):
         return "color:#90a4ae"
 
-def render_results() -> None:
-    _df_all = st.session_state.df.copy()
+def _render_downloads(
+    df_all: pd.DataFrame, df_export: pd.DataFrame, pipeline_signals: list,
+    scan_time_meta: datetime,
+) -> None:
+    """Affiche les boutons de téléchargement CSV, PNG, PDF, JSON."""
     _ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
-    _df_export = _df_all[_df_all["Statut"].isin(["Fresh", "Aged"])].copy()
-    _pipeline_signals = st.session_state.get("pipeline_signals", [])
-    _scan_time_meta = st.session_state.get("scan_time", datetime.now(timezone.utc))
-
-    _n_stale = len(_df_all[_df_all["Statut"] == "Stale"])
-    if _n_stale > 0:
-        st.info(
-            f"{_n_stale} signal(s) Stale visible(s) dans le tableau — exclus des exports."
-        )
-
-    _c1, _c2, _c3, _c4 = st.columns(4)
-    with _c1:
-        _csv_cols = [c for c in EXPORT_COLS if c in _df_export.columns]
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        csv_cols = [c for c in EXPORT_COLS if c in df_export.columns]
         st.download_button(
             "CSV",
-            _df_export[_csv_cols].to_csv(index=False).encode(),
+            df_export[csv_cols].to_csv(index=False).encode(),
             f"choch_{_ts}.csv",
             "text/csv",
         )
-    with _c2:
+    with c2:
         if st.session_state.get("png_buf") is None:
-            st.session_state.png_buf = generate_png(_df_all, DISPLAY_COLS)
+            st.session_state.png_buf = generate_png(df_all, DISPLAY_COLS)
         st.download_button(
             "PNG",
             st.session_state.png_buf.getvalue(),
             f"choch_{_ts}.png",
             "image/png",
         )
-    with _c3:
+    with c3:
         if st.session_state.get("pdf_buf") is None:
-            st.session_state.pdf_buf = create_pdf(_df_export)
+            st.session_state.pdf_buf = create_pdf(df_export)
         st.download_button(
             "PDF",
             st.session_state.pdf_buf.getvalue(),
             f"choch_signaux_{_ts}.pdf",
             "application/pdf",
         )
-    with _c4:
-        _pipeline_json = json.dumps(
+    with c4:
+        pipeline_json = json.dumps(
             {
                 "meta": {
                     "scanner_version": SCANNER_VERSION,
-                    "generated_at": _scan_time_meta.isoformat(),
-                    "signal_count": len(_pipeline_signals),
+                    "generated_at": scan_time_meta.isoformat(),
+                    "signal_count": len(pipeline_signals),
                 },
-                "signals": _pipeline_signals,
+                "signals": pipeline_signals,
             },
             ensure_ascii=False,
             indent=2,
@@ -773,14 +809,16 @@ def render_results() -> None:
         ).encode("utf-8")
         st.download_button(
             "JSON",
-            _pipeline_json,
+            pipeline_json,
             f"choch_pipeline_{_ts}.json",
             "application/json",
         )
 
-    _cols_disp = [c for c in DISPLAY_COLS if c in _df_all.columns]
-    st.dataframe(
-        _df_all[_cols_disp]
+def _render_dataframe(df_all: pd.DataFrame) -> None:
+    """Affiche le tableau principal avec le style coloré."""
+    cols_disp = [c for c in DISPLAY_COLS if c in df_all.columns]
+    styled = (
+        df_all[cols_disp]
         .style
         .map(
             lambda x: (
@@ -824,16 +862,37 @@ def render_results() -> None:
                 else ""
             ),
             subset=["Statut"],
-        ),
-        hide_index=True,
-        use_container_width=True,
+        )
+    )
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+def _render_pipeline_section(pipeline_signals: list) -> None:
+    """Affiche l'aperçu JSON si des signaux sont présents."""
+    if pipeline_signals:
+        with st.expander(
+            f"Aperçu JSON Pipeline ({len(pipeline_signals)} signaux Fresh/Aged)"
+        ):
+            st.json(pipeline_signals[0])
+
+def render_results() -> None:
+    """Point d'entrée principal pour l'affichage des résultats."""
+    _df_all = st.session_state.df.copy()
+    _df_export = _df_all[_df_all["Statut"].isin(["Fresh", "Aged"])].copy()
+    _pipeline_signals = st.session_state.get("pipeline_signals", [])
+    _scan_time_meta = st.session_state.get(
+        "scan_time", datetime.now(timezone.utc)
     )
 
-    if _pipeline_signals:
-        with st.expander(
-            f"Aperçu JSON Pipeline ({len(_pipeline_signals)} signaux Fresh/Aged)"
-        ):
-            st.json(_pipeline_signals[0])
+    _n_stale = len(_df_all[_df_all["Statut"] == "Stale"])
+    if _n_stale > 0:
+        st.info(
+            f"{_n_stale} signal(s) Stale visible(s) dans le tableau "
+            "— exclus des exports."
+        )
+
+    _render_downloads(_df_all, _df_export, _pipeline_signals, _scan_time_meta)
+    _render_dataframe(_df_all)
+    _render_pipeline_section(_pipeline_signals)
 
 # ===================== MAIN APP =====================
 st.set_page_config(page_title=f"CHoCH Scanner v{SCANNER_VERSION}", layout="wide")
@@ -891,7 +950,9 @@ if st.button(
                         scan_aborted = True
                         st.error(str(e))
                         break
-                    except (V20Error, requests.RequestException, ValueError, KeyError) as e:
+                    except (
+                        V20Error, requests.RequestException, ValueError, KeyError
+                    ) as e:
                         _errors.append(f"{_inst}/{_tf_name}: {e}")
                         continue
 
@@ -914,11 +975,14 @@ if st.button(
                     _bb_res = compute_bb_width(_df_bb)
                     _bb_str = format_bb_width(_bb_res)
 
-                    _dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
+                    _dist_pct = calc_distance_pct(
+                        sig["level"], sig["close_price"]
+                    )
                     signal_time = _df.index[sig["idx_break"]]
 
                     signal_id = (
-                        f"{_inst}__{_tf_name}__{signal_time.strftime('%Y%m%dT%H%M')}"
+                        f"{_inst}__{_tf_name}__"
+                        f"{signal_time.strftime('%Y%m%dT%H%M')}"
                         f"__{sig['sig_type']}__{sig['direction']}"
                     )
 
@@ -959,7 +1023,9 @@ if st.button(
                 )
 
             if _errors:
-                st.warning(f"{len(_errors)} erreur(s) : {'; '.join(_errors[:5])}")
+                st.warning(
+                    f"{len(_errors)} erreur(s) : {'; '.join(_errors[:5])}"
+                )
             if _results:
                 _df_sorted = pd.DataFrame(_results).sort_values(
                     "_time_sort", ascending=False
