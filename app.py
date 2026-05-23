@@ -147,7 +147,26 @@ class SignalDict(TypedDict, total=False):
 # ===================== API THREAD-SAFE =====================
 _thread_local = threading.local()
 _api_lock = threading.Lock()
-_auth_error_count = 0
+
+
+class _AuthCounter:
+    """Thread-safe counter for API authentication errors."""
+
+    def __init__(self) -> None:
+        self._count = 0
+        self._lock = threading.Lock()
+
+    def increment(self) -> int:
+        with self._lock:
+            self._count += 1
+            return self._count
+
+    def get(self) -> int:
+        with self._lock:
+            return self._count
+
+
+_auth_counter = _AuthCounter()
 
 
 def _get_api() -> API:
@@ -168,7 +187,7 @@ def _get_api() -> API:
 try:
     _ = st.secrets["OANDA_ACCESS_TOKEN"]
 except KeyError as exc:
-    st.error("Clé API OANDA manquante dans les secrets.")
+    st.error(f"Clé API OANDA manquante dans les secrets : {exc}")
     st.stop()
 
 # ===================== UTILITAIRES =====================
@@ -185,7 +204,9 @@ def _compute_true_range(data: pd.DataFrame) -> np.ndarray:
 
 
 @st.cache_data(ttl=60, max_entries=500)
-def calc_atr_bundle(data: pd.DataFrame, inst: str, period: int = 14) -> tuple[float, str]:
+def calc_atr_bundle(
+    data: pd.DataFrame, inst: str, period: int = 14
+) -> tuple[float, str]:
     tr = _compute_true_range(data)
     if len(tr) < period * 3:
         return float("nan"), VOLATILITY_STATIC.get(inst, "Moyenne")
@@ -238,7 +259,9 @@ def _local_hour(dt: datetime, tz_name: str) -> int:
     return dt.astimezone(ZoneInfo(tz_name)).hour
 
 
-def get_session(dt: datetime) -> Literal["London_NY_Overlap", "London", "NewYork", "Tokyo", "Off"]:
+def get_session(
+    dt: datetime,
+) -> Literal["London_NY_Overlap", "London", "NewYork", "Tokyo", "Off"]:
     """Return the trading session name for a UTC datetime, DST-aware."""
     london_h = _local_hour(dt, "Europe/London")
     ny_h = _local_hour(dt, "America/New_York")
@@ -272,16 +295,21 @@ def _parse_candle_row(c: dict, inst: str, gran: str) -> Optional[dict]:
     try:
         open_v = float(c["mid"]["o"])
         high_v = float(c["mid"]["h"])
-        low_v  = float(c["mid"]["l"])
+        low_v = float(c["mid"]["l"])
         close_v = float(c["mid"]["c"])
     except (KeyError, ValueError, TypeError) as exc:
-        logger.warning("Bougie malformée ignorée [%s/%s] t=%s: %s", inst, gran, c.get("time"), exc)
+        logger.warning(
+            "Bougie malformée ignorée [%s/%s] t=%s: %s", inst, gran, c.get("time"), exc
+        )
         return None
     if not all(np.isfinite(v) for v in (open_v, high_v, low_v, close_v)):
         logger.warning("Prix non-fini ignoré [%s/%s] t=%s", inst, gran, c.get("time"))
         return None
     # P3: OHLC coherence check — reject corrupted candles before they pollute indicators
-    if not (low_v <= min(open_v, close_v) <= max(open_v, close_v) <= high_v):
+    if (
+        low_v > min(open_v, close_v)
+        or max(open_v, close_v) > high_v
+    ):
         logger.warning("OHLC incohérent ignoré [%s/%s] t=%s", inst, gran, c.get("time"))
         return None
     return {
@@ -302,7 +330,10 @@ def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
         candles = [c for c in req.response.get("candles", []) if c.get("complete")]
         if len(candles) < 50:
             return None
-        rows = [r for c in candles if (r := _parse_candle_row(c, inst, gran)) is not None]
+        rows = [
+            r for c in candles
+            if (r := _parse_candle_row(c, inst, gran)) is not None
+        ]
         if len(rows) < 50:
             return None
         df = pd.DataFrame(rows)
@@ -310,14 +341,12 @@ def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
         df = df[~df.index.duplicated(keep="last")]  # guard against duplicate timestamps
         return df
     except V20Error as exc:
-        global _auth_error_count
         if exc.code == 401:
-            with _api_lock:
-                _auth_error_count += 1
+            auth_cnt = _auth_counter.increment()
             if hasattr(_thread_local, "api"):
                 del _thread_local.api  # force re-creation on next call
             logger.error(
-                "V20Error 401 [%s/%s] — auth failure #%d", inst, gran, _auth_error_count
+                "V20Error 401 [%s/%s] — auth failure #%d", inst, gran, auth_cnt
             )
         elif exc.code == 429:
             logger.warning("V20Error 429 [%s/%s] — rate limited", inst, gran)
@@ -337,7 +366,9 @@ def get_candles(inst: str, gran: str) -> Optional[pd.DataFrame]:
 
 
 @st.cache_data(ttl=60, max_entries=500)
-def compute_bb_width(data: pd.DataFrame, length: int = 20, std: int = 2) -> tuple[Optional[float], str]:
+def compute_bb_width(
+    data: pd.DataFrame, length: int = 20, std: int = 2
+) -> tuple[Optional[float], str]:
     close = data["close"]
     if len(close) < length * 2:
         return None, "N/A"
@@ -371,7 +402,9 @@ def format_bb_width(bb_result: tuple[Optional[float], str]) -> str:
     return f"{sign}{pct:.0f}%_{regime}"
 
 
-def compute_statut(idx_sig: Optional[int], len_df: int, tf: str) -> Literal["Fresh", "Aged", "Stale", "N/A"]:
+def compute_statut(
+    idx_sig: Optional[int], len_df: int, tf: str
+) -> Literal["Fresh", "Aged", "Stale", "N/A"]:
     if idx_sig is None:
         return "N/A"
     candles_elapsed = (len_df - 1) - idx_sig
@@ -385,7 +418,9 @@ def compute_statut(idx_sig: Optional[int], len_df: int, tf: str) -> Literal["Fre
 
 # ===================== CORE V5.9 =====================
 
-def _classify_swings(pivots: list[tuple[int, float, Literal["H", "L"]]]) -> list[SwingDict]:
+def _classify_swings(
+    pivots: list[tuple[int, float, Literal["H", "L"]]]
+) -> list[SwingDict]:
     """Classify sorted (idx, price, kind) pivot tuples into HH/LH/HL/LL swing dicts."""
     swings: list[SwingDict] = []
     prev_h: Optional[float] = None
@@ -411,24 +446,24 @@ def detect_swing_points(data: pd.DataFrame, tf: str) -> list[SwingDict]:
     n = len(high_arr)
 
     # P2: vectorized extrema detection using rolling windows
-    high_series = pd.Series(high_arr)
-    low_series = pd.Series(low_arr)
+    high_s = pd.Series(high_arr)
+    low_s = pd.Series(low_arr)
     win = 2 * lookback + 1
 
-    roll_max = high_series.rolling(window=win, center=True, min_periods=win).max()
-    roll_min = low_series.rolling(window=win, center=True, min_periods=win).min()
+    roll_max = high_s.rolling(window=win, center=True, min_periods=win).max()
+    roll_min = low_s.rolling(window=win, center=True, min_periods=win).min()
 
-    high_mask = (high_series == roll_max) & high_series.notna()
-    low_mask = (low_series == roll_min) & low_series.notna()
+    h_mask = (high_s == roll_max) & high_s.notna()
+    l_mask = (low_s == roll_min) & low_s.notna()
 
-    valid_start = max(lookback, n - history - lookback)
-    valid_end = n - lookback - 1
+    start = max(lookback, n - history - lookback)
+    end = n - lookback - 1
 
     pivots: list[tuple[int, float, Literal["H", "L"]]] = []
-    for i in range(valid_start, valid_end):
-        if high_mask.iloc[i]:
+    for i in range(start, end):
+        if h_mask.iloc[i]:
             pivots.append((i, float(high_arr[i]), "H"))
-        if low_mask.iloc[i]:
+        if l_mask.iloc[i]:
             pivots.append((i, float(low_arr[i]), "L"))
 
     pivots.sort(key=lambda x: x[0])
@@ -444,7 +479,9 @@ def detect_swing_points(data: pd.DataFrame, tf: str) -> list[SwingDict]:
     return _classify_swings(pivots)
 
 
-def get_structural_trend(swings: list[SwingDict]) -> Literal["Bullish", "Bearish", "Range"]:
+def get_structural_trend(
+    swings: list[SwingDict],
+) -> Literal["Bullish", "Bearish", "Range"]:
     if len(swings) < 4:
         return "Range"
     rec = swings[-6:]
@@ -452,16 +489,22 @@ def get_structural_trend(swings: list[SwingDict]) -> Literal["Bullish", "Bearish
     lows = [s for s in rec if s["kind"] in ("HL", "LL")]
     if not highs or not lows:
         return "Range"
-    if highs[-1]["kind"] == "HH" and lows[-1]["kind"] == "HL":
+    last_high = highs[-1]["kind"]
+    last_low = lows[-1]["kind"]
+    if last_high == "HH" and last_low == "HL":
         return "Bullish"
-    if highs[-1]["kind"] == "LH" and lows[-1]["kind"] == "LL":
+    if last_high == "LH" and last_low == "LL":
         return "Bearish"
     return "Range"
 
 
 # ---- detect_choch_v58 helpers ------------------------------------------------
 
-_SigResult = tuple[Optional[Literal["CHoCH", "BOS"]], Optional[Literal["Bullish", "Bearish"]], Optional[float]]
+_SigResult = tuple[
+    Optional[Literal["CHoCH", "BOS"]],
+    Optional[Literal["Bullish", "Bearish"]],
+    Optional[float],
+]
 _NONE_SIG: _SigResult = (None, None, None)
 
 
@@ -533,12 +576,14 @@ def _detect_liquidity_sweep(
     if direction == "Bearish":
         candidates = [s for s in prev_swings if s["kind"] in ("HH", "LH")]
         return any(
-            high_arr[idx] > s["price"] and (high_arr[idx] - s["price"]) > (atr_val * 0.25)
+            high_arr[idx] > s["price"]
+            and (high_arr[idx] - s["price"]) > (atr_val * 0.25)
             for s in candidates
         )
     candidates = [s for s in prev_swings if s["kind"] in ("HL", "LL")]
     return any(
-        low_arr[idx] < s["price"] and (s["price"] - low_arr[idx]) > (atr_val * 0.25)
+        low_arr[idx] < s["price"]
+        and (s["price"] - low_arr[idx]) > (atr_val * 0.25)
         for s in candidates
     )
 
@@ -564,7 +609,9 @@ def _compute_confluence_score(
 
 
 @st.cache_data(ttl=60, max_entries=500)
-def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalDict]:
+def detect_choch_v58(
+    df: pd.DataFrame, tf: str, inst: str
+) -> Optional[SignalDict]:
     """
     Detect the most recent CHoCH or BOS signal in *df*.
 
@@ -608,7 +655,7 @@ def detect_choch_v58(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalDic
         body_ratio = abs(close_arr[idx] - open_arr[idx]) / rng_v
         if body_ratio < 0.40:
             continue
-        elif body_ratio >= 0.60:
+        if body_ratio >= 0.60:
             force_label: Literal["Fort", "Moyen", "Faible"] = "Fort"
         else:
             force_label = "Moyen"
@@ -665,7 +712,7 @@ def build_pipeline_payload_v58(
     time_sig = df.index[sig["idx_break"]]
     session = get_session(time_sig)
     dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
-    current_dist_pct = calc_distance_pct(sig["level"], sig["current_price"])
+    curr_dist_pct = calc_distance_pct(sig["level"], sig["current_price"])
     candles_since = (len_df - 1) - sig["idx_break"]
     statut = compute_statut(sig["idx_break"], len_df, tf_name)
     prec = instrument_precision(inst)
@@ -695,7 +742,7 @@ def build_pipeline_payload_v58(
         "current_price": round(float(sig["current_price"]), prec),
         "distance_pct": round(dist_pct, 4) if dist_pct is not None else None,
         "current_distance_pct": (
-            round(current_dist_pct, 4) if current_dist_pct is not None else None
+            round(curr_dist_pct, 4) if curr_dist_pct is not None else None
         ),
         "distance_atr_multiple": round(sig["dist_atr"], 2),
         "volatility": volatilite,
@@ -806,19 +853,19 @@ if st.button(
     disabled=st.session_state.scanning,
 ):
     st.session_state.scanning = True
-    n_combos = len(INSTRUMENTS) * len(TIMEFRAMES)
+    NUM_COMBOS = len(INSTRUMENTS) * len(TIMEFRAMES)
     st.session_state.scan_time = datetime.now(timezone.utc)
-    scan_time = st.session_state.scan_time
+    _scan_time = st.session_state.scan_time
 
     try:
         # P5: reset stale state before scan to avoid displaying obsolete signals
         for key in ("df", "pipeline_signals", "png_buf", "pdf_buf"):
             st.session_state.pop(key, None)
 
-        with st.spinner(f"Scan en cours sur {n_combos} combinaisons…"):
-            results: list[dict] = []
-            pipeline_signals: list[dict] = []
-            errors: list[str] = []
+        with st.spinner(f"Scan en cours sur {NUM_COMBOS} combinaisons…"):
+            _results: list[dict] = []
+            _pipeline_signals: list[dict] = []
+            _errors: list[str] = []
 
             # P7: manual executor lifecycle to avoid shutdown(wait=True) freeze
             executor = ThreadPoolExecutor(max_workers=6)
@@ -841,60 +888,59 @@ if st.button(
                         f.cancel()
 
                 for future in done:
-                    inst, tf_name = futures[future]
+                    _inst, _tf_name = futures[future]
                     try:
-                        df = future.result()
-                    except Exception as exc:  # broad catch: any worker exception must be surfaced
-                        errors.append(f"{inst}/{tf_name}: {exc}")
+                        _df = future.result()
+                    except Exception as exc:
+                        _errors.append(f"{_inst}/{_tf_name}: {exc}")
                         continue
-                    if df is None:
+                    if _df is None:
                         continue
 
-                    sig = detect_choch_v58(df, tf_name, inst)
+                    sig = detect_choch_v58(_df, _tf_name, _inst)
                     if not sig:
                         continue
 
-                    trend = sig["trend"]
-                    volatilite = sig["volatilite"]
-                    force = sig["force"]
+                    _trend = sig["trend"]
+                    _vol = sig["volatilite"]
+                    _force = sig["force"]
 
-                    # Construction payload UI
-                    inst_display = inst.replace("_", "/")
-                    statut = compute_statut(sig["idx_break"], len(df), tf_name)
-                    
+                    _inst_disp = _inst.replace("_", "/")
+                    _statut = compute_statut(sig["idx_break"], len(_df), _tf_name)
+
                     # P3: pass only the tail of data needed for BB calculation
                     bb_needed = 40
                     bb_start = max(0, sig["idx_break"] + 1 - bb_needed)
-                    df_bb = df.iloc[bb_start:sig["idx_break"] + 1]
-                    bb_result = compute_bb_width(df_bb)
-                    bb_str = format_bb_width(bb_result)
-                    
-                    dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
+                    _df_bb = _df.iloc[bb_start:sig["idx_break"] + 1]
+                    _bb_res = compute_bb_width(_df_bb)
+                    _bb_str = format_bb_width(_bb_res)
 
-                    results.append({
-                        "Instrument": inst_display,
-                        "Paire": inst_display,
-                        "_time_sort": df.index[sig["idx_break"]],
-                        "Timeframe": tf_name,
+                    _dist_pct = calc_distance_pct(sig["level"], sig["close_price"])
+
+                    _results.append({
+                        "Instrument": _inst_disp,
+                        "Paire": _inst_disp,
+                        "_time_sort": _df.index[sig["idx_break"]],
+                        "Timeframe": _tf_name,
                         "Type": sig["sig_type"],
                         "Ordre": "Achat" if sig["direction"] == "Bullish" else "Vente",
                         "Signal": f"{sig['direction']} {sig['sig_type']}",
-                        "Niveau": format_niveau(sig["level"], inst),
-                        "Distance%": format_distance(dist_pct),
-                        "Volatilité": volatilite,
-                        "Force": force,
-                        "BB_Width": bb_str,
-                        "Statut": statut,
-                        "Heure (UTC)": df.index[sig["idx_break"]].strftime(
+                        "Niveau": format_niveau(sig["level"], _inst),
+                        "Distance%": format_distance(_dist_pct),
+                        "Volatilité": _vol,
+                        "Force": _force,
+                        "BB_Width": _bb_str,
+                        "Statut": _statut,
+                        "Heure (UTC)": _df.index[sig["idx_break"]].strftime(
                             "%Y-%m-%d %H:%M"
                         ),
                     })
 
-                    if statut in ("Fresh", "Aged"):
-                        pipeline_signals.append(
+                    if _statut in ("Fresh", "Aged"):
+                        _pipeline_signals.append(
                             build_pipeline_payload_v58(
-                                df, inst, inst_display, tf_name, sig, trend,
-                                scan_time, len(df), bb_result, volatilite, force,
+                                _df, _inst, _inst_disp, _tf_name, sig, _trend,
+                                _scan_time, len(_df), _bb_res, _vol, _force,
                             )
                         )
             finally:
@@ -903,17 +949,17 @@ if st.button(
                 except TypeError:
                     executor.shutdown(wait=False)
 
-            if errors:
-                st.warning(f"{len(errors)} erreur(s) : {'; '.join(errors[:5])}")
-            if results:
-                df_sorted = pd.DataFrame(results).sort_values(
+            if _errors:
+                st.warning(f"{len(_errors)} erreur(s) : {'; '.join(_errors[:5])}")
+            if _results:
+                _df_sorted = pd.DataFrame(_results).sort_values(
                     "_time_sort", ascending=False
                 )
-                before_dedup = len(df_sorted)
+                _before_dedup = len(_df_sorted)
                 # FIX #3: dedup on (Instrument, Timeframe, Type, Ordre)
                 # so CHoCH and BOS on the same pair/TF are both kept
-                df_result = (
-                    df_sorted
+                _df_result = (
+                    _df_sorted
                     .drop_duplicates(
                         subset=["Instrument", "Timeframe", "Type", "Ordre"],
                         keep="first",
@@ -921,18 +967,18 @@ if st.button(
                     .drop(columns=["_time_sort"])
                     .reset_index(drop=True)
                 )
-                if before_dedup > len(df_result):
+                if _before_dedup > len(_df_result):
                     logger.warning(
                         "%d doublon(s) éliminé(s)",
-                        before_dedup - len(df_result),
+                        _before_dedup - len(_df_result),
                     )
-                st.session_state.df = df_result
-                st.session_state.pipeline_signals = pipeline_signals
+                st.session_state.df = _df_result
+                st.session_state.pipeline_signals = _pipeline_signals
                 st.session_state.png_buf = None  # reset — generated on demand
                 st.session_state.pdf_buf = None  # reset — generated on demand
                 st.success(
-                    f"Scan terminé – {len(df_result)} signaux sur {n_combos} "
-                    f"combinaisons | {len(pipeline_signals)} dans le pipeline JSON"
+                    f"Scan terminé – {len(_df_result)} signaux sur {NUM_COMBOS} "
+                    f"combinaisons | {len(_pipeline_signals)} dans le pipeline JSON"
                 )
             else:
                 st.info("Aucun signal CHoCH/BOS récent qualifié (Score ≥ 65)")
@@ -943,52 +989,52 @@ if st.button(
         st.session_state.scanning = False
 
 if "df" in st.session_state:
-    df_all = st.session_state.df.copy()
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
-    df_export = df_all[df_all["Statut"].isin(["Fresh", "Aged"])].copy()
-    pipeline_signals = st.session_state.get("pipeline_signals", [])
-    scan_time_meta = st.session_state.get("scan_time", datetime.now(timezone.utc))
+    _df_all = st.session_state.df.copy()
+    _ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+    _df_export = _df_all[_df_all["Statut"].isin(["Fresh", "Aged"])].copy()
+    _pipeline_signals = st.session_state.get("pipeline_signals", [])
+    _scan_time_meta = st.session_state.get("scan_time", datetime.now(timezone.utc))
 
-    n_stale = len(df_all[df_all["Statut"] == "Stale"])
-    if n_stale > 0:
+    _n_stale = len(_df_all[_df_all["Statut"] == "Stale"])
+    if _n_stale > 0:
         st.info(
-            f"{n_stale} signal(s) Stale visible(s) dans le tableau — exclus des exports."
+            f"{_n_stale} signal(s) Stale visible(s) dans le tableau — exclus des exports."
         )
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        csv_cols = [c for c in EXPORT_COLS if c in df_export.columns]
+    _c1, _c2, _c3, _c4 = st.columns(4)
+    with _c1:
+        _csv_cols = [c for c in EXPORT_COLS if c in _df_export.columns]
         st.download_button(
             "CSV",
-            df_export[csv_cols].to_csv(index=False).encode(),
-            f"choch_{ts}.csv",
+            _df_export[_csv_cols].to_csv(index=False).encode(),
+            f"choch_{_ts}.csv",
             "text/csv",
         )
-    with col2:
+    with _c2:
         # FIX #4: PNG generated lazily — no main-thread blocking after each scan
         if st.session_state.get("png_buf") is None:
-            st.session_state.png_buf = generate_png(df_all, DISPLAY_COLS)
+            st.session_state.png_buf = generate_png(_df_all, DISPLAY_COLS)
         st.download_button(
-            "PNG", st.session_state.png_buf.getvalue(), f"choch_{ts}.png", "image/png"
+            "PNG", st.session_state.png_buf.getvalue(), f"choch_{_ts}.png", "image/png"
         )
-    with col3:
+    with _c3:
         if st.session_state.get("pdf_buf") is None:
-            st.session_state.pdf_buf = create_pdf(df_export)
+            st.session_state.pdf_buf = create_pdf(_df_export)
         st.download_button(
             "PDF",
             st.session_state.pdf_buf.getvalue(),
-            f"choch_signaux_{ts}.pdf",
+            f"choch_signaux_{_ts}.pdf",
             "application/pdf",
         )
-    with col4:
-        pipeline_json = json.dumps(
+    with _c4:
+        _pipeline_json = json.dumps(
             {
                 "meta": {
                     "scanner_version": SCANNER_VERSION,
-                    "generated_at": scan_time_meta.isoformat(),
-                    "signal_count": len(pipeline_signals),
+                    "generated_at": _scan_time_meta.isoformat(),
+                    "signal_count": len(_pipeline_signals),
                 },
-                "signals": pipeline_signals,
+                "signals": _pipeline_signals,
             },
             ensure_ascii=False,
             indent=2,
@@ -996,8 +1042,8 @@ if "df" in st.session_state:
         ).encode("utf-8")
         st.download_button(
             "JSON",
-            pipeline_json,
-            f"choch_pipeline_{ts}.json",
+            _pipeline_json,
+            f"choch_pipeline_{_ts}.json",
             "application/json",
         )
 
@@ -1020,9 +1066,9 @@ if "df" in st.session_state:
         except (ValueError, TypeError):
             return "color:#90a4ae"
 
-    cols_display = [c for c in DISPLAY_COLS if c in df_all.columns]
+    _cols_disp = [c for c in DISPLAY_COLS if c in _df_all.columns]
     st.dataframe(
-        df_all[cols_display]
+        _df_all[_cols_disp]
         .style
         .map(
             lambda x: (
@@ -1071,8 +1117,8 @@ if "df" in st.session_state:
         use_container_width=True,
     )
 
-    if pipeline_signals:
+    if _pipeline_signals:
         with st.expander(
-            f"Aperçu JSON Pipeline ({len(pipeline_signals)} signaux Fresh/Aged)"
+            f"Aperçu JSON Pipeline ({len(_pipeline_signals)} signaux Fresh/Aged)"
         ):
-            st.json(pipeline_signals[0])
+            st.json(_pipeline_signals[0])
