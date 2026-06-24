@@ -76,7 +76,7 @@ from reportlab.platypus import (
 # =====================================================================
 
 SCANNER_VERSION: Final[str] = "5.15"
-RULE_VERSION: Final[str] = "choch.v58.r1"  # bump on any quant rule change
+RULE_VERSION: Final[str] = "choch.v58.r3"  # r3: fix BUG-F score determinism (session bonus decoupled from Fresh status)
 
 INSTRUMENTS: Final[tuple[str, ...]] = (
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -608,7 +608,7 @@ def _compute_confluence_score(
     score = 25
     if dist_atr <= 1.0:
         score += 15
-    if statut == "Fresh" and is_premium_session(get_session(candle_time)):
+    if is_premium_session(get_session(candle_time)):
         score += 20
     if has_sweep:
         score += 15
@@ -749,7 +749,8 @@ def detect_choch(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalCore]:
         idx = n - 1 - offset
         if idx < 3:
             break
-        prev_swings = [s for s in swings if s["idx"] < idx - 2]
+        lookback = SWING_LOOKBACK.get(tf, 5)
+        prev_swings = [s for s in swings if s["idx"] <= idx - (lookback + 1)]
         if not prev_swings:
             continue
         sig = _evaluate_candle(
