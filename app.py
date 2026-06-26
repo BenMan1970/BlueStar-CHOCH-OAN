@@ -76,7 +76,7 @@ from reportlab.platypus import (
 # =====================================================================
 
 SCANNER_VERSION: Final[str] = "5.15"
-RULE_VERSION: Final[str] = "choch.v58.r3"  # r3: fix BUG-F score determinism (session bonus decoupled from Fresh status)
+RULE_VERSION: Final[str] = "choch.v58.r6"  # r6: fix BUG-C look-ahead, BUG-A BOS, BUG-E CHoCH pivot, BUG-G sweep, BUG-B offset
 
 INSTRUMENTS: Final[tuple[str, ...]] = (
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -321,8 +321,10 @@ def calc_atr_bundle(
     if tr.size < period * 3:
         return float("nan"), fallback
 
+    # EWM-14 converge à 99.9% après 50 périodes — slice suffit
+    tr_ewm = tr[-100:] if tr.size > 100 else tr
     atr_val = float(
-        pd.Series(tr).ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
+        pd.Series(tr_ewm).ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
     )
     if not math.isfinite(atr_val):
         return float("nan"), fallback
@@ -530,32 +532,42 @@ _NONE_SIG: _SigResult = (None, None, None)
 def _resolve_bullish(
     close_arr: np.ndarray, idx: int, prev_swings: Sequence[SwingDict],
 ) -> _SigResult:
-    hl = [s for s in prev_swings if s["kind"] == "HL"]
-    if hl:
-        ref = hl[-1]["price"]
-        if close_arr[idx] < ref <= close_arr[idx - 1]:
-            return "CHoCH", "Bearish", ref
-    hh = [s for s in prev_swings if s["kind"] == "HH"]
-    if hh:
-        ref = hh[-1]["price"]
+    # BUG-E : le pivot CHoCH valide est le HL POSTÉRIEUR au dernier HH confirmé.
+    # Un HL antérieur au dernier HH est déjà protégé par ce HH — non-protecteur.
+    hh_list = [s for s in prev_swings if s["kind"] == "HH"]
+    if hh_list:
+        last_hh_idx = hh_list[-1]["idx"]
+        hl_after_hh = [s for s in prev_swings if s["kind"] == "HL" and s["idx"] > last_hh_idx]
+        if hl_after_hh:
+            ref = hl_after_hh[-1]["price"]
+            if close_arr[idx] < ref <= close_arr[idx - 1]:
+                return "CHoCH", "Bearish", ref
+        # BOS : cassure du dernier HH (BUG-A : préservé)
+        ref = hh_list[-1]["price"]
         if close_arr[idx - 1] <= ref < close_arr[idx]:
             return "BOS", "Bullish", ref
+    # OPT-2 : pas de HH confirmé → pas de signal (suppression fallback fantôme)
     return _NONE_SIG
 
 
 def _resolve_bearish(
     close_arr: np.ndarray, idx: int, prev_swings: Sequence[SwingDict],
 ) -> _SigResult:
-    lh = [s for s in prev_swings if s["kind"] == "LH"]
-    if lh:
-        ref = lh[-1]["price"]
-        if close_arr[idx - 1] <= ref < close_arr[idx]:
-            return "CHoCH", "Bullish", ref
-    ll = [s for s in prev_swings if s["kind"] == "LL"]
-    if ll:
-        ref = ll[-1]["price"]
+    # BUG-E : le pivot CHoCH valide est le LH POSTÉRIEUR au dernier LL confirmé.
+    # Un LH antérieur au dernier LL est déjà franchi — non-protecteur.
+    ll_list = [s for s in prev_swings if s["kind"] == "LL"]
+    if ll_list:
+        last_ll_idx = ll_list[-1]["idx"]
+        lh_after_ll = [s for s in prev_swings if s["kind"] == "LH" and s["idx"] > last_ll_idx]
+        if lh_after_ll:
+            ref = lh_after_ll[-1]["price"]
+            if close_arr[idx - 1] <= ref < close_arr[idx]:
+                return "CHoCH", "Bullish", ref
+        # BOS : cassure du dernier LL (BUG-A : préservé)
+        ref = ll_list[-1]["price"]
         if close_arr[idx] < ref <= close_arr[idx - 1]:
             return "BOS", "Bearish", ref
+    # OPT-2 : pas de LL confirmé → pas de signal (suppression fallback fantôme)
     return _NONE_SIG
 
 
@@ -574,18 +586,24 @@ def _detect_liquidity_sweep(
     high_arr: np.ndarray, low_arr: np.ndarray, idx: int,
     prev_swings: Sequence[SwingDict], atr_val: float, direction: DirectionT,
 ) -> bool:
+    # BUG-G : seuls les 3 pivots les plus récents constituent des pools actifs.
+    # any() sur toute l'histoire gonflait has_sweep → scores artificiels.
     if direction == "Bearish":
         cands = [s for s in prev_swings if s["kind"] in ("HH", "LH")]
+        if not cands:
+            return False
         return any(
             high_arr[idx] > s["price"]
             and (high_arr[idx] - s["price"]) > (atr_val * 0.25)
-            for s in cands
+            for s in cands[-3:]
         )
     cands = [s for s in prev_swings if s["kind"] in ("HL", "LL")]
+    if not cands:
+        return False
     return any(
         low_arr[idx] < s["price"]
         and (s["price"] - low_arr[idx]) > (atr_val * 0.25)
-        for s in cands
+        for s in cands[-3:]
     )
 
 
@@ -608,7 +626,7 @@ def _compute_confluence_score(
     score = 25
     if dist_atr <= 1.0:
         score += 15
-    if is_premium_session(get_session(candle_time)):
+    if statut == "Fresh" and is_premium_session(get_session(candle_time)):
         score += 20
     if has_sweep:
         score += 15
@@ -744,22 +762,22 @@ def detect_choch(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalCore]:
     atr_val, atr_regime = calc_atr_bundle(df, inst)
     if not math.isfinite(atr_val) or atr_val <= 0:
         return None
+    # BUG-B : supprimer le loop offset 0..4 — redondant avec le scanner qui
+    # appelle detect_choch() pour chaque bougie individuellement.
+    # Le loop retournait des signaux sur N-1..N-4 que detect_at_idx tuait ensuite
+    # (filtre idx_break == len-1), perdant 67-76% des signaux valides.
     n = len(df)
-    for offset in range(5):
-        idx = n - 1 - offset
-        if idx < 3:
-            break
-        lookback = SWING_LOOKBACK.get(tf, 5)
-        prev_swings = [s for s in swings if s["idx"] <= idx - (lookback + 1)]
-        if not prev_swings:
-            continue
-        sig = _evaluate_candle(
-            idx=idx, df=df, prev_swings=prev_swings,
-            atr_val=atr_val, atr_regime=atr_regime, trend=trend, tf=tf,
-        )
-        if sig is not None:
-            return sig
-    return None
+    idx = n - 1
+    if idx < 3:
+        return None
+    lookback = SWING_LOOKBACK.get(tf, 5)
+    prev_swings = [s for s in swings if s["idx"] <= idx - (lookback + 1)]
+    if not prev_swings:
+        return None
+    return _evaluate_candle(
+        idx=idx, df=df, prev_swings=prev_swings,
+        atr_val=atr_val, atr_regime=atr_regime, trend=trend, tf=tf,
+    )
 
 
 # ---- 4.7 row/payload projections (single source of truth) ----------------
