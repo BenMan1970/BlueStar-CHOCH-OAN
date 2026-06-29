@@ -42,7 +42,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Final, Literal, Mapping, Optional, Sequence, TypedDict
@@ -76,7 +76,10 @@ from reportlab.platypus import (
 # =====================================================================
 
 SCANNER_VERSION: Final[str] = "5.15"
-RULE_VERSION: Final[str] = "choch.v58.r7"  # r7: revert BUG-B (detection window), BUG-E (CHoCH pivot over-restriction), BUG-F (session bonus coupling); preserve BUG-A (BOS), BUG-C (look-ahead), BUG-G (sweep scope)
+RULE_VERSION: Final[str] = "choch.v58.r7"
+# r7: revert BUG-B (detection window), BUG-E (CHoCH pivot over-restriction),
+# BUG-F (session bonus coupling); preserve BUG-A (BOS), BUG-C (look-ahead),
+# BUG-G (sweep scope)
 
 INSTRUMENTS: Final[tuple[str, ...]] = (
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -632,7 +635,7 @@ def compute_statut(idx_sig: Optional[int], len_df: int, tf: str) -> StatusT:
 
 def _compute_confluence_score(
     dist_atr: float, candle_time: datetime, has_sweep: bool,
-    sig_type: SigTypeT, statut: StatusT,
+    sig_type: SigTypeT, _statut: StatusT,
 ) -> int:
     score = 25
     if dist_atr <= 1.0:
@@ -640,7 +643,7 @@ def _compute_confluence_score(
     # r7: revert BUG-F. The session bonus reflects the quality of the candle's
     # formation context, which does not change as the signal ages. Coupling it
     # to statut == "Fresh" pushed valid Aged signals below MIN_SCORE, amplifying
-    # the zero-signal regression. 'statut' is kept in the signature for backward
+    # the zero-signal regression. '_statut' is kept in the signature for backward
     # stability (callers need not change), but is no longer used in scoring.
     if is_premium_session(get_session(candle_time)):
         score += 20
@@ -812,7 +815,7 @@ def _signal_id(inst: str, tf: str, sig: SignalCore) -> str:
         f"{inst}|{tf}|{sig.signal_time_utc.strftime('%Y%m%dT%H%MZ')}"
         f"|{sig.sig_type}|{sig.direction}|{RULE_VERSION}"
     )
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
     return f"{inst}__{tf}__{sig.signal_time_utc.strftime('%Y%m%dT%H%M')}__{digest}"
 
 
@@ -931,7 +934,7 @@ def _fetch_candles_raw(inst: str, gran: str) -> Optional[list[dict]]:
     max_entries=512,
 )
 def get_candles_cached(
-    inst: str, gran: str, cache_bust: int,
+    inst: str, gran: str, _cache_bust: int,
 ) -> Optional[pd.DataFrame]:
     """
     Streamlit-cached candles fetch with explicit cache_bust key.
