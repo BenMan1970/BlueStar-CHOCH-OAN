@@ -76,7 +76,7 @@ from reportlab.platypus import (
 # =====================================================================
 
 SCANNER_VERSION: Final[str] = "5.15"
-RULE_VERSION: Final[str] = "choch.v58.r6"  # r6: fix BUG-C look-ahead, BUG-A BOS, BUG-E CHoCH pivot, BUG-G sweep, BUG-B offset
+RULE_VERSION: Final[str] = "choch.v58.r7"  # r7: revert BUG-B (detection window), BUG-E (CHoCH pivot over-restriction), BUG-F (session bonus coupling); preserve BUG-A (BOS), BUG-C (look-ahead), BUG-G (sweep scope)
 
 INSTRUMENTS: Final[tuple[str, ...]] = (
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -114,6 +114,20 @@ SWING_HISTORY: Final[Mapping[str, int]] = {
 GRAN_COUNT: Final[Mapping[str, int]] = {
     "H1": 400, "H4": 300, "D": 200, "W": 120,
 }
+
+# r7: explicit per-timeframe detection window.
+# BUG-B (r6) falsely claimed the offset loop was redundant. _scan_one calls
+# detect_choch() exactly ONCE per (inst, tf); there is no per-candle outer
+# loop and no detect_at_idx() filter anywhere in the codebase. Removing the
+# loop collapsed detection to the last closed candle only, losing ~80% of
+# valid signals (especially D1/Weekly where CHoCHs rarely form on N-1).
+# D1/Weekly use shorter windows because a 5-candle lookback would detect
+# signals already Stale by definition (TF_STATUT["D1"]["Aged"] = 5,
+# TF_STATUT["Weekly"]["Aged"] = 4).
+DETECTION_LOOKBACK: Final[Mapping[str, int]] = {
+    "H1": 5, "H4": 5, "D1": 3, "Weekly": 3,
+}
+
 TF_STATUT: Final[Mapping[str, Mapping[str, int]]] = {
     "H1":     {"Fresh": 4, "Aged": 12},
     "H4":     {"Fresh": 3, "Aged": 8},
@@ -532,42 +546,39 @@ _NONE_SIG: _SigResult = (None, None, None)
 def _resolve_bullish(
     close_arr: np.ndarray, idx: int, prev_swings: Sequence[SwingDict],
 ) -> _SigResult:
-    # BUG-E : le pivot CHoCH valide est le HL POSTÉRIEUR au dernier HH confirmé.
-    # Un HL antérieur au dernier HH est déjà protégé par ce HH — non-protecteur.
-    hh_list = [s for s in prev_swings if s["kind"] == "HH"]
-    if hh_list:
-        last_hh_idx = hh_list[-1]["idx"]
-        hl_after_hh = [s for s in prev_swings if s["kind"] == "HL" and s["idx"] > last_hh_idx]
-        if hl_after_hh:
-            ref = hl_after_hh[-1]["price"]
-            if close_arr[idx] < ref <= close_arr[idx - 1]:
-                return "CHoCH", "Bearish", ref
-        # BOS : cassure du dernier HH (BUG-A : préservé)
-        ref = hh_list[-1]["price"]
+    # r7: revert BUG-E over-restriction. The protective pivot for a bearish
+    # CHoCH is the most recent HL, regardless of its position relative to the
+    # last HH. Requiring HL.idx > last_HH.idx eliminated the dominant right-
+    # edge configuration where the protective pivot forms near the end of the
+    # series and hasn't yet been followed by a new HH. This is the proven r3
+    # logic, restored. BUG-A (BOS on last extreme) is preserved.
+    hl = [s for s in prev_swings if s["kind"] == "HL"]
+    if hl:
+        ref = hl[-1]["price"]
+        if close_arr[idx] < ref <= close_arr[idx - 1]:
+            return "CHoCH", "Bearish", ref
+    hh = [s for s in prev_swings if s["kind"] == "HH"]
+    if hh:
+        ref = hh[-1]["price"]
         if close_arr[idx - 1] <= ref < close_arr[idx]:
             return "BOS", "Bullish", ref
-    # OPT-2 : pas de HH confirmé → pas de signal (suppression fallback fantôme)
     return _NONE_SIG
 
 
 def _resolve_bearish(
     close_arr: np.ndarray, idx: int, prev_swings: Sequence[SwingDict],
 ) -> _SigResult:
-    # BUG-E : le pivot CHoCH valide est le LH POSTÉRIEUR au dernier LL confirmé.
-    # Un LH antérieur au dernier LL est déjà franchi — non-protecteur.
-    ll_list = [s for s in prev_swings if s["kind"] == "LL"]
-    if ll_list:
-        last_ll_idx = ll_list[-1]["idx"]
-        lh_after_ll = [s for s in prev_swings if s["kind"] == "LH" and s["idx"] > last_ll_idx]
-        if lh_after_ll:
-            ref = lh_after_ll[-1]["price"]
-            if close_arr[idx - 1] <= ref < close_arr[idx]:
-                return "CHoCH", "Bullish", ref
-        # BOS : cassure du dernier LL (BUG-A : préservé)
-        ref = ll_list[-1]["price"]
+    # r7: symmetric revert of BUG-E (see _resolve_bullish comment).
+    lh = [s for s in prev_swings if s["kind"] == "LH"]
+    if lh:
+        ref = lh[-1]["price"]
+        if close_arr[idx - 1] <= ref < close_arr[idx]:
+            return "CHoCH", "Bullish", ref
+    ll = [s for s in prev_swings if s["kind"] == "LL"]
+    if ll:
+        ref = ll[-1]["price"]
         if close_arr[idx] < ref <= close_arr[idx - 1]:
             return "BOS", "Bearish", ref
-    # OPT-2 : pas de LL confirmé → pas de signal (suppression fallback fantôme)
     return _NONE_SIG
 
 
@@ -626,7 +637,12 @@ def _compute_confluence_score(
     score = 25
     if dist_atr <= 1.0:
         score += 15
-    if statut == "Fresh" and is_premium_session(get_session(candle_time)):
+    # r7: revert BUG-F. The session bonus reflects the quality of the candle's
+    # formation context, which does not change as the signal ages. Coupling it
+    # to statut == "Fresh" pushed valid Aged signals below MIN_SCORE, amplifying
+    # the zero-signal regression. 'statut' is kept in the signature for backward
+    # stability (callers need not change), but is no longer used in scoring.
+    if is_premium_session(get_session(candle_time)):
         score += 20
     if has_sweep:
         score += 15
@@ -762,22 +778,30 @@ def detect_choch(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalCore]:
     atr_val, atr_regime = calc_atr_bundle(df, inst)
     if not math.isfinite(atr_val) or atr_val <= 0:
         return None
-    # BUG-B : supprimer le loop offset 0..4 — redondant avec le scanner qui
-    # appelle detect_choch() pour chaque bougie individuellement.
-    # Le loop retournait des signaux sur N-1..N-4 que detect_at_idx tuait ensuite
-    # (filtre idx_break == len-1), perdant 67-76% des signaux valides.
+
+    # r7: restore explicit detection window. BUG-B (r6) was based on the false
+    # premise that _scan_one calls detect_choch() per-candle. It does not.
+    # _scan_one calls detect_choch() exactly ONCE per (inst, tf). The loop is
+    # therefore the ONLY mechanism covering signals formed on N-2..N-k.
+    # The first (most recent) match wins, preserving signal_id determinism.
     n = len(df)
-    idx = n - 1
-    if idx < 3:
-        return None
     lookback = SWING_LOOKBACK.get(tf, 5)
-    prev_swings = [s for s in swings if s["idx"] <= idx - (lookback + 1)]
-    if not prev_swings:
-        return None
-    return _evaluate_candle(
-        idx=idx, df=df, prev_swings=prev_swings,
-        atr_val=atr_val, atr_regime=atr_regime, trend=trend, tf=tf,
-    )
+    window = DETECTION_LOOKBACK.get(tf, 5)
+
+    for offset in range(window):
+        idx = n - 1 - offset
+        if idx < 3:
+            break
+        prev_swings = [s for s in swings if s["idx"] <= idx - (lookback + 1)]
+        if not prev_swings:
+            continue
+        sig = _evaluate_candle(
+            idx=idx, df=df, prev_swings=prev_swings,
+            atr_val=atr_val, atr_regime=atr_regime, trend=trend, tf=tf,
+        )
+        if sig is not None:
+            return sig
+    return None
 
 
 # ---- 4.7 row/payload projections (single source of truth) ----------------
