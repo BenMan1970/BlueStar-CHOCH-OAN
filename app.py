@@ -1027,7 +1027,10 @@ def _scan_one(
     return inst, tf_name, sig, None
 
 
-def run_scan(auth: AuthState, cache_bust: int) -> ScanResult:
+def run_scan(
+    auth: AuthState, cache_bust: int,
+    progress_callback: Optional[callable] = None,
+) -> ScanResult:
     """
     Pure orchestration. Idempotent: same inputs (cache_bust unchanged)
     produce identical outputs thanks to st.cache_data on candles.
@@ -1072,15 +1075,21 @@ def run_scan(auth: AuthState, cache_bust: int) -> ScanResult:
             errors.append(f"{inst_r}/{tf_r}: {err}")
             continue
         if sig is None:
+            if progress_callback is not None:
+                progress_callback(inst_r, tf_r)
             continue
         row = signal_to_row(inst_r, tf_r, sig)
         sid = row["signal_id"]
         if sid in seen_ids:
+            if progress_callback is not None:
+                progress_callback(inst_r, tf_r)
             continue
         seen_ids.add(sid)
         rows.append(row)
         if sig.statut in ("Fresh", "Aged"):
             payloads.append(signal_to_payload(inst_r, tf_r, sig, scan_time))
+        if progress_callback is not None:
+            progress_callback(inst_r, tf_r)
 
     aborted = auth.is_aborted()
     _log(logging.INFO, "scan_end",
@@ -1342,15 +1351,41 @@ def _trigger_scan() -> None:
         auth: AuthState = st.session_state.auth
         cache_bust: int = st.session_state.cache_bust
 
-        with st.spinner(
-            f"Scan en cours sur {len(INSTRUMENTS) * len(TIMEFRAMES)} combinaisons…"
-        ):
-            try:
-                result = run_scan(auth, cache_bust)
-            except Exception as exc:  # noqa: BLE001 — final defensive barrier
-                _log(logging.ERROR, "scan_fatal", err=str(exc))
-                st.error(f"Erreur critique du scan : {exc}")
-                return
+        # r7: animated progress bar replacing static st.spinner
+        _pb = st.progress(0.0, text="Initialisation du scan…")
+        _st = st.empty()
+        _t0 = time.monotonic()
+        _completed = 0
+        _total = len(INSTRUMENTS) * len(TIMEFRAMES)
+
+        def _tick(inst: str, tf: str) -> None:
+            nonlocal _completed
+            _completed += 1
+            pct = _completed / _total
+            elapsed = time.monotonic() - _t0
+            eta = (elapsed / _completed) * (_total - _completed) if _completed else 0.0
+            _pb.progress(
+                pct,
+                text=f"[{_completed}/{_total}] {inst.replace('_', '/')} ({tf}) — ETA {int(eta)}s"
+            )
+            _st.markdown(
+                f"<div style='font-size:0.8rem;color:#64748b'>"
+                f"Workers: {SCAN_MAX_WORKERS} | Timeout: {SCAN_GLOBAL_TIMEOUT}s | "
+                f"Écoulé: {elapsed:.1f}s</div>",
+                unsafe_allow_html=True,
+            )
+
+        try:
+            result = run_scan(auth, cache_bust, progress_callback=_tick)
+        except Exception as exc:  # noqa: BLE001 — final defensive barrier
+            _log(logging.ERROR, "scan_fatal", err=str(exc))
+            _pb.empty()
+            _st.empty()
+            st.error(f"Erreur critique du scan : {exc}")
+            return
+        finally:
+            _pb.empty()
+            _st.empty()
 
         if result.aborted:
             st.error(
