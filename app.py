@@ -150,14 +150,17 @@ MAX_AUTH_FAILURES: Final[int] = 3
 OANDA_MAX_RETRIES: Final[int] = 2
 OANDA_BACKOFF_BASE: Final[float] = 0.25
 
-# LOT1 (§4.1/§4.2): le score de confluence (critere d'emission) et
-# l'identifiant de signal sont desormais visibles et exportables.
-DISPLAY_COLS: Final[tuple[str, ...]] = (
+# LOT1 (§4.1/§4.2): le score de confluence (critere d'emission) est visible
+# a l'ecran. L'identifiant de signal (signal_id) reste dans les exports
+# CSV/PDF (tracabilite) mais est masque du tableau UI et du PNG.
+EXPORT_COLS: Final[tuple[str, ...]] = (
     "Instrument", "Timeframe", "Type", "Ordre", "Signal",
     "Niveau", "Distance%", "Score", "Volatilité", "Force", "BB_Width",
     "Statut", "Heure (UTC)", "signal_id",
 )
-EXPORT_COLS: Final[tuple[str, ...]] = DISPLAY_COLS
+DISPLAY_COLS: Final[tuple[str, ...]] = tuple(
+    c for c in EXPORT_COLS if c != "signal_id"
+)
 
 TrendT = Literal["Bullish", "Bearish", "Range"]
 DirectionT = Literal["Bullish", "Bearish"]
