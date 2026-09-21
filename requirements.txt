@@ -1,6 +1,11 @@
-streamlit
-pandas
-numpy
-oandapyV20
-reportlab
-matplotlib
+# CHoCH Scanner v5.15 - production dependencies (pinned)
+# Exact versions validated by the forensic audit (2026-09-21) against OANDA practice.
+# NOTE: requests==2.32.4 is REQUIRED - versions >= 2.34 raise SSLEOFError
+# (UNEXPECTED_EOF_WHILE_READING) against api-fxpractice.oanda.com.
+streamlit==1.64.0
+pandas==3.0.6
+numpy==2.5.3
+oandapyV20==0.7.2
+reportlab==5.0.1
+matplotlib==3.11.2
+requests==2.32.4

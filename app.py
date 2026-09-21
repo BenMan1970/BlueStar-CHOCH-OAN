@@ -40,12 +40,14 @@ from concurrent.futures import (
     CancelledError,
     Future,
     ThreadPoolExecutor,
+    as_completed,
     wait,
 )
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Final, Literal, Mapping, Optional, Sequence, TypedDict
+from typing import (Any, Callable, Final, Literal, Mapping, Optional,
+                    Sequence, TypedDict)
 
 try:
     from zoneinfo import ZoneInfo
@@ -148,10 +150,12 @@ MAX_AUTH_FAILURES: Final[int] = 3
 OANDA_MAX_RETRIES: Final[int] = 2
 OANDA_BACKOFF_BASE: Final[float] = 0.25
 
+# LOT1 (§4.1/§4.2): le score de confluence (critere d'emission) et
+# l'identifiant de signal sont desormais visibles et exportables.
 DISPLAY_COLS: Final[tuple[str, ...]] = (
     "Instrument", "Timeframe", "Type", "Ordre", "Signal",
-    "Niveau", "Distance%", "Volatilité", "Force", "BB_Width",
-    "Statut", "Heure (UTC)",
+    "Niveau", "Distance%", "Score", "Volatilité", "Force", "BB_Width",
+    "Statut", "Heure (UTC)", "signal_id",
 )
 EXPORT_COLS: Final[tuple[str, ...]] = DISPLAY_COLS
 
@@ -225,19 +229,27 @@ def _tz(name: str) -> ZoneInfo:
     return ZoneInfo(name)
 
 
-@st.cache_resource(show_spinner=False)
+_thread_local = threading.local()
+
+
 def _get_oanda_api() -> API:
     """
-    One OANDA API client per Streamlit process (shared across reruns).
-    Thread-safe by design (oandapyV20 uses requests.Session internally).
+    One OANDA API client PER THREAD (LOT1, §3.5): oandapyV20 wraps a single
+    requests.Session, which psf/requests does not guarantee thread-safe.
+    A previous @st.cache_resource version shared one Session across the 6
+    scan workers; it is replaced by a thread-local client.
     """
-    token = st.secrets.get("OANDA_ACCESS_TOKEN")
-    if not token:
-        raise RuntimeError("OANDA_ACCESS_TOKEN missing from st.secrets")
-    return API(
-        access_token=token,
-        request_params={"timeout": OANDA_REQUEST_TIMEOUT},
-    )
+    api = getattr(_thread_local, "api", None)
+    if api is None:
+        token = st.secrets.get("OANDA_ACCESS_TOKEN")
+        if not token:
+            raise RuntimeError("OANDA_ACCESS_TOKEN missing from st.secrets")
+        api = API(
+            access_token=token,
+            request_params={"timeout": OANDA_REQUEST_TIMEOUT},
+        )
+        _thread_local.api = api
+    return api
 
 
 @st.cache_resource(show_spinner=False)
@@ -289,17 +301,6 @@ class SignalCore:
 
 
 # ---- 4.1 numeric utilities ------------------------------------------------
-
-def _safe_float(value: Any) -> Optional[float]:
-    """Convert to float or return None for NaN/Inf/invalid."""
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(f):
-        return None
-    return f
-
 
 def _compute_true_range_vec(data: pd.DataFrame) -> np.ndarray:
     """
@@ -823,7 +824,6 @@ def signal_to_row(inst: str, tf: str, sig: SignalCore) -> dict[str, Any]:
     inst_disp = inst.replace("_", "/")
     return {
         "Instrument": inst_disp,
-        "Paire": inst_disp,
         "_time_sort": sig.signal_time_utc,
         "Timeframe": tf,
         "Type": sig.sig_type,
@@ -831,6 +831,7 @@ def signal_to_row(inst: str, tf: str, sig: SignalCore) -> dict[str, Any]:
         "Signal": f"{sig.direction} {sig.sig_type}",
         "Niveau": format_niveau(sig.level, inst),
         "Distance%": format_distance(sig.distance_pct),
+        "Score": str(sig.score),
         "Volatilité": sig.volatilite,
         "Force": sig.force,
         "BB_Width": format_bb_width((sig.bb_width_pct, sig.bb_regime)),
@@ -934,10 +935,11 @@ def _fetch_candles_raw(inst: str, gran: str) -> Optional[list[dict]]:
     max_entries=512,
 )
 def get_candles_cached(
-    inst: str, gran: str, _cache_bust: int,
+    inst: str, gran: str, cache_bust: int,
 ) -> Optional[pd.DataFrame]:
     """
-    Streamlit-cached candles fetch with explicit cache_bust key.
+    Streamlit-cached candles fetch with explicit cache_bust key
+    (LOT1: parameter renamed, it now really participates in the cache key).
     Cache TTL is short (60s) — quotes refresh quickly during market hours.
 
     Errors are NOT cached: on any failure we return None and the next call
@@ -1032,7 +1034,7 @@ def _scan_one(
 
 def run_scan(
     auth: AuthState, cache_bust: int,
-    progress_callback: Optional[callable] = None,
+    progress_callback: Optional[Callable[[str, str], None]] = None,
 ) -> ScanResult:
     """
     Pure orchestration. Idempotent: same inputs (cache_bust unchanged)
@@ -1053,46 +1055,51 @@ def run_scan(
         for tf_name, tf_code in TIMEFRAMES.items()
     }
 
-    done, not_done = wait(futures.keys(), timeout=SCAN_GLOBAL_TIMEOUT)
-    for f in not_done:
-        f.cancel()
-
     rows: list[dict[str, Any]] = []
     payloads: list[dict[str, Any]] = []
     errors: list[str] = []
     seen_ids: set[str] = set()
 
-    for fut in done:
+    def _handle(fut: Future) -> None:
+        # LOT1 (§3.4): progression animee — le callback est appele sur TOUTES
+        # les branches (erreur, sans-signal, signal), des que la tache finit.
         inst, tf_name = futures[fut]
         try:
             inst_r, tf_r, sig, err = fut.result()
         except CancelledError:
-            continue
+            return
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{inst}/{tf_name}: {exc}")
-            continue
-        if err and err.startswith("401"):
-            errors.append(f"{inst_r}/{tf_r}: auth {err}")
-            continue
-        if err:
-            errors.append(f"{inst_r}/{tf_r}: {err}")
-            continue
-        if sig is None:
+            return
+        try:
+            if err and err.startswith("401"):
+                errors.append(f"{inst_r}/{tf_r}: auth {err}")
+                return
+            if err:
+                errors.append(f"{inst_r}/{tf_r}: {err}")
+                return
+            if sig is not None:
+                row = signal_to_row(inst_r, tf_r, sig)
+                sid = row["signal_id"]
+                if sid not in seen_ids:
+                    seen_ids.add(sid)
+                    rows.append(row)
+                    if sig.statut in ("Fresh", "Aged"):
+                        payloads.append(
+                            signal_to_payload(inst_r, tf_r, sig, scan_time))
+        finally:
             if progress_callback is not None:
                 progress_callback(inst_r, tf_r)
-            continue
-        row = signal_to_row(inst_r, tf_r, sig)
-        sid = row["signal_id"]
-        if sid in seen_ids:
-            if progress_callback is not None:
-                progress_callback(inst_r, tf_r)
-            continue
-        seen_ids.add(sid)
-        rows.append(row)
-        if sig.statut in ("Fresh", "Aged"):
-            payloads.append(signal_to_payload(inst_r, tf_r, sig, scan_time))
-        if progress_callback is not None:
-            progress_callback(inst_r, tf_r)
+
+    not_done: list[Future] = []
+    try:
+        for fut in as_completed(futures.keys(), timeout=SCAN_GLOBAL_TIMEOUT):
+            _handle(fut)
+    except TimeoutError:
+        pass
+    not_done = [f for f in futures if not f.done()]
+    for f in not_done:
+        f.cancel()
 
     aborted = auth.is_aborted()
     _log(logging.INFO, "scan_end",
@@ -1134,25 +1141,48 @@ def _json_default(obj: Any) -> Any:
         return "<unserializable>"
 
 
+def _sanitize_json(obj: Any) -> Any:
+    """LOT1 (§4.4): nettoie AVANT dumps — un float non-fini devient None
+    (default= n'est jamais consulte pour un float, allow_nan=False leve)."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    if isinstance(obj, (np.floating,)) and not math.isfinite(float(obj)):
+        return None
+    return obj
+
+
 def serialize_pipeline(
     payloads: Sequence[Mapping[str, Any]], scan_time: datetime,
+    errors: Sequence[str] = (), timed_out: int = 0,
 ) -> bytes:
+    # LOT1 (§4.3): le JSON dit maintenant ce qui a echoue.
     doc = {
         "meta": {
             "scanner_version": SCANNER_VERSION,
             "rule_version": RULE_VERSION,
             "generated_at": scan_time.isoformat(),
             "signal_count": len(payloads),
+            "coverage": {
+                "pairs_requested": len(INSTRUMENTS) * len(TIMEFRAMES),
+                "pairs_failed": len(errors),
+                "pairs_timed_out": timed_out,
+                "failures": list(errors[:50]),
+            },
         },
         "signals": list(payloads),
     }
     return json.dumps(
-        doc, ensure_ascii=False, indent=2,
+        _sanitize_json(doc), ensure_ascii=False, indent=2,
         default=_json_default, allow_nan=False,
     ).encode("utf-8")
 
 
-def create_pdf(df_export: pd.DataFrame) -> bytes:
+def create_pdf(df_export: pd.DataFrame,
+                 scan_time: Optional[datetime] = None) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=landscape(A4),
@@ -1164,7 +1194,7 @@ def create_pdf(df_export: pd.DataFrame) -> bytes:
         f"Rapport des Signaux CHoCH v{SCANNER_VERSION} ({RULE_VERSION})",
         styles["Title"]))
     elements.append(Paragraph(
-        f"Généré le {datetime.now(timezone.utc).strftime('%d/%m/%Y à %H:%M')} UTC",
+        f"Généré le {(scan_time or datetime.now(timezone.utc)).strftime('%d/%m/%Y à %H:%M')} UTC",
         styles["Normal"]))
     elements.append(Spacer(1, 20))
 
@@ -1193,6 +1223,7 @@ def create_pdf(df_export: pd.DataFrame) -> bytes:
 
 
 def generate_png(data: pd.DataFrame, display_cols: Sequence[str]) -> bytes:
+    # LOT1 (§3.6): dpi 100 (etait 200) — divise la memoire de rendu par 4
     fig = Figure(figsize=(22, min(max(5, len(data) * 0.35), 30)))
     ax = fig.add_subplot(111)
     ax.axis("off")
@@ -1206,7 +1237,7 @@ def generate_png(data: pd.DataFrame, display_cols: Sequence[str]) -> bytes:
     tbl.set_fontsize(8)
     tbl.scale(1.2, 1.8)
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=200)
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
     return buf.getvalue()
 
 
@@ -1254,7 +1285,16 @@ def _render_downloads(
     df_all: pd.DataFrame, df_export: pd.DataFrame,
     pipeline_signals: Sequence[Mapping[str, Any]], scan_time: datetime,
 ) -> None:
-    ts = scan_time.strftime("%Y%m%d_%H%M")
+    # LOT1 (§3.6): cle a la SECONDE + empreinte du contenu ; les anciennes
+    # cles png_/pdf_ sont purgees (memoire) ; dpi 100 au lieu de 200.
+    ts = scan_time.strftime("%Y%m%d_%H%M%S")
+    content_hash = hashlib.sha256(
+        pd.util.hash_pandas_object(df_all, index=False).to_numpy().tobytes()
+    ).hexdigest()[:6] if len(df_all) else "empty"
+    for k in list(st.session_state):
+        if k.startswith(("png_", "pdf_")) and k not in (
+                f"png_{ts}_{content_hash}", f"pdf_{ts}_{content_hash}"):
+            del st.session_state[k]
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         cols = [c for c in EXPORT_COLS if c in df_export.columns]
@@ -1265,7 +1305,7 @@ def _render_downloads(
         )
     with c2:
         # Lazy generation, cached against the dataframe identity via session
-        png_key = f"png_{ts}"
+        png_key = f"png_{ts}_{content_hash}"
         if png_key not in st.session_state:
             st.session_state[png_key] = generate_png(df_all, DISPLAY_COLS)
         st.download_button(
@@ -1274,9 +1314,9 @@ def _render_downloads(
             key=f"dl_png_{ts}",
         )
     with c3:
-        pdf_key = f"pdf_{ts}"
+        pdf_key = f"pdf_{ts}_{content_hash}"
         if pdf_key not in st.session_state:
-            st.session_state[pdf_key] = create_pdf(df_export)
+            st.session_state[pdf_key] = create_pdf(df_export, scan_time)
         st.download_button(
             "PDF", st.session_state[pdf_key],
             f"choch_signaux_{ts}.pdf", "application/pdf",
@@ -1284,7 +1324,10 @@ def _render_downloads(
         )
     with c4:
         st.download_button(
-            "JSON", serialize_pipeline(pipeline_signals, scan_time),
+            "JSON", serialize_pipeline(
+                pipeline_signals, scan_time,
+                st.session_state.get("scan_errors", []),
+                int(st.session_state.get("scan_timed_out", 0))),
             f"choch_pipeline_{ts}.json", "application/json",
             key=f"dl_json_{ts}",
         )
@@ -1313,7 +1356,7 @@ def _render_dataframe(df_all: pd.DataFrame) -> None:
                         else "color:#ff5252;font-weight:bold" if x == "Stale"
                         else ""), subset=["Statut"])
     )
-    st.dataframe(styled, hide_index=True, use_container_width=True)
+    st.dataframe(styled, hide_index=True, width="stretch")
 
 
 def _render_results() -> None:
@@ -1416,16 +1459,20 @@ def _trigger_scan() -> None:
             return
 
         df = (
+            # LOT1 (§3.7): tri deterministe — les ex æquo sont departages
+            # par Instrument puis Timeframe (mergesort, stable).
             pd.DataFrame(result.rows)
-            .sort_values("_time_sort", ascending=False)
+            .sort_values(["_time_sort", "Instrument", "Timeframe"],
+                         ascending=[False, True, True], kind="mergesort")
             .drop_duplicates(subset="signal_id", keep="first")
-            .drop(columns=["_time_sort", "signal_id"])
+            .drop(columns=["_time_sort"])
             .reset_index(drop=True)
         )
         st.session_state.df = df
         st.session_state.pipeline_signals = result.payloads
         st.session_state.scan_time = result.scan_time
         st.session_state.scan_errors = result.errors
+        st.session_state.scan_timed_out = result.timed_out
         st.success(
             f"Scan terminé — {len(df)} signaux | "
             f"{len(result.payloads)} dans le pipeline JSON | "
@@ -1454,14 +1501,14 @@ col_a, col_b = st.columns([3, 1])
 with col_a:
     scan_clicked = st.button(
         "Lancer le Scan", type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=st.session_state.scanning,
         key="btn_scan",
     )
 with col_b:
     force_refresh = st.button(
         "Force refresh (bust cache)",
-        use_container_width=True,
+        width="stretch",
         disabled=st.session_state.scanning,
         key="btn_force_refresh",
     )
