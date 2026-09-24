@@ -32,6 +32,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -41,18 +42,14 @@ from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
     as_completed,
-    wait,
 )
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import (Any, Callable, Final, Literal, Mapping, Optional,
                     Sequence, TypedDict)
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover - py<3.9 fallback
-    from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+from zoneinfo import ZoneInfo  # Python >= 3.12 (exige par numpy 2.5.3)
 
 import numpy as np
 import pandas as pd
@@ -78,10 +75,14 @@ from reportlab.platypus import (
 # =====================================================================
 
 SCANNER_VERSION: Final[str] = "5.15"
-RULE_VERSION: Final[str] = "choch.v58.r7"
+RULE_VERSION: Final[str] = "choch.v58.r8"
 # r7: revert BUG-B (detection window), BUG-E (CHoCH pivot over-restriction),
 # BUG-F (session bonus coupling); preserve BUG-A (BOS), BUG-C (look-ahead),
 # BUG-G (sweep scope)
+# r8: fix FND-13 (fenetre de pivot : dernier pivot confirmable inclus),
+#     FND-01 (ordre JSON trie), FND-04 (validation contrat fail-closed),
+#     FND-06 (champs additifs confirmation_time + age_minutes),
+#     FND-02 (etat no_data explicite). Impact : 3/132 signaux terminaux.
 
 INSTRUMENTS: Final[tuple[str, ...]] = (
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
@@ -150,17 +151,14 @@ MAX_AUTH_FAILURES: Final[int] = 3
 OANDA_MAX_RETRIES: Final[int] = 2
 OANDA_BACKOFF_BASE: Final[float] = 0.25
 
-# LOT1 (§4.1/§4.2): le score de confluence (critere d'emission) est visible
-# a l'ecran. L'identifiant de signal (signal_id) reste dans les exports
-# CSV/PDF (tracabilite) mais est masque du tableau UI et du PNG.
-EXPORT_COLS: Final[tuple[str, ...]] = (
+# LOT1 (§4.1/§4.2): le score de confluence (critere d'emission) et
+# l'identifiant de signal sont desormais visibles et exportables.
+DISPLAY_COLS: Final[tuple[str, ...]] = (
     "Instrument", "Timeframe", "Type", "Ordre", "Signal",
     "Niveau", "Distance%", "Score", "Volatilité", "Force", "BB_Width",
     "Statut", "Heure (UTC)", "signal_id",
 )
-DISPLAY_COLS: Final[tuple[str, ...]] = tuple(
-    c for c in EXPORT_COLS if c != "signal_id"
-)
+EXPORT_COLS: Final[tuple[str, ...]] = DISPLAY_COLS
 
 TrendT = Literal["Bullish", "Bearish", "Range"]
 DirectionT = Literal["Bullish", "Bearish"]
@@ -244,7 +242,11 @@ def _get_oanda_api() -> API:
     """
     api = getattr(_thread_local, "api", None)
     if api is None:
-        token = st.secrets.get("OANDA_ACCESS_TOKEN")
+        # st.secrets en production ; CHOCH_TEST_TOKEN pour les tests hors
+        # Streamlit (jamais logge, jamais mis dans le document JSON).
+        token = os.environ.get("CHOCH_TEST_TOKEN")
+        if not token:
+            token = st.secrets.get("OANDA_ACCESS_TOKEN")
         if not token:
             raise RuntimeError("OANDA_ACCESS_TOKEN missing from st.secrets")
         api = API(
@@ -501,7 +503,10 @@ def detect_swing_points(data: pd.DataFrame, tf: str) -> list[SwingDict]:
     l_mask = (low_s == roll_min) & low_s.notna()
 
     start = max(lookback, n - history - lookback)
-    end = n - lookback - 1
+    # r8 (fix FND-13) : end = n - lookback, pas n - lookback - 1.
+    # range(start, end) exclut end ; le dernier pivot confirmable est
+    # i = n - 1 - lookback (fenetre centree [i-lb, i+lb] dans la serie).
+    end = n - lookback
     pivots: list[tuple[int, float, str]] = []
     seen_idx: set[int] = set()
     high_arr = high_s.to_numpy()
@@ -639,23 +644,20 @@ def compute_statut(idx_sig: Optional[int], len_df: int, tf: str) -> StatusT:
 
 def _compute_confluence_score(
     dist_atr: float, candle_time: datetime, has_sweep: bool,
-    sig_type: SigTypeT, _statut: StatusT,
+    sig_type: SigTypeT,
 ) -> int:
     score = 25
     if dist_atr <= 1.0:
         score += 15
     # r7: revert BUG-F. The session bonus reflects the quality of the candle's
-    # formation context, which does not change as the signal ages. Coupling it
-    # to statut == "Fresh" pushed valid Aged signals below MIN_SCORE, amplifying
-    # the zero-signal regression. '_statut' is kept in the signature for backward
-    # stability (callers need not change), but is no longer used in scoring.
+    # formation context, which does not change as the signal ages.
     if is_premium_session(get_session(candle_time)):
         score += 20
     if has_sweep:
         score += 15
     if sig_type == "CHoCH":
         score += 10
-    return min(score, 100)
+    return score
 
 
 # ---- 4.5 BB width ---------------------------------------------------------
@@ -739,7 +741,7 @@ def _evaluate_candle(
     candle_time = df.index[idx].to_pydatetime()
     statut = compute_statut(idx, n, tf)
     score = _compute_confluence_score(
-        dist_atr, candle_time, has_sweep, sig_type, statut,
+        dist_atr, candle_time, has_sweep, sig_type,
     )
     if score < MIN_SCORE:
         return None
@@ -889,7 +891,29 @@ def signal_to_payload(
         "candles_elapsed": int(sig.candles_elapsed),
         "has_sweep": bool(sig.has_sweep),
         "atr": round(sig.atr_val, prec + 2),
+        # FND-06 (additif, schema 1.1.0) : age et instant de confirmation.
+        # signal_time = OUVERTURE de la bougie de cassure ; la cassure n'est
+        # confirmee qu'a la CLOTURE de cette bougie (1 barre plus tard).
+        "confirmation_time": _confirmation_time(sig.signal_time_utc, tf),
+        "age_minutes": _age_minutes(sig.signal_time_utc, scan_time),
     }
+
+
+_BAR_SECONDS = {"H1": 3600, "H4": 14400, "D": 86400, "W": 604800,
+                "D1": 86400, "Weekly": 604800}
+
+
+def _confirmation_time(signal_time: datetime, tf: str) -> str:
+    """Cloture de la bougie de cassure = signal_time + 1 barre."""
+    secs = _BAR_SECONDS.get(tf, 3600)
+    return (signal_time + timedelta(seconds=secs)).isoformat()
+
+
+def _age_minutes(signal_time: datetime, scan_time: datetime) -> int:
+    """Minutes ecoulees depuis la confirmation (cloture). Non negatif."""
+    conf = signal_time  # garde-fou : age >= 0 meme avant confirmation
+    delta = (scan_time - conf).total_seconds()
+    return int(max(0.0, delta) // 60)
 
 
 # =====================================================================
@@ -945,9 +969,10 @@ def get_candles_cached(
     (LOT1: parameter renamed, it now really participates in the cache key).
     Cache TTL is short (60s) — quotes refresh quickly during market hours.
 
-    Errors are NOT cached: on any failure we return None and the next call
-    will retry (st.cache_data caches the None too, but TTL is short).
-    For auth/network errors we raise so the caller can track per-session.
+    Errors ARE surfaced: on any failure we return None and the caller marks
+    the pair as "no_data" (not silently "no_signal"). st.cache_data caches
+    the None for the TTL (60s) — Force refresh (bust cache) bypasses it.
+    For auth errors we raise so the caller can track per-session.
     """
     for attempt in range(OANDA_MAX_RETRIES + 1):
         try:
@@ -1025,7 +1050,10 @@ def _scan_one(
         return inst, tf_name, None, f"unexpected:{type(exc).__name__}"
 
     if df is None:
-        return inst, tf_name, None, None
+        # FND-02 : distinguer "non traite" (donnees indisponibles) de
+        # "traite sans signal". Retourne un etat explicite au lieu de None
+        # silencieux, pour que coverage reflete la realite.
+        return inst, tf_name, None, "no_data"
     try:
         sig = detect_choch(df, tf_name, inst)
     except Exception as exc:  # noqa: BLE001
@@ -1158,25 +1186,151 @@ def _sanitize_json(obj: Any) -> Any:
     return obj
 
 
+SCHEMA_VERSION: Final[str] = "1.1.0"
+
+# Regexes/enums du contrat (miroir minimal de choch_pipeline.schema.json ;
+# le validateur complet est publie dans audit_prod/).
+_RE_SIGNAL_ID = re.compile(
+    r"^[A-Z0-9_]{2,20}__(H1|H4|D1|Weekly)__\d{8}T\d{4}__[0-9a-f]{12}$")
+_RE_PAIR = re.compile(r"^[A-Z0-9]{2,8}/[A-Z0-9]{2,8}$")
+_RE_PAIR_OANDA = re.compile(r"^[A-Z0-9]{2,8}_[A-Z0-9]{2,8}$")
+_RE_ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?\+00:00$")
+_SIGNAL_ENUMS = {
+    "timeframe": {"H1", "H4", "D1", "Weekly"},
+    "type": {"CHoCH", "BOS"},
+    "direction": {"Bullish", "Bearish"},
+    "order": {"buy", "sell"},
+    "trend": {"Bullish", "Bearish"},
+    "status": {"Fresh", "Aged"},
+    "volatility": {"Très Haute", "Haute", "Moyenne", "Basse"},
+    "force": {"Fort", "Moyen"},
+    "bb_regime": {"Squeeze", "Expansion", "Normal", "N/A"},
+    "session": {"London_NY_Overlap", "London", "NewYork", "Tokyo", "Off"},
+}
+_SIGNAL_REQUIRED = (
+    "signal_id", "scanner_version", "rule_version", "generated_at", "pair",
+    "pair_oanda", "timeframe", "type", "direction", "is_bullish", "order",
+    "trend", "is_choch", "status", "confluence_score", "level", "close_price",
+    "current_price", "distance_pct", "current_distance_pct",
+    "distance_atr_multiple", "volatility", "force", "bb_width_pct",
+    "bb_regime", "session", "signal_time", "candles_elapsed", "has_sweep",
+    "atr", "confirmation_time", "age_minutes",
+)
+
+
+def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
+    """Contrat JSON d'un signal. Renvoie une raison de rejet ou None.
+
+    Fail-closed : un signal non conforme n'est JAMAIS emis en silence ; il est
+    ecarte et compte dans meta.invalid_signals (FND-04).
+    """
+    try:
+        if set(s) - set(_SIGNAL_REQUIRED):
+            return "cles en trop: %s" % sorted(set(s) - set(_SIGNAL_REQUIRED))
+        for k in _SIGNAL_REQUIRED:
+            if k not in s:
+                return f"cle requise manquante: {k}"
+        if not _RE_SIGNAL_ID.match(s["signal_id"]):
+            return "signal_id: pattern invalide"
+        if not _RE_PAIR.match(s["pair"]) or not _RE_PAIR_OANDA.match(
+                s["pair_oanda"]):
+            return "pair/pair_oanda: pattern invalide"
+        if s["pair"] != s["pair_oanda"].replace("_", "/"):
+            return "pair != pair_oanda"
+        for k, allowed in _SIGNAL_ENUMS.items():
+            if s[k] not in allowed:
+                return f"{k}: valeur hors enum ({s[k]!r})"
+        if not isinstance(s["is_bullish"], bool) or not isinstance(
+                s["is_choch"], bool) or not isinstance(s["has_sweep"], bool):
+            return "champs booleens non booleens"
+        if s["is_bullish"] != (s["direction"] == "Bullish"):
+            return "is_bullish != (direction == 'Bullish')"
+        if s["order"] != ("buy" if s["is_bullish"] else "sell"):
+            return "order != is_bullish"
+        if s["is_choch"] != (s["type"] == "CHoCH"):
+            return "is_choch != (type == 'CHoCH')"
+        if not isinstance(s["confluence_score"], int) or isinstance(
+                s["confluence_score"], bool):
+            return "confluence_score: pas un integer"
+        if not (MIN_SCORE <= s["confluence_score"] <= 100):
+            return "confluence_score hors borne"
+        for k in ("level", "close_price", "current_price", "atr"):
+            v = s[k]
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                return f"{k}: pas un nombre"
+            if not (v > 0 and math.isfinite(v)):
+                return f"{k}: valeur invalide"
+        if not isinstance(s["distance_atr_multiple"], (int, float)) or isinstance(
+                s["distance_atr_multiple"], bool):
+            return "distance_atr_multiple: pas un nombre"
+        if not (0.0 <= s["distance_atr_multiple"] <= ATR_DIST_MULT):
+            return "distance_atr_multiple hors borne"
+        for k in ("distance_pct", "current_distance_pct", "bb_width_pct"):
+            v = s[k]
+            if v is not None:
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    return f"{k}: pas un nombre"
+                if not math.isfinite(v):
+                    return f"{k}: non fini"
+        if not _RE_ISO_UTC.match(str(s["generated_at"])):
+            return "generated_at: pas ISO 8601 UTC"
+        if not _RE_ISO_UTC.match(str(s["signal_time"])):
+            return "signal_time: pas ISO 8601 UTC"
+        if not _RE_ISO_UTC.match(str(s.get("confirmation_time", ""))):
+            return "confirmation_time: pas ISO 8601 UTC"
+        if not isinstance(s.get("age_minutes"), int) or isinstance(
+                s.get("age_minutes"), bool) or s["age_minutes"] < 0:
+            return "age_minutes: entier >= 0 attendu"
+        if not isinstance(s["candles_elapsed"], int) or isinstance(
+                s["candles_elapsed"], bool) or s["candles_elapsed"] < 0:
+            return "candles_elapsed: entier >= 0 attendu"
+        if s["distance_pct"] is not None:
+            rec = calc_distance_pct(s["level"], s["close_price"])
+            if rec is None or abs(round(rec, 4) - s["distance_pct"]) > 1e-9:
+                return "distance_pct non recalculable"
+        if s["scanner_version"] != SCANNER_VERSION:
+            return "scanner_version incoherent"
+        if s["rule_version"] != RULE_VERSION:
+            return "rule_version incoherent"
+    except Exception as exc:  # noqa: BLE001 - boundary fail-closed
+        return f"validateur: {type(exc).__name__}"
+    return None
+
+
 def serialize_pipeline(
     payloads: Sequence[Mapping[str, Any]], scan_time: datetime,
     errors: Sequence[str] = (), timed_out: int = 0,
 ) -> bytes:
     # LOT1 (§4.3): le JSON dit maintenant ce qui a echoue.
+    # FND-04 : validation fail-closed avant emission. Un signal non conforme
+    # est ecarte (jamais emis en silence) et compte dans meta.invalid_signals.
+    valid: list[Mapping[str, Any]] = []
+    invalid: list[str] = []
+    for p in payloads:
+        raison = _validate_signal(p)
+        if raison is None:
+            valid.append(p)
+        else:
+            sid = p.get("signal_id", "<sans-id>")
+            invalid.append(f"{sid}: {raison}")
+            _log(logging.ERROR, "signal_rejete_contrat",
+                 signal_id=sid, raison=raison)
     doc = {
         "meta": {
+            "schema_version": SCHEMA_VERSION,
             "scanner_version": SCANNER_VERSION,
             "rule_version": RULE_VERSION,
             "generated_at": scan_time.isoformat(),
-            "signal_count": len(payloads),
+            "signal_count": len(valid),
             "coverage": {
                 "pairs_requested": len(INSTRUMENTS) * len(TIMEFRAMES),
                 "pairs_failed": len(errors),
                 "pairs_timed_out": timed_out,
                 "failures": list(errors[:50]),
             },
+            "invalid_signals": invalid[:50],
         },
-        "signals": list(payloads),
+        "signals": sorted(valid, key=lambda p: p["signal_id"]),  # FND-01
     }
     return json.dumps(
         _sanitize_json(doc), ensure_ascii=False, indent=2,
@@ -1307,10 +1461,12 @@ def _render_downloads(
             key=f"dl_csv_{ts}",
         )
     with c2:
-        # Lazy generation, cached against the dataframe identity via session
+        # Lazy generation, cached against the dataframe identity via session.
+        # LOT1 (fix FND-12) : le PNG utilise df_export, comme le CSV et le PDF
+        # (les signaux Stale sont "exclus des exports" selon l'UI).
         png_key = f"png_{ts}_{content_hash}"
         if png_key not in st.session_state:
-            st.session_state[png_key] = generate_png(df_all, DISPLAY_COLS)
+            st.session_state[png_key] = generate_png(df_export, DISPLAY_COLS)
         st.download_button(
             "PNG", st.session_state[png_key],
             f"choch_{ts}.png", "image/png",

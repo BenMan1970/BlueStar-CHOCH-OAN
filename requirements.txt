@@ -2,6 +2,8 @@
 # Exact versions validated by the forensic audit (2026-09-21) against OANDA practice.
 # NOTE: requests==2.32.4 is REQUIRED - versions >= 2.34 raise SSLEOFError
 # (UNEXPECTED_EOF_WHILE_READING) against api-fxpractice.oanda.com.
+# NOTE: Python >= 3.12 is REQUIRED (numpy 2.5.3) - concurrent.futures.TimeoutError
+# is an alias of the builtin only since 3.11 (app.py l.1098).
 streamlit==1.64.0
 pandas==3.0.6
 numpy==2.5.3
