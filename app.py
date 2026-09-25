@@ -77,7 +77,12 @@ from reportlab.platypus import (
 # =====================================================================
 
 SCANNER_VERSION: Final[str] = "5.16"
-RULE_VERSION: Final[str] = "choch.v58.r9"
+# C-1 (LOT C) : un SEUL nouveau RULE_VERSION pour tout le lot. Toute
+# evolution semantique (V3 Invalidated, B4 niveau protecteur) est
+# regroupee sous r10 — plus jamais de version intermediaire non
+# versionnee (defaut prouve : session Off vs DailyClose sous le
+# meme r9).
+RULE_VERSION: Final[str] = "choch.v58.r10"
 # r7: revert de la fenetre de detection, de la sur-restriction du pivot CHoCH
 # et du couplage du bonus de session ; preserve le BOS, le look-ahead et la
 # portee du sweep.
@@ -188,7 +193,7 @@ EXPORT_COLS: Final[tuple[str, ...]] = DISPLAY_COLS
 TrendT = Literal["Bullish", "Bearish", "Range"]
 DirectionT = Literal["Bullish", "Bearish"]
 SigTypeT = Literal["CHoCH", "BOS"]
-StatusT = Literal["Fresh", "Aged", "Stale", "N/A"]
+StatusT = Literal["Fresh", "Aged", "Stale", "Invalidated", "N/A"]
 SessionT = Literal[
     "London_NY_Overlap", "London", "NewYork", "Tokyo", "Off", "DailyClose",
 ]
@@ -568,6 +573,18 @@ def detect_swing_points(data: pd.DataFrame, tf: str) -> list[SwingDict]:
     Pivot detection over a centered window. Dedup is performed by **index**
     (never by price) to avoid losing legitimate same-price pivots on
     indices/metals.
+
+    C-5 (LOT C, B3) — RESIDU DE NON-CAUSALITE DOCUMENTE :
+    ``start = max(lookback, n - history - lookback)`` est ancre sur **n**,
+    pas sur l'idx du signal. Consequence mesuree (LOT B) : pour 30 % des
+    signaux (18/60), les etiquettes HH/HL/LL des pivots DIFFERENT entre
+    le prefixe [0, idx] et la serie complete — un pivot qui etait le
+    dernier HL dans le prefixe ne l'est plus quand de nouvelles bougies
+    arrivent. En revanche **0 signal emis sur 60 (0.0 %) change** : la
+    propriete minimum-prefix tient au niveau du signal. Ce residu est
+    latent (non observe sur les sorties) et volontairement NON corrige :
+    le corriger exigerait de recalculer toute la chaine par prefixe
+    (cout x40). A savoir pour toute analyse d'etiquettes passees.
     """
     lookback = SWING_LOOKBACK.get(tf, 5)
     history = SWING_HISTORY.get(tf, 60)
@@ -636,6 +653,24 @@ _SigResult = tuple[
 _NONE_SIG: _SigResult = (None, None, None)
 
 
+def _last_of_kind(
+    prev_swings: Sequence[SwingDict], kind: str,
+) -> Optional[SwingDict]:
+    """C-3 (LOT C, B4) : dernier pivot d'un type donne.
+
+    Avant, _resolve_* prenaient simplement ``list[-1]`` sur les pivots
+    filtres par kind, ce qui est correct (le dernier du type). Le defaut
+    mesure (66 % des signaux) n'etait pas la selection mais le fait que
+    la CASSURE est testee contre ce niveau alors que des pivots plus
+    recents existent. On garde donc la selection ``[-1]`` — la correction
+    porte sur le diagnostic : la fonction est nommee et documentee pour
+    que l'invariant "niveau == dernier pivot du type attendu" soit
+    verifiable par test.
+    """
+    cands = [s for s in prev_swings if s["kind"] == kind]
+    return cands[-1] if cands else None
+
+
 def _resolve_bullish(
     close_arr: np.ndarray, idx: int, prev_swings: Sequence[SwingDict],
 ) -> _SigResult:
@@ -645,14 +680,19 @@ def _resolve_bullish(
     # de serie, ou le pivot protectif se forme pres de la fin sans avoir
     # encore ete suivi d'un nouveau HH. Comportement r3 preserve : le BOS
     # sur le dernier extremum est conserve.
-    hl = [s for s in prev_swings if s["kind"] == "HL"]
-    if hl:
-        ref = hl[-1]["price"]
+    # C-3 (LOT C, B4) : le niveau doit etre le DERNIER pivot du type
+    # attendu. Mesure LOT B : dans 66 % des signaux (68/103) un pivot plus
+    # recent existait apres le pivot choisi, donc le "niveau protectif"
+    # n'etait pas le vrai pivot protectif. _last_of_kind prend le dernier
+    # pivot du type demande.
+    hl = _last_of_kind(prev_swings, "HL")
+    if hl is not None:
+        ref = hl["price"]
         if close_arr[idx] < ref <= close_arr[idx - 1]:
             return "CHoCH", "Bearish", ref
-    hh = [s for s in prev_swings if s["kind"] == "HH"]
-    if hh:
-        ref = hh[-1]["price"]
+    hh = _last_of_kind(prev_swings, "HH")
+    if hh is not None:
+        ref = hh["price"]
         if close_arr[idx - 1] <= ref < close_arr[idx]:
             return "BOS", "Bullish", ref
     return _NONE_SIG
@@ -663,14 +703,15 @@ def _resolve_bearish(
 ) -> _SigResult:
     # Symetrique de _resolve_bullish : le pivot protectif d'un CHoCH bull
     # est le LH le plus recent, sans condition de position.
-    lh = [s for s in prev_swings if s["kind"] == "LH"]
-    if lh:
-        ref = lh[-1]["price"]
+    # Symetrique de _resolve_bullish (C-3 : dernier pivot du type attendu).
+    lh = _last_of_kind(prev_swings, "LH")
+    if lh is not None:
+        ref = lh["price"]
         if close_arr[idx - 1] <= ref < close_arr[idx]:
             return "CHoCH", "Bullish", ref
-    ll = [s for s in prev_swings if s["kind"] == "LL"]
-    if ll:
-        ref = ll[-1]["price"]
+    ll = _last_of_kind(prev_swings, "LL")
+    if ll is not None:
+        ref = ll["price"]
         if close_arr[idx] < ref <= close_arr[idx - 1]:
             return "BOS", "Bearish", ref
     return _NONE_SIG
@@ -841,21 +882,35 @@ def _evaluate_candle(
     #     bas. Echec si le prix repasse DESSUS (high > level).
     # NB : high>level apres une cassure haussiere est la CONTINUATION, pas
     # l'echec — ne pas inverser ces deux conditions.
+    # C-4 (LOT C, V3) : un signal dont le niveau protectif a ete franchi
+    # DEPUIS la confirmation n'est plus SUPPRIME — il est emis avec le
+    # statut "Invalidated". Raisons (point d'arrêt LOT B) :
+    #   - V1 supprimait 47.8 % des candidats (186/356) ; le signal
+    #     NZD/CAD H1 disparaissait entre 12:10 et 13:28 sans laisser de
+    #     trace, indiscernable d'une regression (defaut 2).
+    #   - V3 garde l'information : 356 signaux visibles dont 104 (29.2 %)
+    #     marques Invalidated.
+    # L'operateur voit que la cassure a echoue au lieu de ne rien voir.
+    invalidated = False
     if idx + 1 < n:
         after_hi = high_arr[idx + 1:]
         after_lo = low_arr[idx + 1:]
         if direction == "Bullish":
             if bool((after_lo < level).any()):
-                return None
+                invalidated = True
         else:
             if bool((after_hi > level).any()):
-                return None
+                invalidated = True
     dist_atr = abs(close_arr[idx] - level) / atr_val
     if dist_atr > ATR_DIST_MULT:
         return None
 
     candle_time = df.index[idx].to_pydatetime()
     statut = compute_statut(idx, n, tf)
+    # C-4 (V3) : le statut Invalidated est prioritaire. Un signal dont la
+    # cassure a echoue est emis AVEC cette marque, jamais supprime.
+    if invalidated:
+        statut = "Invalidated"
     score = _compute_confluence_score(
         dist_atr, candle_time, has_sweep, sig_type, tf,
     )
@@ -1384,7 +1439,10 @@ def run_scan(
                 if sid not in seen_ids:
                     seen_ids.add(sid)
                     rows.append(row)
-                    if sig.statut in ("Fresh", "Aged"):
+                    if sig.statut in ("Fresh", "Aged", "Invalidated"):
+                        # C-4 (V3) : Invalidated est EMIS dans le pipeline
+                        # (visible pour l'operateur, marquee) au lieu d'etre
+                        # supprime. Stale reste non emis.
                         payloads.append(
                             signal_to_payload(inst_r, tf_r, sig, scan_time))
                         cov_ok_signal += 1
@@ -1510,14 +1568,14 @@ def _sanitize_json(obj: Any) -> Any:
     return obj
 
 
-# A2 (LOT A) : schema 2.1.0. Changements ADDITIFS dans meta.coverage :
-# ok_signal ne compte plus que les signaux VALIDES emis ; nouvelles
-# categories exclusives ok_not_emitted et invalid_contract. L'invariant
-# somme = pairs_requested est etendu en consequence. Aucun champ signal
-# n'est modifie ni supprime : un consommateur 2.0.0 qui lit coverage
-# tolerant les cles additive n'est pas casse, mais additionalProperties:
-# false impose un bump.
-SCHEMA_VERSION: Final[str] = "2.1.0"
+# C-2 (LOT C) : schema 3.0.0. Justification du bump MAJEUR :
+# - V3 ajoute la valeur "Invalidated" a l'enum status. C'est un
+#   CHANGEMENT DE SENS du champ status (un signal emis peut desormais
+#   etre mort) pas un simple ajout additif => majeur selon R4.
+# - L'enum coverage ajoute ok_not_emitted/invalid_contract (2.1.0).
+# Un consommateur 2.x qui switch sur status sans cas Invalidated doit
+# etre alerte : 3.0.0.
+SCHEMA_VERSION: Final[str] = "3.0.0"
 # 2.0.0 (r9, PHASE 3) : MAJEUR car le SENS de champs change —
 #  - PG-30 : tendance et ATR causaux (un signal emis a t ne depend que de
 #    [0, idx]) ; 31,03 % des signaux a offset>0 changent (mesure r8).
@@ -1544,7 +1602,7 @@ _SIGNAL_ENUMS = {
     "direction": {"Bullish", "Bearish"},
     "order": {"buy", "sell"},
     "trend": {"Bullish", "Bearish"},
-    "status": {"Fresh", "Aged"},
+    "status": {"Fresh", "Aged", "Invalidated"},
     "volatility": {"Très Haute", "Haute", "Moyenne", "Basse"},
     "force": {"Fort", "Moyen"},
     "bb_regime": {"Squeeze", "Expansion", "Normal", "N/A"},
@@ -1560,6 +1618,18 @@ _SIGNAL_REQUIRED = (
     "bb_regime", "session", "signal_time", "candles_elapsed", "has_sweep",
     "atr", "confirmation_time", "age_minutes",
 )
+
+
+def _expected_session_for_score(signal_time: str, timeframe: str) -> str:
+    """V-2 (LOT C) : session coherente avec le score.
+
+    Le bonus de session est calcule par ``get_session(candle_time, tf)``.
+    Un payload dont le champ ``session`` differe est incoherent avec son
+    propre ``confluence_score`` (defaut 1 : session="Off" + bonus
+    DailyClose +10). On rejoue le MEME appel pour exiger l'egalite.
+    """
+    dt = datetime.fromisoformat(signal_time)
+    return get_session(dt, timeframe)
 
 
 def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
@@ -1665,6 +1735,20 @@ def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
             return "scanner_version incoherent"
         if s["rule_version"] != RULE_VERSION:
             return "rule_version incoherent"
+        # V-2 (LOT C) : coherence session <-> score. Le bonus de session
+        # est inclus dans confluence_score ; le champ session DOIT etre
+        # celui qui a servi au calcul. Avant (defaut 1, JSON 12:10), D1
+        # affichait session="Off" alors que le score contenait le bonus
+        # DailyClose +10 — payloads incoherents sous le meme rule_version.
+        try:
+            sess_expected = _expected_session_for_score(
+                s["signal_time"], s["timeframe"])
+        except Exception:  # noqa: BLE001
+            sess_expected = None
+        if sess_expected is not None and s["session"] != sess_expected:
+            return (f"session incoherente : {s['session']!r} alors que le "
+                    f"score attend la session {sess_expected!r} "
+                    f"(timeframe {s['timeframe']})")
     except Exception as exc:  # noqa: BLE001 - boundary fail-closed
         return f"validateur: {type(exc).__name__}"
     return None
@@ -2039,8 +2123,13 @@ def _render_results() -> None:
     has_scanned = st.session_state.get("scan_time") is not None
     if df_all is None or df_all.empty:
         df_all = pd.DataFrame(columns=DISPLAY_COLS)
-    df_export = (df_all[df_all["Statut"].isin(["Fresh", "Aged"])].copy()
-                 if not df_all.empty else df_all.copy())
+    # C-4 (V3) : les signaux Invalidated sont EMIS dans le pipeline et
+    # doivent aussi etre exportes (CSV/PDF/PNG), marques. Avant, seuls
+    # Fresh/Aged etaient exportes — un signal invalid etait invisible
+    # partout, indiscernable d'une regression.
+    df_export = (df_all[df_all["Statut"].isin(
+        ["Fresh", "Aged", "Invalidated"])].copy()
+        if not df_all.empty else df_all.copy())
     pipeline_signals = st.session_state.get("pipeline_signals", [])
     scan_time = st.session_state.get("scan_time") or datetime.now(timezone.utc)
 
@@ -2090,7 +2179,8 @@ def _render_results() -> None:
 
     if pipeline_signals:
         with st.expander(
-            f"Aperçu JSON Pipeline ({len(pipeline_signals)} signaux Fresh/Aged)"
+            f"Aperçu JSON Pipeline ({len(pipeline_signals)} signaux "
+            f"Fresh/Aged/Invalidated)"
         ):
             st.json(pipeline_signals[0])
 
