@@ -866,7 +866,11 @@ def _evaluate_candle(
         bb_width_pct=bb_pct,
         bb_regime=bb_regime,
         signal_time_utc=candle_time,
-        session=get_session(candle_time),
+        # PG-31b (r9.2) : MEME appel que _compute_confluence_score. Avant,
+        # le payload affichait session="Off" pour D1/Weekly alors que le
+        # score incluait le bonus DailyClose +10 : champ et score
+        # incoherents. Desormais les deux voient "DailyClose".
+        session=get_session(candle_time, tf),
         statut=statut,
         candles_elapsed=(n - 1) - int(idx),
         distance_pct=calc_distance_pct(level_f, close_price),
