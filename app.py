@@ -1,5 +1,5 @@
 """
-CHoCH Scanner v5.15 — Production-grade hardened build.
+CHoCH Scanner v5.19 — Production-grade hardened build.
 
 Monolithic deployment (Streamlit Cloud compatible) but architected as strict
 layered modules in a single file:
@@ -55,14 +55,15 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit.runtime.scriptrunner import RerunException
+# A4 (LOT A) : import interne RerunException supprime — on utilise
+# desormais l'API publique st.rerun().
 from matplotlib.figure import Figure
 from oandapyV20 import API
 from oandapyV20.endpoints import instruments
 from oandapyV20.exceptions import V20Error
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
     Paragraph,
     SimpleDocTemplate,
@@ -75,7 +76,7 @@ from reportlab.platypus import (
 # SECTION 1 — CONSTANTS & RULE REGISTRY
 # =====================================================================
 
-SCANNER_VERSION: Final[str] = "5.15"
+SCANNER_VERSION: Final[str] = "5.16"
 RULE_VERSION: Final[str] = "choch.v58.r9"
 # r7: revert de la fenetre de detection, de la sur-restriction du pivot CHoCH
 # et du couplage du bonus de session ; preserve le BOS, le look-ahead et la
@@ -143,8 +144,10 @@ GRAN_COUNT: Final[Mapping[str, int]] = {
 # ramenait la detection a la derniere bougie cloturee, perdant ~80% des
 # signaux valides (surtout D1/Weekly ou les CHoCH se forment rarement en
 # N-1). D1/Weekly utilisent des fenetres plus courtes car un lookback de 5
-# bougies detecterait des signaux deja Stale par definition.
-# TF_STATUT["Weekly"]["Aged"] = 4).
+# bougies detecterait des signaux deja Stale par definition (cf. TF_STATUT
+# ci-dessous : Weekly Aged = 4 bougies, donc un signal forme a N-5 ou
+# avant est deja Aged ; un lookback de 5 le detecterait systematiquement
+# trop tard).
 DETECTION_LOOKBACK: Final[Mapping[str, int]] = {
     "H1": 5, "H4": 5, "D1": 3, "Weekly": 3,
 }
@@ -171,10 +174,14 @@ PNG_ROWS_PER_PAGE: Final[int] = 40
 
 # Le score de confluence (critere d'emission) et l'identifiant de signal
 # sont visibles et exportables.
+# A9 (LOT A) : "Heure (UTC)" remplacee par "Ouverture bougie (UTC)" +
+# "Confirmation (UTC)" (affichage honnete de l'ouverture vs la cloture
+# confirmative) ; ajout de "Distance actuelle %" (current_distance_pct).
 DISPLAY_COLS: Final[tuple[str, ...]] = (
     "Instrument", "Timeframe", "Type", "Ordre", "Signal",
-    "Niveau", "Distance%", "Score", "Volatilité", "Force", "BB_Width",
-    "Statut", "Heure (UTC)", "signal_id",
+    "Niveau", "Distance%", "Distance actuelle %", "Score",
+    "Volatilité", "Force", "BB_Width", "Statut",
+    "Ouverture bougie (UTC)", "Confirmation (UTC)", "signal_id",
 )
 EXPORT_COLS: Final[tuple[str, ...]] = DISPLAY_COLS
 
@@ -220,7 +227,18 @@ def _configure_root_logger() -> logging.Logger:
     root = logging.getLogger("choch")
     if getattr(root, "_choch_configured", False):
         return root
-    root.setLevel(os.environ.get("CHOCH_LOG_LEVEL", "INFO"))
+    # A10 (LOT A) : une valeur invalide (ex. CHOCH_LOG_LEVEL=verbose) ne
+    # doit pas faire crasher l'import. On valide et on replie sur INFO
+    # avec un warning, plutot que de lever ValueError.
+    level_name = os.environ.get("CHOCH_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, None)
+    if not isinstance(level, int):
+        print(
+            f"CHOCH_LOG_LEVEL inconnu : '{level_name}' — repli sur INFO",
+            file=sys.stderr,
+        )
+        level = logging.INFO
+    root.setLevel(level)
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(_JsonFormatter())
     root.handlers.clear()
@@ -380,7 +398,10 @@ def calc_atr_bundle(
     if tr.size < period * 3:
         return float("nan"), fallback
 
-    # EWM-14 converge à 99.9% après 50 périodes — slice suffit
+    # A10 (LOT A) : correction d'une affirmation inexacte. Un EWM avec
+    # alpha=1/14 atteint ~97,5% de convergence apres 50 periodes (et
+    # ~99,9% apres ~66), pas 99,9% a 50. Le slice a 100 reste largement
+    # suffisant : le poids des bougies au-dela est negligeable.
     tr_ewm = tr[-100:] if tr.size > 100 else tr
     atr_val = float(
         pd.Series(tr_ewm).ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
@@ -721,7 +742,7 @@ def _compute_confluence_score(
         score += 20
     if has_sweep:
         score += 15
-    # D7-a (r9.1) : bonus symetrique pour le BOS. Un BOS continue la tendance
+    # D7-a : bonus symetrique pour le BOS. Un BOS continue la tendance
     # (D1-a) : c'est un evenement structurel aussi informatif qu'un CHoCH,
     # mais il n'a jamais droit au bonus has_sweep (+15, reserve au CHoCH).
     # Sans ce bonus son score plafonnait a 60 (25+15+20) < MIN_SCORE=65 et
@@ -866,7 +887,7 @@ def _evaluate_candle(
         bb_width_pct=bb_pct,
         bb_regime=bb_regime,
         signal_time_utc=candle_time,
-        # PG-31b (r9.2) : MEME appel que _compute_confluence_score. Avant,
+        # PG-31b : MEME appel que _compute_confluence_score. Avant,
         # le payload affichait session="Off" pour D1/Weekly alors que le
         # score incluait le bonus DailyClose +10 : champ et score
         # incoherents. Desormais les deux voient "DailyClose".
@@ -939,12 +960,18 @@ def signal_to_row(inst: str, tf: str, sig: SignalCore) -> dict[str, Any]:
         "Signal": f"{sig.direction} {sig.sig_type}",
         "Niveau": format_niveau(sig.level, inst),
         "Distance%": format_distance(sig.distance_pct),
-        "Score": str(sig.score),
+        "Score": int(sig.score),  # A9 : nombre pour tri numerique
         "Volatilité": sig.volatilite,
         "Force": sig.force,
         "BB_Width": format_bb_width((sig.bb_width_pct, sig.bb_regime)),
         "Statut": sig.statut,
-        "Heure (UTC)": sig.signal_time_utc.strftime("%Y-%m-%d %H:%M"),
+        # A9 : "Heure (UTC)" affichait l'OUVERTURE (signal_time_utc) sans le
+        # dire. Desormais deux colonnes explicites + distance actuelle.
+        "Ouverture bougie (UTC)": sig.signal_time_utc.strftime(
+            "%Y-%m-%d %H:%M"),
+        "Confirmation (UTC)": _confirmation_time(
+            sig.signal_time_utc, tf)[:16].replace("T", " "),
+        "Distance actuelle %": format_distance(sig.current_distance_pct),
         "signal_id": _signal_id(inst, tf, sig),
     }
 
@@ -1056,7 +1083,15 @@ class AuthState:
             return self.aborted
 
     def cancel(self) -> None:
-        """Annulation explicite (bouton Stop) : positionne l'Event."""
+        """Annulation : positionne l'Event (workers + run_scan timeout).
+
+        A7 (LOT A) : il n'y a PAS de bouton Stop dans l'UI ; cancel() est
+        appele par run_scan sur timeout global. Tout commentaire mentionnant
+        un bouton Stop etait faux. Limite documentee : une requete HTTP
+        deja partie ne s'interrompt pas — elle dure jusqu'a
+        OANDA_REQUEST_TIMEOUT ; l'annulation agit AVANT la prochaine
+        tentative et avant chaque backoff sleep.
+        """
         with self.lock:
             self.aborted = True
         self.cancel_event.set()
@@ -1091,16 +1126,25 @@ def _fetch_candles_raw(inst: str, gran: str) -> Optional[list[dict]]:
 )
 def get_candles_cached(
     inst: str, gran: str, cache_bust: int,
+    # A7 (LOT A) : le prefix underscore indique a st.cache_data de NE PAS
+    # hasher cet argument (Streamlit ne sait pas hasher un threading.Event
+    # -> "Cannot hash argument"). C'est correct : l'Event n'influence pas
+    # le resultat (memes bougies pour (inst, gran, cache_bust)) ; il ne
+    # sert qu'a interrompre les retries/backoff.
+    _cancel_event: Optional[threading.Event] = None,
 ) -> Optional[pd.DataFrame]:
     """
     Streamlit-cached candles fetch with explicit cache_bust key
     (le parametre participe reellement a la cle de cache).
     Cache TTL is short (60s) — quotes refresh quickly during market hours.
 
-    Errors ARE surfaced: on any failure we return None and the caller marks
-    the pair as "no_data" (not silently "no_signal"). st.cache_data caches
-    the None for the TTL (60s) — Force refresh (bust cache) bypasses it.
-    For auth errors we raise so the caller can track per-session.
+    A6 (LOT A) : une reponse valide mais insuffisante (< 50 bougies) leve
+    InsufficientDataError et est comptee en no_data. Une vraie panne
+    (v20/network) leve son exception et est comptee en failed. Cette
+    fonction ne renvoie JAMAIS None (comportement r9 obsolete : None etait
+    cache 60 s et masquait une panne reelle). Les exceptions ne sont pas
+    mises en cache : st.cache_data ne met en cache que les valeurs de
+    retour normales. Pour auth errors on raise aussi (tracking session).
     """
     for attempt in range(OANDA_MAX_RETRIES + 1):
         try:
@@ -1111,12 +1155,18 @@ def get_candles_cached(
                 # Bubble up so the caller can update AuthState
                 raise
             if exc.code == 429 and attempt < OANDA_MAX_RETRIES:
+                if _cancel_event is not None and _cancel_event.is_set():
+                    raise requests.RequestException(
+                        f"annulation demandee pour {inst} {gran}")
                 time.sleep(OANDA_BACKOFF_BASE * (2 ** attempt))
                 continue
             # PG-08 : retry sur 5xx (erreur temporaire du serveur OANDA).
             # 500/502/503/504 sont transitoires ; le backoff exponentiel
             # evite de saturer l'API.
             if 500 <= exc.code < 600 and attempt < OANDA_MAX_RETRIES:
+                if _cancel_event is not None and _cancel_event.is_set():
+                    raise requests.RequestException(
+                        f"annulation demandee pour {inst} {gran}")
                 time.sleep(OANDA_BACKOFF_BASE * (2 ** attempt))
                 continue
             _log(logging.WARNING, "oanda_v20_error",
@@ -1126,6 +1176,8 @@ def get_candles_cached(
             raise
         except requests.RequestException as exc:
             if attempt < OANDA_MAX_RETRIES:
+                if _cancel_event is not None and _cancel_event.is_set():
+                    raise
                 time.sleep(OANDA_BACKOFF_BASE * (2 ** attempt))
                 continue
             _log(logging.WARNING, "oanda_network_error",
@@ -1136,12 +1188,12 @@ def get_candles_cached(
             f"retry eteint pour {inst} {gran} sans reponse")
 
     if raw is None or len(raw) < 50:
-        # PG-07 : lever au lieu de cacher un None pendant le TTL (60s).
-        # Une reponse vide/tronquee est une PANNE, pas un "pas de signal" :
-        # le cache la memoriserait silencieusement pendant 60s et masquerait
-        # un probleme reel. L'appelur distingue deja "no_data" ; on leve
-        # pour qu'il le compte en failed et que l'operateur le voie.
-        raise requests.RequestException(
+        # A6 (LOT A) : reponse valide mais contenu insuffisant. Ce n'est pas
+        # une panne reseau : on leve InsufficientDataError pour que l'appel
+        # la compte en no_data. Leve (pas de None cache) car st.cache_data
+        # ne met en cache que les retours normaux — un tel appel refait
+        # donc bien une requete au prochain appel.
+        raise InsufficientDataError(
             f"reponse OANDA insuffisante pour {inst} {gran} "
             f"({len(raw) if raw is not None else 0} < 50 bougies)")
 
@@ -1150,13 +1202,23 @@ def get_candles_cached(
         if (r := _parse_candle_row(c, inst, gran)) is not None
     ]
     if len(rows) < 50:
-        raise requests.RequestException(
+        raise InsufficientDataError(
             f"bougies exploitables insuffisantes pour {inst} {gran} "
             f"({len(rows)} < 50 apres parsing)")
 
     df = pd.DataFrame(rows).set_index("time").sort_index()
     df = df[~df.index.duplicated(keep="last")]
     return df
+
+
+class InsufficientDataError(Exception):
+    """A6 (LOT A) : reponse OANDA valide mais < 50 bougies exploitables.
+
+    Ce n'est PAS une panne reseau ni une erreur v20 : l'API a repondu,
+    mais le contenu est insuffisant pour la detection. Comptee en no_data
+    (pas en failed). Herite d'Exception (pas de requests.RequestException)
+    pour ne pas etre confondue avec une panne reseau.
+    """
 
 
 # =====================================================================
@@ -1173,6 +1235,10 @@ class ScanResult:
     aborted: bool = False
     # PG-03 : compteurs exclusifs. Invariant : la somme vaut
     # pairs_requested (132), verifie par le validateur.
+    # A2 (LOT A) : ok_signal ne compte QUE les signaux VALIDES emis.
+    # Les signaux detectes mais non emis (Stale, doublon de signal_id)
+    # vont dans ok_not_emitted, et les payloads rejetes par le contrat
+    # sont recomptes en invalid_contract par serialize_pipeline.
     coverage_counts: dict[str, int] = field(default_factory=dict)
 
 
@@ -1184,7 +1250,8 @@ def _scan_one(
     if auth.is_aborted():
         return inst, tf_name, None, "aborted"
     try:
-        df = get_candles_cached(inst, tf_code, cache_bust)
+        df = get_candles_cached(inst, tf_code, cache_bust,
+                                auth.cancel_event)
     except V20Error as exc:
         if exc.code == 401:
             n = auth.record_failure()
@@ -1196,6 +1263,12 @@ def _scan_one(
         _log(logging.ERROR, "oanda_network_failure",
              instrument=inst, granularity=tf_name, err=str(exc))
         return inst, tf_name, None, f"failed:net:{type(exc).__name__}"
+    except InsufficientDataError as exc:
+        # A6 (LOT A) : reponse valide mais < 50 bougies -> no_data, pas
+        # failed. Une vraie panne reseau reste en failed:net:.
+        _log(logging.WARNING, "oanda_insufficient_data",
+             instrument=inst, granularity=tf_name, err=str(exc))
+        return inst, tf_name, None, "no_data"
     except Exception as exc:  # noqa: BLE001 — defensive boundary
         _log(logging.ERROR, "scan_one_unexpected",
              instrument=inst, granularity=tf_name, err=str(exc))
@@ -1256,6 +1329,10 @@ def run_scan(
     cov_no_data = 0
     cov_failed = 0
     cov_aborted = 0
+    # A2 (LOT A) : signaux detectes mais non emis en payload (Stale, ou
+    # doublon de signal_id ecarte par seen_ids). Categorie dediee pour
+    # que ok_signal reflete exactement les payloads emis.
+    cov_ok_not_emitted = 0
     seen_ids: set[str] = set()
     # PG-09 : trace les futures deja traitees par as_completed pour eviter
     # un double comptage lors du rattrapage post-timeout.
@@ -1310,7 +1387,15 @@ def run_scan(
                     if sig.statut in ("Fresh", "Aged"):
                         payloads.append(
                             signal_to_payload(inst_r, tf_r, sig, scan_time))
-                cov_ok_signal += 1
+                        cov_ok_signal += 1
+                    else:
+                        # A2 : Stale — detecte, visible dans le tableau,
+                        # mais non emis dans le pipeline JSON.
+                        cov_ok_not_emitted += 1
+                else:
+                    # A2 : doublon de signal_id (deja emis par une autre
+                    # unite). Detecte, non emis.
+                    cov_ok_not_emitted += 1
             else:
                 cov_ok_no_signal += 1
         finally:
@@ -1322,7 +1407,10 @@ def run_scan(
         for fut in as_completed(futures.keys(), timeout=SCAN_GLOBAL_TIMEOUT):
             _handle(fut)
     except TimeoutError:
-        pass
+        # A7 (LOT A) : un timeout global est une demande d'arret. On leve
+        # l'Event d'annulation pour que les workers en vol (backoff sleep
+        # inclus) s'arretent des que possible.
+        auth.cancel()
     # PG-09 : entre le TimeoutError de as_completed et ce balayage, des
     # futures peuvent terminer (race). Il faut les traiter, sinon un
     # resultat disponible serait compte en timed_out et perdu.
@@ -1331,8 +1419,11 @@ def run_scan(
         if f.done():
             if not f.cancelled():
                 # deja traitees par la boucle as_completed ; les nouvelles
-                # terminees depuis le timeout doivent etre gerees ici
-                if f not in _handled:
+                # terminees depuis le timeout doivent etre gerees ici.
+                # A8 (LOT A) : on compare id(f) (le set contient des int),
+                # pas f lui-meme — sinon un Future ne vaut jamais un int et
+                # le test est toujours vrai => double comptage.
+                if id(f) not in _handled:
                     _handle(f)
         else:
             not_done.append(f)
@@ -1360,6 +1451,10 @@ def run_scan(
         coverage_counts={
             "ok_signal": cov_ok_signal,
             "ok_no_signal": cov_ok_no_signal,
+            "ok_not_emitted": cov_ok_not_emitted,
+            # A2 : rempli a 0 ici ; serialize_pipeline recompte les
+            # payloads effectivement rejetes par le contrat.
+            "invalid_contract": 0,
             "no_data": cov_no_data,
             "failed": cov_failed,
             "aborted": cov_aborted,
@@ -1373,7 +1468,13 @@ def run_scan(
 # =====================================================================
 
 def _json_default(obj: Any) -> Any:
-    """Robust JSON converter — no information loss, never crashes."""
+    """A10 (LOT A) : convertisseur JSON — sans perte d'information.
+
+    Le repli str(obj) est DESORMAIS une erreur refusee : serialiser un
+    objet inconnu en chaine cacherait une anomalie de type sous une
+    representation inattendue. Les types attendus sont couverts
+    explicitement ; tout le reste doit echouer bruyamment.
+    """
     if obj is None:
         return None
     if isinstance(obj, (np.bool_,)):
@@ -1390,11 +1491,9 @@ def _json_default(obj: Any) -> Any:
     if isinstance(obj, (datetime, pd.Timestamp)):
         return obj.isoformat()
     if isinstance(obj, (set, frozenset)):
-        return list(obj)
-    try:
-        return str(obj)
-    except Exception:  # noqa: BLE001 - last-resort barrier
-        return "<unserializable>"
+        return sorted(obj)
+    raise TypeError(
+        f"objet non serialisable : {type(obj).__name__}")
 
 
 def _sanitize_json(obj: Any) -> Any:
@@ -1411,7 +1510,14 @@ def _sanitize_json(obj: Any) -> Any:
     return obj
 
 
-SCHEMA_VERSION: Final[str] = "2.0.0"
+# A2 (LOT A) : schema 2.1.0. Changements ADDITIFS dans meta.coverage :
+# ok_signal ne compte plus que les signaux VALIDES emis ; nouvelles
+# categories exclusives ok_not_emitted et invalid_contract. L'invariant
+# somme = pairs_requested est etendu en consequence. Aucun champ signal
+# n'est modifie ni supprime : un consommateur 2.0.0 qui lit coverage
+# tolerant les cles additive n'est pas casse, mais additionalProperties:
+# false impose un bump.
+SCHEMA_VERSION: Final[str] = "2.1.0"
 # 2.0.0 (r9, PHASE 3) : MAJEUR car le SENS de champs change —
 #  - PG-30 : tendance et ATR causaux (un signal emis a t ne depend que de
 #    [0, idx]) ; 31,03 % des signaux a offset>0 changent (mesure r8).
@@ -1583,6 +1689,14 @@ def serialize_pipeline(
             invalid.append(f"{sid}: {raison}")
             _log(logging.ERROR, "signal_rejete_contrat",
                  signal_id=sid, raison=raison)
+    # A2 (LOT A) : ok_signal ne compte QUE les signaux valides emis. Les
+    # payloads rejetes par le contrat sont bascules de ok_signal vers la
+    # categorie dediee invalid_contract. Un signal invalide n'abime plus
+    # jamais le document : on l'ecarte et on garde les autres (fail-closed
+    # au niveau du signal, pas du document).
+    n_rejected = len(invalid)
+    cov_ok_signal = int(coverage_counts.get("ok_signal", 0)) - n_rejected
+    cov_invalid_contract = n_rejected
     doc = {
         "meta": {
             "schema_version": SCHEMA_VERSION,
@@ -1594,8 +1708,12 @@ def serialize_pipeline(
                 "pairs_requested": len(INSTRUMENTS) * len(TIMEFRAMES),
                 # PG-03 : compteurs exclusifs. Invariant somme = 132,
                 # verifie par _validate_doc ci-dessous.
-                "ok_signal": int(coverage_counts.get("ok_signal", 0)),
-                "ok_no_signal": int(coverage_counts.get("ok_no_signal", 0)),
+                "ok_signal": cov_ok_signal,
+                "ok_no_signal": int(
+                    coverage_counts.get("ok_no_signal", 0)),
+                "ok_not_emitted": int(
+                    coverage_counts.get("ok_not_emitted", 0)),
+                "invalid_contract": cov_invalid_contract,
                 "no_data": int(coverage_counts.get("no_data", 0)),
                 "failed": int(coverage_counts.get("failed", 0)),
                 "aborted": int(coverage_counts.get("aborted", 0)),
@@ -1611,19 +1729,27 @@ def serialize_pipeline(
     # PG-03 : invariant de couverture. La somme des compteurs exclusifs doit
     # valoir pairs_requested. Echec bruyant (jamais de document partiel).
     cov = doc["meta"]["coverage"]
-    total = (cov["ok_signal"] + cov["ok_no_signal"] + cov["no_data"]
-             + cov["failed"] + cov["aborted"] + cov["timed_out"])
+    total = (cov["ok_signal"] + cov["ok_no_signal"] + cov["ok_not_emitted"]
+             + cov["invalid_contract"] + cov["no_data"] + cov["failed"]
+             + cov["aborted"] + cov["timed_out"])
     if total != cov["pairs_requested"]:
         raise RuntimeError(
             f"invariant de couverture viole : {total} != "
             f"{cov['pairs_requested']} (ok_signal={cov['ok_signal']}, "
-            f"ok_no_signal={cov['ok_no_signal']}, no_data={cov['no_data']}, "
+            f"ok_no_signal={cov['ok_no_signal']}, "
+            f"ok_not_emitted={cov['ok_not_emitted']}, "
+            f"invalid_contract={cov['invalid_contract']}, "
+            f"no_data={cov['no_data']}, "
             f"failed={cov['failed']}, aborted={cov['aborted']}, "
             f"timed_out={cov['timed_out']})"
         )
-    if cov["ok_signal"] != len(valid):
-        raise RuntimeError(
-            f"ok_signal={cov['ok_signal']} != signaux valides={len(valid)}")
+    # A2 (LOT A) : l'ancien test cov["ok_signal"] != len(valid) levait
+    # RuntimeError et DETRUISAIT le document des qu'un signal etait rejete
+    # — l'inverse du fail-closed. Desormais ok_signal est RECALCULE pour
+    # valoir len(valid) par construction (voir plus haut), donc cette
+    # egalite est toujours verifiee ; on l'affirme sans lever.
+    assert cov["ok_signal"] == len(valid), (
+        f"ok_signal={cov['ok_signal']} != {len(valid)}")
     return json.dumps(
         _sanitize_json(doc), ensure_ascii=False, indent=2,
         default=_json_default, allow_nan=False,
@@ -1650,7 +1776,9 @@ def create_pdf(df_export: pd.DataFrame,
     cols_present = [c for c in EXPORT_COLS if c in df_export.columns]
     widths_map = {c: 60 for c in cols_present}
     widths_map.update({
-        "Instrument": 65, "Distance%": 52, "Statut": 45, "Heure (UTC)": 105,
+        "Instrument": 65, "Distance%": 52, "Distance actuelle %": 52,
+        "Statut": 45, "Ouverture bougie (UTC)": 105,
+        "Confirmation (UTC)": 105, "signal_id": 130,
     })
     col_widths = [widths_map.get(c, 60) for c in cols_present]
     # PG-16 : la largeur totale doit tenir dans la page A4 paysage
@@ -1661,7 +1789,24 @@ def create_pdf(df_export: pd.DataFrame,
     if total > usable:
         scale = usable / total
         col_widths = [w * scale for w in col_widths]
-    data = [cols_present] + df_export[cols_present].values.tolist()
+    # A9 / PG-16 (LOT A) : signal_id fait ~45 caracteres ; en cellule
+    # simple il deborde et est coupe. Un Paragraph reportlab retourne a la
+    # ligne automatiquement. Les autres colonnes restent brutes (nombres).
+    idx_sid = cols_present.index("signal_id") if "signal_id" in cols_present \
+        else None
+    rows_data = []
+    for row in df_export[cols_present].values.tolist():
+        if idx_sid is not None:
+            row = list(row)
+            sid = row[idx_sid]
+            if isinstance(sid, str):
+                row[idx_sid] = Paragraph(
+                    sid,
+                    ParagraphStyle(
+                        "sid", fontName="Helvetica", fontSize=6.5,
+                        leading=8, alignment=1))
+        rows_data.append(row)
+    data = [cols_present] + rows_data
 
     table = Table(data, colWidths=col_widths, repeatRows=1)
     table.setStyle(TableStyle([
@@ -1722,6 +1867,9 @@ def generate_png(data: pd.DataFrame, display_cols: Sequence[str]) -> bytes:
         b.seek(0)
         bufs.append(b)
     from PIL import Image
+    # A10 (LOT A) : Pillow est une dependance transitive de matplotlib
+    # (pinnee explicitement dans requirements.txt). L'import local evite
+    # de charger Pillow au demarrage quand aucun PNG n'est genere.
     imgs = [Image.open(b).convert("RGB") for b in bufs]
     w = max(im.width for im in imgs)
     h = sum(im.height for im in imgs)
@@ -1777,25 +1925,38 @@ def _init_session_state() -> None:
             st.session_state[k] = v
 
 
+def _json_session_key(df_all: pd.DataFrame, scan_time: datetime) -> str:
+    """A5 (LOT A) : cle de cache JSON calculee UNE SEULE FOIS.
+
+    _render_downloads et _render_results doivent construire la MEME cle,
+    sinon le second ne retrouve jamais le document serialise par le
+    premier. Cette fonction unique supprime le recalcul duplique.
+    """
+    ts = scan_time.strftime("%Y%m%d_%H%M%S")
+    content_hash = (
+        hashlib.sha256(
+            pd.util.hash_pandas_object(df_all, index=False).to_numpy()
+            .tobytes()
+        ).hexdigest()[:6] if len(df_all) else "empty"
+    )
+    return f"json_{ts}_{content_hash}"
+
+
 def _render_downloads(
     df_all: pd.DataFrame, df_export: pd.DataFrame,
     pipeline_signals: Sequence[Mapping[str, Any]], scan_time: datetime,
 ) -> None:
-    # cle a la SECONDE + empreinte du contenu ; les anciennes
-    # cles png_/pdf_ sont purgees (memoire) ; dpi 100 au lieu de 200.
     ts = scan_time.strftime("%Y%m%d_%H%M%S")
-    content_hash = hashlib.sha256(
-        pd.util.hash_pandas_object(df_all, index=False).to_numpy().tobytes()
-    ).hexdigest()[:6] if len(df_all) else "empty"
+    json_key = _json_session_key(df_all, scan_time)
+    content_hash = json_key.split("_")[-1]
     for k in list(st.session_state):
         if k.startswith(("png_", "pdf_", "json_")) and k not in (
                 f"png_{ts}_{content_hash}", f"pdf_{ts}_{content_hash}",
                 f"json_{ts}_{content_hash}"):
             del st.session_state[k]
-    # PG-05 : le JSON est serialise UNE SEULE FOIS ici (octets caches en
-    # session_state), jamais re-serialise au rerun. Les compteurs UI
-    # proviennent de meta.signal_count (apres validation fail-closed).
-    json_key = f"json_{ts}_{content_hash}"
+    # A5 (LOT A) : la cle json_ est calculee UNE SEULE FOIS (ici, appelee
+    # aussi par _render_results via _json_session_key). Plus jamais de
+    # recalcul duplique dans _render_results.
     if json_key not in st.session_state:
         st.session_state[json_key] = serialize_pipeline(
             pipeline_signals, scan_time,
@@ -1806,10 +1967,11 @@ def _render_downloads(
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         cols = [c for c in EXPORT_COLS if c in df_export.columns]
-        # PG-18 : utf-8-sig (BOM) pour qu'Excel ouvre correctement les
-        # accents (Volatilité, Détection) sans delimiter guessing.
-        csv_bytes = df_export[cols].to_csv(
-            index=False, encoding="utf-8-sig")
+        # PG-18 / A3 (LOT A) : to_csv() sans chemin renvoie une CHAINE et
+        # ignore encoding ; il faut encoder la chaine en utf-8-sig pour que
+        # la BOM soit presente. Sans elle Excel devine le delimiteur et
+        # casse les accents (Volatilité).
+        csv_bytes = df_export[cols].to_csv(index=False).encode("utf-8-sig")
         st.download_button(
             "CSV", csv_bytes, f"choch_{ts}.csv", "text/csv",
             key=f"dl_csv_{ts}",
@@ -1891,14 +2053,13 @@ def _render_results() -> None:
         )
     if has_scanned:
         _render_downloads(df_all, df_export, pipeline_signals, scan_time)
-        # PG-05 : les compteurs UI proviennent du document JSON serialise
-        # (meta.signal_count, APRES validation fail-closed), pas des
-        # payloads bruts.
-        json_key = (f"json_{scan_time.strftime('%Y%m%d_%H%M%S')}_"
-                    + (hashlib.sha256(
-                        pd.util.hash_pandas_object(
-                            df_all, index=False).to_numpy().tobytes()
-                    ).hexdigest()[:6] if len(df_all) else "empty"))
+        # A5 (LOT A) : les compteurs UI viennent UNIQUEMENT de meta (document
+        # serialise, APRES validation fail-closed). Avant, st.success et
+        # l'expander affichaient len(result.payloads) — compte AVANT
+        # validation, donc superieur a meta.signal_count des qu'un signal
+        # etait rejete. La cle json_ est calculee UNE SEULE FOIS dans
+        # _render_downloads (plus de recalcul duplique fragile ici).
+        json_key = _json_session_key(df_all, scan_time)
         meta = None
         try:
             meta = json.loads(st.session_state[json_key])["meta"]
@@ -1907,18 +2068,22 @@ def _render_results() -> None:
         if meta is not None:
             n_valid = meta["signal_count"]
             n_invalid = len(meta["invalid_signals"])
+            cov_m = meta["coverage"]
             st.caption(
                 f"Pipeline JSON : {n_valid} signal(s) valide(s)"
                 + (f", {n_invalid} rejeté(s) par le contrat"
                    if n_invalid else "")
                 + f" | schema {meta['schema_version']} "
-                f"| rule {meta['rule_version']}"
+                + f"| rule {meta['rule_version']}"
                 + f" | couverture "
-                  f"{meta['coverage']['ok_signal']}+"
-                  f"{meta['coverage']['ok_no_signal']} OK, "
-                  f"{meta['coverage']['no_data']} no_data, "
-                  f"{meta['coverage']['failed']} failed, "
-                  f"{meta['coverage']['timed_out']} timed_out"
+                f"{cov_m['ok_signal']}+{cov_m['ok_no_signal']} OK"
+                + (f", {cov_m['ok_not_emitted']} non emis"
+                   if cov_m.get("ok_not_emitted") else "")
+                + (f", {cov_m['invalid_contract']} rejetes contrat"
+                   if cov_m.get("invalid_contract") else "")
+                + f", {cov_m['no_data']} no_data, "
+                f"{cov_m['failed']} failed, "
+                f"{cov_m['timed_out']} timed_out"
             )
     if not df_all.empty:
         _render_dataframe(df_all)
@@ -1928,6 +2093,27 @@ def _render_results() -> None:
             f"Aperçu JSON Pipeline ({len(pipeline_signals)} signaux Fresh/Aged)"
         ):
             st.json(pipeline_signals[0])
+
+
+def _store_scan_result(
+    result: ScanResult,
+    df: Optional[pd.DataFrame],
+) -> None:
+    """A1 (LOT A) : stockage UNIQUE du resultat, TOUTES branches confondues.
+
+    Avant, la branche "0 signal" ne mettait a jour que df/pipeline_signals/
+    scan_time et conservait les erreurs ET compteurs du scan PRECEDENT ;
+    serialize_pipeline voyait alors des compteurs incoherents et levait
+    l'invariant de couverture. Desormais toutes les cles sont rafraichies
+    dans tous les cas (signaux, 0 signal, interruption, timeout).
+    """
+    st.session_state.df = df
+    st.session_state.pipeline_signals = result.payloads
+    st.session_state.scan_time = result.scan_time
+    st.session_state.scan_errors = list(result.errors)
+    st.session_state.scan_timed_out = int(result.timed_out)
+    # PG-03 : compteurs exclusifs pour l'invariant de couverture
+    st.session_state.scan_coverage_counts = result.coverage_counts
 
 
 def _trigger_scan() -> None:
@@ -1999,9 +2185,10 @@ def _trigger_scan() -> None:
             )
 
         if not result.rows:
-            st.session_state.df = None
-            st.session_state.pipeline_signals = []
-            st.session_state.scan_time = result.scan_time
+            # A1 (LOT A) : _store_scan_result met a jour TOUTES les cles
+            # (y compris erreurs et compteurs) — sinon le JSON du scan
+            # precedent fuitait dans celui-ci.
+            _store_scan_result(result, None)
             st.info("Aucun signal CHoCH/BOS récent qualifié (Score ≥ 65).")
             return
 
@@ -2015,13 +2202,7 @@ def _trigger_scan() -> None:
             .drop(columns=["_time_sort"])
             .reset_index(drop=True)
         )
-        st.session_state.df = df
-        st.session_state.pipeline_signals = result.payloads
-        st.session_state.scan_time = result.scan_time
-        st.session_state.scan_errors = result.errors
-        st.session_state.scan_timed_out = result.timed_out
-        # PG-03 : compteurs exclusifs pour l'invariant de couverture
-        st.session_state.scan_coverage_counts = result.coverage_counts
+        _store_scan_result(result, df)
         st.success(
             f"Scan terminé — {len(df)} signaux | "
             f"{len(result.payloads)} dans le pipeline JSON | "
@@ -2066,14 +2247,20 @@ if force_refresh:
     st.session_state.cache_bust += 1
     get_candles_cached.clear()
     st.toast("Cache des bougies vidé.", icon="🔄")
-    # PG-12 : un rerun explicite est necessaire — sinon le bouton modifie
-    # l'etat session mais l'interface affiche encore les resultats du cache
-    # precedent, et l'utilisateur doit cliquer deux fois. RerunException
-    # (et non st.rerun) pour rester compatible avec le mode script.
-    raise RerunException()
+    # A4 (LOT A) : st.rerun() (API publique). RerunException sans argument
+    # leve une TypeError dans streamlit 1.64.0 (le constructeur exige
+    # rerun_data). [PROUVÉ-EXÉCUTION : signature inspectée =
+    # (self, rerun_data: RerunData) -> None]. RerunException herite de
+    # BaseException, pas de Exception : elle n'est donc pas absorbee par
+    # le except Exception de _trigger_scan. [PROUVÉ-EXÉCUTION : MRO =
+    # RerunException -> ScriptControlException -> BaseException]
+    st.rerun()
 
 if scan_clicked:
     _trigger_scan()
 
-if st.session_state.df is not None:
+# A1 (LOT A) : on rend les resultats des qu'un scan a eu lieu (scan_time),
+# pas seulement quand des signaux existent (df is not None). Sinon un scan
+# a 0 signal ne propose aucun JSON telechargeable (PG-04 non fonctionnel).
+if st.session_state.get("scan_time") is not None:
     _render_results()
