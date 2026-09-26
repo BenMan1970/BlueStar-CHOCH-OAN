@@ -65,10 +65,13 @@ from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer, Table,
 # SECTION 1 — CONSTANTES & REGISTRE DES REGLES
 # =====================================================================
 
-SCANNER_VERSION: Final[str] = "5.20"
+SCANNER_VERSION: Final[str] = "5.21"
 RULE_VERSION: Final[str] = "choch.v58.r11"
 SCHEMA_VERSION: Final[str] = "3.1.0"
 # CHANGELOG
+# 5.21 (aucun signal modifie) : parsing des bougies en un seul passage
+#   (BUG-01), suppression du garde-fou scanning inatteignable (BUG-02),
+#   hash du signal_id recalcule par le validateur.
 # r11 (sorties modifiees -> nouveau RULE_VERSION, signal_id tous changes) :
 #   R11-1 Fenetre de detection DERIVEE de TF_STATUT (Aged + 2). Avant, la
 #         fenetre (H1 5, H4 5, D1 3, W 3) etait plus courte que le seuil
@@ -484,28 +487,40 @@ def age_minutes(signal_time: datetime, tf: str, scan_time: datetime) -> int:
 
 # ---- 4.2 parsing des bougies ----------------------------------------------
 
-def _parse_candle_row(c: Mapping[str, Any], inst: str,
-                      gran: str) -> Optional[dict[str, Any]]:
-    try:
-        mid = c["mid"]
-        open_v = float(mid["o"])
-        high_v = float(mid["h"])
-        low_v = float(mid["l"])
-        close_v = float(mid["c"])
-        t = c["time"]
-    except (KeyError, ValueError, TypeError) as exc:
-        _log(logging.WARNING, "candle_malformed", instrument=inst,
-             granularity=gran, err=str(exc))
-        return None
-    if not all(math.isfinite(v) for v in (open_v, high_v, low_v, close_v)):
-        return None
-    if not (high_v >= low_v and high_v >= max(open_v, close_v)
-            and low_v <= min(open_v, close_v)):
-        _log(logging.WARNING, "candle_inconsistent", instrument=inst,
-             granularity=gran, t=str(t))
-        return None
-    return {"time": pd.to_datetime(t, utc=True), "open": open_v,
-            "high": high_v, "low": low_v, "close": close_v}
+def _candles_to_df(raw: Sequence[Mapping[str, Any]], inst: str,
+                   gran: str) -> pd.DataFrame:
+    """Parsing en un seul passage (BUG-01) : un seul pd.to_datetime
+    vectorise pour toutes les bougies. Ne renvoie jamais None ; leve
+    InsufficientDataError si moins de MIN_CANDLES bougies exploitables."""
+    times: list[str] = []
+    cols: dict[str, list[float]] = {"open": [], "high": [], "low": [],
+                                    "close": []}
+    for c in raw:
+        try:
+            mid = c["mid"]
+            o, h, lo, cl = (float(mid["o"]), float(mid["h"]),
+                            float(mid["l"]), float(mid["c"]))
+            t = str(c["time"])
+        except (KeyError, ValueError, TypeError) as exc:
+            _log(logging.WARNING, "candle_malformed", instrument=inst,
+                 granularity=gran, err=str(exc))
+            continue
+        if not all(math.isfinite(v) for v in (o, h, lo, cl)):
+            continue
+        if not (h >= lo and h >= max(o, cl) and lo <= min(o, cl)):
+            _log(logging.WARNING, "candle_inconsistent", instrument=inst,
+                 granularity=gran, t=t)
+            continue
+        times.append(t)
+        for k, v in zip(cols, (o, h, lo, cl)):
+            cols[k].append(v)
+    if len(times) < MIN_CANDLES:
+        raise InsufficientDataError(
+            f"{inst} {gran} : {len(times)} bougies exploitables "
+            f"(< {MIN_CANDLES}, {len(raw)} recues)")
+    index = pd.DatetimeIndex(pd.to_datetime(times, utc=True), name="time")
+    df = pd.DataFrame(cols, index=index).sort_index()
+    return df[~df.index.duplicated(keep="last")]
 
 
 # ---- 4.3 pivots & tendance -------------------------------------------------
@@ -765,12 +780,17 @@ def detect_choch(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalCore]:
 
 # ---- 4.7 projections (ligne UI / payload JSON) ----------------------------
 
-def _signal_id(inst: str, tf: str, sig: SignalCore) -> str:
-    stamp = sig.signal_time_utc.strftime("%Y%m%dT%H%M")
-    raw = (f"{inst}|{tf}|{stamp}Z|{sig.sig_type}|{sig.direction}"
-           f"|{RULE_VERSION}")
+def _make_signal_id(inst: str, tf: str, signal_time: datetime,
+                    sig_type: str, direction: str) -> str:
+    stamp = signal_time.strftime("%Y%m%dT%H%M")
+    raw = f"{inst}|{tf}|{stamp}Z|{sig_type}|{direction}|{RULE_VERSION}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
     return f"{inst}__{tf}__{stamp}__{digest}"
+
+
+def _signal_id(inst: str, tf: str, sig: SignalCore) -> str:
+    return _make_signal_id(inst, tf, sig.signal_time_utc, sig.sig_type,
+                           sig.direction)
 
 
 @dataclass(frozen=True)
@@ -921,15 +941,8 @@ def get_candles_cached(inst: str, gran: str, env: str, cache_bust: int,
     par _ ne sont pas hashes (credentials, Event). Ne renvoie jamais None :
     toute panne ou reponse insuffisante LEVE (les exceptions ne sont pas
     mises en cache)."""
-    raw = _fetch_with_retry(inst, gran, _creds, _cancel_event)
-    rows = [r for c in raw
-            if (r := _parse_candle_row(c, inst, gran)) is not None]
-    if len(rows) < MIN_CANDLES:
-        raise InsufficientDataError(
-            f"{inst} {gran} : {len(rows)} bougies exploitables "
-            f"(< {MIN_CANDLES}, {len(raw)} recues)")
-    df = pd.DataFrame(rows).set_index("time").sort_index()
-    return df[~df.index.duplicated(keep="last")]
+    return _candles_to_df(
+        _fetch_with_retry(inst, gran, _creds, _cancel_event), inst, gran)
 
 
 # =====================================================================
@@ -1172,8 +1185,6 @@ def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
             if s[k] not in allowed:
                 return f"{k}: valeur hors enum ({s[k]!r})"
         tf = s["timeframe"]
-        if not s["signal_id"].startswith(f"{s['pair_oanda']}__{tf}__"):
-            return "signal_id incoherent avec pair_oanda/timeframe"
         for k in ("is_bullish", "is_choch", "has_sweep"):
             if not isinstance(s[k], bool):
                 return f"{k}: pas un booleen"
@@ -1223,6 +1234,9 @@ def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
         sig_t = datetime.fromisoformat(s["signal_time"])
         conf_t = datetime.fromisoformat(s["confirmation_time"])
         gen_t = datetime.fromisoformat(s["generated_at"])
+        if s["signal_id"] != _make_signal_id(
+                s["pair_oanda"], tf, sig_t, s["type"], s["direction"]):
+            return "signal_id non recalculable (hash/paire/tf/instant)"
         if conf_t != confirmation_time(sig_t, tf):
             return "confirmation_time != signal_time + 1 barre"
         if s["session"] != get_session(sig_t, tf):
@@ -1599,51 +1613,45 @@ def _render_results(scan: StoredScan) -> None:
 
 
 def _init_session_state() -> None:
-    for k, v in {"scanning": False, "cache_bust": 0, "scan": None}.items():
+    for k, v in {"cache_bust": 0, "scan": None}.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 
 def _trigger_scan() -> None:
-    if st.session_state.scanning:
-        return
-    st.session_state.scanning = True
     try:
-        try:
-            creds = resolve_credentials()
-        except ConfigError as exc:
-            st.error(str(exc))
-            return
-        pb = st.progress(0.0, text="Initialisation du scan…")
-        info = st.empty()
-        t0 = time.monotonic()
-        total = len(INSTRUMENTS) * len(TIMEFRAMES)
-        done = 0
+        creds = resolve_credentials()
+    except ConfigError as exc:
+        st.error(str(exc))
+        return
+    pb = st.progress(0.0, text="Initialisation du scan…")
+    info = st.empty()
+    t0 = time.monotonic()
+    total = len(INSTRUMENTS) * len(TIMEFRAMES)
+    done = 0
 
-        def _tick(inst: str, tf: str) -> None:
-            nonlocal done
-            done += 1
-            elapsed = time.monotonic() - t0
-            eta = elapsed / done * (total - done)
-            pb.progress(done / total,
-                        text=f"[{done}/{total}] {inst.replace('_', '/')} "
-                             f"({tf}) — ETA {int(eta)}s")
-            info.caption(f"Workers: {SCAN_MAX_WORKERS} | Timeout: "
-                         f"{SCAN_GLOBAL_TIMEOUT}s | Écoulé: {elapsed:.1f}s")
+    def _tick(inst: str, tf: str) -> None:
+        nonlocal done
+        done += 1
+        elapsed = time.monotonic() - t0
+        eta = elapsed / done * (total - done)
+        pb.progress(done / total,
+                    text=f"[{done}/{total}] {inst.replace('_', '/')} "
+                         f"({tf}) — ETA {int(eta)}s")
+        info.caption(f"Workers: {SCAN_MAX_WORKERS} | Timeout: "
+                     f"{SCAN_GLOBAL_TIMEOUT}s | Écoulé: {elapsed:.1f}s")
 
-        try:
-            result = run_scan(creds, st.session_state.cache_bust,
-                              progress_callback=_tick)
-        except Exception as exc:  # noqa: BLE001 — barriere finale
-            _log(logging.ERROR, "scan_fatal", err=repr(exc))
-            st.error(f"Erreur critique du scan : {exc}")
-            return
-        finally:
-            pb.empty()
-            info.empty()
-        st.session_state.scan = _build_stored_scan(result)
+    try:
+        result = run_scan(creds, st.session_state.cache_bust,
+                          progress_callback=_tick)
+    except Exception as exc:  # noqa: BLE001 — barriere finale
+        _log(logging.ERROR, "scan_fatal", err=repr(exc))
+        st.error(f"Erreur critique du scan : {exc}")
+        return
     finally:
-        st.session_state.scanning = False
+        pb.empty()
+        info.empty()
+    st.session_state.scan = _build_stored_scan(result)
 
 
 # =====================================================================
