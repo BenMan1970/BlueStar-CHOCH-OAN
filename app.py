@@ -1,5 +1,5 @@
 """
-CHoCH Scanner v5.21 — build de production.
+CHoCH Scanner v5.22 — build de production.
 
 Fichier unique (compatible Streamlit Cloud), organise en couches strictes :
     1. Constantes et registre des regles (figes, versionnes)
@@ -51,6 +51,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -77,10 +78,24 @@ from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer, Table,
 # SECTION 1 — CONSTANTES & REGISTRE DES REGLES
 # =====================================================================
 
-SCANNER_VERSION: Final[str] = "5.21"
+SCANNER_VERSION: Final[str] = "5.22"
 RULE_VERSION: Final[str] = "choch.v58.r11"
 SCHEMA_VERSION: Final[str] = "3.1.0"
 # CHANGELOG
+# 5.22 (regles inchangees : RULE_VERSION et signal_id identiques a 5.21) :
+#   F1 as_completed leve concurrent.futures.TimeoutError, qui n'est l'alias
+#      du TimeoutError builtin qu'a partir de Python 3.11. Le except cible
+#      desormais FuturesTimeoutError (scan partiel au lieu d'un crash).
+#   F2 Validateur (AUD-08) : le controle "bb_regime coherent avec
+#      bb_width_pct" etait imbrique dans `if bb is not None` et ne
+#      s'executait donc jamais pour le cas None ; il est sorti du if.
+#   F3 Regime BB calcule sur la valeur ARRONDIE a 2 decimales, comme le
+#      payload : plus de rejet contractuel pour un pct de type 24.996.
+#      (Seul effet possible : le libelle du regime sur ce cas limite ;
+#      score, statut et signal_id ne dependent pas du regime.)
+#   F4 UI : la colonne signal_id n'est plus affichee dans le tableau
+#      Streamlit ; elle reste dans le DataFrame (filtrage UI == JSON) et
+#      dans les exports CSV/PDF/PNG et le JSON.
 # 5.21 (aucun signal modifie) : parsing des bougies en un seul passage
 #   (BUG-01), suppression du garde-fou scanning inatteignable (BUG-02),
 #   hash du signal_id recalcule par le validateur.
@@ -682,6 +697,10 @@ def _detect_liquidity_sweep(high_arr: np.ndarray, low_arr: np.ndarray,
 
 def compute_bb_width(data: pd.DataFrame, length: int = 20,
                      std: int = 2) -> tuple[Optional[float], str]:
+    """(pct brut, regime). F3 : le regime est calcule sur la valeur arrondie
+    a 2 decimales, exactement celle publiee dans le payload, pour que le
+    validateur retrouve le meme regime. Le pct renvoye reste la valeur
+    brute (l'affichage UI est donc inchange)."""
     close = data["close"]
     if len(close) < length * 2:
         return None, "N/A"
@@ -693,9 +712,10 @@ def compute_bb_width(data: pd.DataFrame, length: int = 20,
                * 100.0).iloc[-1]
     if pd.isna(pct_val) or not math.isfinite(pct_val):
         return None, "N/A"
-    if pct_val <= -25:
+    published = round(float(pct_val), 2)
+    if published <= -25:
         return float(pct_val), "Squeeze"
-    if pct_val >= 25:
+    if published >= 25:
         return float(pct_val), "Expansion"
     return float(pct_val), "Normal"
 
@@ -1153,7 +1173,9 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
     try:
         for fut in as_completed(futures, timeout=SCAN_GLOBAL_TIMEOUT):
             _handle(fut)
-    except TimeoutError:
+    except FuturesTimeoutError:
+        # F1 : concurrent.futures.TimeoutError n'est l'alias du TimeoutError
+        # builtin qu'a partir de Python 3.11.
         control.cancel()
     # Race : des futures peuvent finir entre le TimeoutError et ce balayage.
     for fut in futures:
@@ -1277,20 +1299,21 @@ def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
             return "Bullish mais close_price < level"
         if s["direction"] == "Bearish" and s["close_price"] > s["level"]:
             return "Bearish mais close_price > level"
-        # AUD-08 : regime BB recohérent avec bb_width_pct
+        # AUD-08 / F2 : regime BB coherent avec bb_width_pct. Le controle
+        # de coherence None <-> "N/A" est HORS du `if bb is not None`
+        # (avant : imbrique donc mort). Le regime attendu est calcule sur
+        # la valeur publiee (arrondie a 2 decimales, cf. compute_bb_width).
         bb = s["bb_width_pct"]
+        if (bb is None) != (s["bb_regime"] == "N/A"):
+            return "bb_regime incoherent avec bb_width_pct"
         if bb is not None:
-            if (bb is None) != (s["bb_regime"] == "N/A"):
-                return "bb_regime incoherent avec bb_width_pct"
+            if not (_is_num(bb) and math.isfinite(bb)):
+                return "bb_width_pct invalide"
             expected_regime = ("Squeeze" if bb <= -25 else
                                "Expansion" if bb >= 25 else "Normal")
             if s["bb_regime"] != expected_regime:
                 return (f"bb_regime {s['bb_regime']} incoherent avec "
                         f"bb_width_pct={bb}")
-        if s["bb_width_pct"] is not None and not (
-                _is_num(s["bb_width_pct"])
-                and math.isfinite(s["bb_width_pct"])):
-            return "bb_width_pct invalide"
         # Distances : recalcul EXACT depuis les prix publies (R11-4)
         for k_dist, k_px in (("distance_pct", "close_price"),
                              ("current_distance_pct", "current_price")):
@@ -1634,8 +1657,11 @@ _STATUS_STYLE: Final[Mapping[str, str]] = {
 
 
 def _render_dataframe(df_all: pd.DataFrame) -> None:
+    # F4 : signal_id reste dans df_all (filtrage UI == JSON, exports) mais
+    # n'est pas affiche dans le tableau Streamlit.
+    df_view = df_all.drop(columns=["signal_id"], errors="ignore")
     styled = (
-        df_all.style
+        df_view.style
         .map(lambda x: "color:#e879f9;font-weight:bold" if x == "CHoCH"
              else "color:#94a3b8", subset=["Type"])
         .map(lambda x: "color:#00c853;font-weight:bold" if x == "Achat"
