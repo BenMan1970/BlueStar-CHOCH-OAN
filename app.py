@@ -76,6 +76,9 @@ SCHEMA_VERSION: Final[str] = "3.1.0"
 #   (un bug de serialisation ne perd plus le scan), E1 invariant
 #   UI == JSON (exports filtres sur les signaux valides), E2 pairs_failed
 #   ne compte que failed. Aucun signal emis modifie.
+#   C1 valide empiriquement : le plafond BOS D1/Weekly a 60 (< MIN_SCORE)
+#   est une DECISION DE REGLE, pas un bug. Backtest causal n=509.
+#   Aucun signal emis modifie.
 # r11 (sorties modifiees -> nouveau RULE_VERSION, signal_id tous changes) :
 #   R11-1 Fenetre de detection DERIVEE de TF_STATUT (Aged + 2). Avant, la
 #         fenetre (H1 5, H4 5, D1 3, W 3) etait plus courte que le seuil
@@ -152,6 +155,17 @@ DETECTION_LOOKBACK: Final[Mapping[str, int]] = {
 EMITTED_STATUSES: Final[tuple[str, ...]] = ("Fresh", "Aged", "Invalidated")
 
 # Bareme de confluence (max 25+10+20+15+15 = 85)
+# DECISION DE REGLE C1 ( validee empiriquement, ne pas "corriger" ) :
+#   Sous DailyClose (D1/Weekly, session forcee l.444) un BOS plafonne a
+#   25+10+10+15 = 60 < MIN_SCORE -> les BOS D1/Weekly ne sont JAMAIS emis.
+#   Ce plafond est INTENTIONNEL. Backtest causal (33 instruments,
+#   D1 ~2 ans + Weekly ~5 ans, n=509 BOS D1/W) : les BOS D1/W ne sont pas
+#   de mauvais signaux (win rate comparable aux CHoCH emis, MFE legerement
+#   superieur), mais la non-inferiorite n'est pas etablie de facon robuste
+#   (2/5 definitions de "win" l'infirment, IC95 large), et les emettre
+#   ajouterait ~1.4x de signaux D1/W sans gain de qualite prouve.
+#   Verdict : GARDER FILTRE. Pour reouvrir : n>=1000 + non-inferiorite
+#   robuste sur >=3 definitions de win.
 SCORE_BASE: Final[int] = 25
 SCORE_TYPE_BONUS: Final[int] = 10          # CHoCH et BOS (D7-a)
 SCORE_DIST_BONUS: Final[int] = 15
