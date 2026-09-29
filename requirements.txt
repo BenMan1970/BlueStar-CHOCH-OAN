@@ -6,7 +6,9 @@
 # layer (see urllib3 issue #3360); pinning requests alone does not lock the
 # transitive urllib3 version, so a resolver upgrade could reintroduce it.
 # NOTE: Python >= 3.12 is REQUIRED (numpy 2.5.3) - concurrent.futures.TimeoutError
-# is an alias of the builtin only since 3.11 (app.py l.1102).
+# is an alias of the builtin only since 3.11 (app.py, dans run_scan).
+# Les numeros de ligne ne sont pas figes : chercher "except TimeoutError"
+# dans la fonction run_scan.
 streamlit==1.64.0
 pandas==3.0.6
 numpy==2.5.3

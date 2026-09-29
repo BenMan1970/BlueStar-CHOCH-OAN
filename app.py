@@ -5,11 +5,13 @@ Fichier unique (compatible Streamlit Cloud), organise en couches strictes :
     1. Constantes et registre des regles (figes, versionnes)
     2. Logging JSON structure
     3. Configuration et ressources (credentials, client OANDA, pool)
-    4. Couche domaine pure (deterministe, sans effet de bord)
+    4. Couche domaine (deterministe ; le parsing des bougies y log
+       cependant quelques avertissements, cf. _candles_to_df)
     5. Couche I/O (OANDA : retry, annulation)
     6. Orchestration (scan = fonction pure de ses entrees)
     7. Contrat JSON et exports (JSON / CSV / PDF / PNG)
     8. Couche UI (presentation uniquement)
+    9. Entree Streamlit
 
 Invariants :
     - Une seule source de verite par champ de signal (UI == JSON).
@@ -17,8 +19,18 @@ Invariants :
     - Tout payload emis est auto-coherent : score, distances, session,
       statut, confirmation_time et age_minutes sont RECALCULABLES depuis
       le payload lui-meme et verifies par le validateur (fail-closed).
-    - Couverture : somme des compteurs exclusifs == 132, sinon echec bruyant.
-    - Aucun etat mutable partage entre sessions Streamlit.
+      Note : le statut Invalidated depend des bougies completes
+      posterieures a la detection ; il est coherent mais n'est pas
+      recalculable depuis les seuls champs du payload.
+    - Couverture : somme des compteurs exclusifs == 132, et
+      pairs_failed == failed, sinon echec bruyant.
+    - Le pool de threads et le cache des bougies sont partages entre
+      sessions Streamlit (ressources globales, par construction).
+      Deux scans concurrents peuvent donc se attendre mutuellement.
+    - L'invalidation ne considere que les bougies COMPLETES d'un
+      timeframe : un signal Weekly peut rester Fresh tant que la
+      semaine n'est pas close, meme si un prix H1 passe sous le niveau.
+      C'est la causalite du detecteur, pas un bug (cf. audit M1).
 """
 from __future__ import annotations
 
@@ -532,13 +544,17 @@ def _candles_to_df(raw: Sequence[Mapping[str, Any]], inst: str,
         times.append(t)
         for k, v in zip(cols, (o, h, lo, cl)):
             cols[k].append(v)
-    if len(times) < MIN_CANDLES:
-        raise InsufficientDataError(
-            f"{inst} {gran} : {len(times)} bougies exploitables "
-            f"(< {MIN_CANDLES}, {len(raw)} recues)")
+    # AUD-07 : on deduplique AVANT le seuil MIN_CANDLES. Avant, 50 bougies
+    # au meme timestamp etaient comptees comme valides, ne laissant qu'une
+    # seule bougie apres dedup sans declencher InsufficientDataError.
     index = pd.DatetimeIndex(pd.to_datetime(times, utc=True), name="time")
     df = pd.DataFrame(cols, index=index).sort_index()
-    return df[~df.index.duplicated(keep="last")]
+    df = df[~df.index.duplicated(keep="last")]
+    if len(df) < MIN_CANDLES:
+        raise InsufficientDataError(
+            f"{inst} {gran} : {len(df)} bougies exploitables uniques "
+            f"(< {MIN_CANDLES}, {len(raw)} recues)")
+    return df
 
 
 # ---- 4.3 pivots & tendance -------------------------------------------------
@@ -1097,12 +1113,19 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
         o = fut.result()
         try:
             if o.sig is not None:
-                rows.append(signal_to_row(o.inst, o.tf, o.sig))
+                # AUD-04 : atomicite row+payload. On construit les DEUX
+                # representations en variables locales et on n'append qu'une
+                # fois les deux reussies. Avant, rows.append precedait
+                # signal_to_payload : si le payload levait, la row restait
+                # dans l'UI (comptee failed et absente du JSON).
+                row = signal_to_row(o.inst, o.tf, o.sig)
                 if o.sig.statut in EMITTED_STATUSES:
-                    payloads.append(
-                        signal_to_payload(o.inst, o.tf, o.sig, scan_time))
+                    payload = signal_to_payload(o.inst, o.tf, o.sig, scan_time)
+                    rows.append(row)
+                    payloads.append(payload)
                     counts["ok_signal"] += 1
                 else:
+                    rows.append(row)
                     counts["ok_not_emitted"] += 1  # Stale : visible, non emis
             elif o.kind == "no_signal":
                 counts["ok_no_signal"] += 1
@@ -1111,12 +1134,13 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
                 # E2 : errors (-> pairs_failed) ne concerne que failed.
                 # Avant, no_data et aborted-401 y etaient aussi ajoutes,
                 # et un meme evenement etait compte 2 fois sous 2 noms.
-                if o.kind == "failed" and o.detail:
-                    errors.append(f"{o.inst}/{o.tf}: {o.detail}")
+                if o.kind == "failed":
+                    errors.append(
+                        f"{o.inst}/{o.tf}: {o.detail or 'failed'}")
         except Exception as exc:  # noqa: BLE001 — frontiere du compte
             # A6 : un bug dans signal_to_row/signal_to_payload ne doit
             # JAMAIS perdre le scan entier. L'unite est comptee en failed.
-            gran = futures.get(fut, (o.inst, o.tf, o.tf))[2]
+            gran = futures[fut][2]
             _log(logging.ERROR, "handle_unexpected", instrument=o.inst,
                  granularity=gran, err=repr(exc))
             counts["failed"] += 1
@@ -1238,6 +1262,31 @@ def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
             return "distance_atr_multiple invalide ou hors borne"
         if round(dam, 2) != dam:
             return "distance_atr_multiple non arrondi a 2 decimales"
+        # AUD-01 : recalcul EXACT depuis les prix publies. Avant, dam etait
+        # seulement verifie en borne : un payload avec ratio reel 96.0 et
+        # dam=0.68 passait le validateur (bonus de distance indu).
+        expected_dam = round(
+            abs(s["close_price"] - s["level"]) / s["atr"], 2)
+        if dam != expected_dam:
+            return ("distance_atr_multiple non recalculable depuis "
+                    "close_price/level/atr")
+        # AUD-06 : la direction doit etre coherente avec la cassure.
+        # Bullish : clôture AU-DESSUS du niveau casse ; Bearish : en dessous.
+        # On autorise l'egalite (arrondi de publication).
+        if s["direction"] == "Bullish" and s["close_price"] < s["level"]:
+            return "Bullish mais close_price < level"
+        if s["direction"] == "Bearish" and s["close_price"] > s["level"]:
+            return "Bearish mais close_price > level"
+        # AUD-08 : regime BB recohérent avec bb_width_pct
+        bb = s["bb_width_pct"]
+        if bb is not None:
+            if (bb is None) != (s["bb_regime"] == "N/A"):
+                return "bb_regime incoherent avec bb_width_pct"
+            expected_regime = ("Squeeze" if bb <= -25 else
+                               "Expansion" if bb >= 25 else "Normal")
+            if s["bb_regime"] != expected_regime:
+                return (f"bb_regime {s['bb_regime']} incoherent avec "
+                        f"bb_width_pct={bb}")
         if s["bb_width_pct"] is not None and not (
                 _is_num(s["bb_width_pct"])
                 and math.isfinite(s["bb_width_pct"])):
@@ -1264,6 +1313,11 @@ def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
         sig_t = datetime.fromisoformat(s["signal_time"])
         conf_t = datetime.fromisoformat(s["confirmation_time"])
         gen_t = datetime.fromisoformat(s["generated_at"])
+        # AUD-05 : chronologie. Un signal ne peut pas etre confirme APRES
+        # sa generation. Avant, max(0.0, ...) masquait ce cas et age_minutes
+        # valait 0 pour un signal "confirme dans le futur".
+        if conf_t > gen_t:
+            return "confirmation_time posterieur a generated_at"
         if s["signal_id"] != _make_signal_id(
                 s["pair_oanda"], tf, sig_t, s["type"], s["direction"]):
             return "signal_id non recalculable (hash/paire/tf/instant)"
@@ -1346,7 +1400,13 @@ def serialize_pipeline(payloads: Sequence[Mapping[str, Any]],
     cov: dict[str, Any] = {
         "pairs_requested": len(INSTRUMENTS) * len(TIMEFRAMES)}
     for k in _COVERAGE_KEYS:
-        cov[k] = int(coverage_counts[k])
+        # AUD-02 : compteurs strictement entiers et non negatifs.
+        # Avant, int(...) acceptait -1 ou des floats sans controler.
+        value = coverage_counts[k]
+        if not _is_int(value) or value < 0:
+            raise RuntimeError(
+                f"compteur de couverture invalide: {k}={value!r}")
+        cov[k] = value
     cov["ok_signal"] -= len(invalid)
     cov["invalid_contract"] += len(invalid)
     total = sum(cov[k] for k in _COVERAGE_KEYS)
@@ -1360,6 +1420,13 @@ def serialize_pipeline(payloads: Sequence[Mapping[str, Any]],
             f"invariant viole : ok_signal={cov['ok_signal']} != {len(valid)}")
     cov["pairs_failed"] = len(errors)
     cov["pairs_timed_out"] = cov["timed_out"]
+    # AUD-02 : pairs_failed doit valoir EXACTEMENT failed. Sans ce
+    # croisement, un doc avec failed=1 et errors=[] (pairs_failed=0)
+    # etait emis silencieusement, mentant sur la sante du scan.
+    if cov["pairs_failed"] != cov["failed"]:
+        raise RuntimeError(
+            f"invariant viole : pairs_failed={cov['pairs_failed']} != "
+            f"failed={cov['failed']}")
     cov["failures"] = list(errors[:50])
 
     doc = {
@@ -1513,13 +1580,17 @@ def _build_stored_scan(result: ScanResult) -> StoredScan:
     # contenir EXACTEMENT les signaux valides du pipeline JSON. Avant,
     # df_export filtrait seulement sur Statut : un signal rejete par le
     # contrat (Invalidated) y restait, brisant l'invariant.
-    # NB : les signaux Stale restent affiches dans le tableau (visibles,
-    # non emis) — comportement documente l.1627-1630 preserve.
-    if json_bytes is not None and doc is not None and not df.empty:
-        invalid_ids = {s.split(":", 1)[0]
-                       for s in doc["meta"]["invalid_signals"]}
+    # AUD-03 : on filtre en LISTE BLANCHE (valid_ids + Stale), pas en
+    # liste noire sur invalid_signals, car cette derniere est tronquee
+    # a 50 en serialize_pipeline -> au-dela, des rejets restaient affiches.
+    # Les Stale restent affiches (visibles, non emis) : comportement
+    # documente l.1640-1643 preserve.
+    if doc is not None and not df.empty:
+        valid_ids = {s["signal_id"] for s in doc["signals"]}
         n_before = len(df)
-        df = df[~df["signal_id"].isin(invalid_ids)].reset_index(drop=True)
+        df = df[
+            df["signal_id"].isin(valid_ids) | (df["Statut"] == "Stale")
+            ].reset_index(drop=True)
         n_dropped = n_before - len(df)
         if n_dropped:
             _log(logging.WARNING, "ui_json_desync",
@@ -1624,13 +1695,14 @@ def _render_results(scan: StoredScan) -> None:
 
     df_all = scan.df
     # E1 : les exports ne contiennent que les signaux VALIDES du pipeline
-    # JSON (plus le filtre Statut historique, qui reste vrai par
-    # construction : les payloads valides sont tous dans EMITTED_STATUSES).
+    # JSON. AUD-03/m3 : si le JSON a echoue (doc is None), on n'exporte
+    # RIEN (echec ferme) : exporter un CSV non valide brisait l'invariant
+    # UI == JSON et livrait des donnees non contractuelles.
     if scan.doc is not None:
         valid_ids = {s["signal_id"] for s in scan.doc["signals"]}
         df_export = df_all[df_all["signal_id"].isin(valid_ids)]
     else:
-        df_export = df_all[df_all["Statut"].isin(EMITTED_STATUSES)]
+        df_export = df_all.iloc[0:0]   # vide : pas d'export non valide
     _render_downloads(scan, df_export)
 
     if scan.doc is not None:
