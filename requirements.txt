@@ -1,9 +1,12 @@
-# CHoCH Scanner v5.15 - production dependencies (pinned)
+# CHoCH Scanner v5.21 - production dependencies (pinned)
 # Exact versions validated by the forensic audit (2026-09-21) against OANDA practice.
 # NOTE: requests==2.32.4 is REQUIRED - versions >= 2.34 raise SSLEOFError
 # (UNEXPECTED_EOF_WHILE_READING) against api-fxpractice.oanda.com.
+# urllib3 is pinned explicitly: the SSLEOFError is raised from urllib3's TLS
+# layer (see urllib3 issue #3360); pinning requests alone does not lock the
+# transitive urllib3 version, so a resolver upgrade could reintroduce it.
 # NOTE: Python >= 3.12 is REQUIRED (numpy 2.5.3) - concurrent.futures.TimeoutError
-# is an alias of the builtin only since 3.11 (app.py l.1098).
+# is an alias of the builtin only since 3.11 (app.py l.1102).
 streamlit==1.64.0
 pandas==3.0.6
 numpy==2.5.3
@@ -11,3 +14,5 @@ oandapyV20==0.7.2
 reportlab==5.0.1
 matplotlib==3.11.2
 requests==2.32.4
+urllib3==2.8.0
+Pillow==12.3.0

@@ -1,5 +1,5 @@
 """
-CHoCH Scanner v5.20 — build de production.
+CHoCH Scanner v5.21 — build de production.
 
 Fichier unique (compatible Streamlit Cloud), organise en couches strictes :
     1. Constantes et registre des regles (figes, versionnes)
@@ -72,6 +72,10 @@ SCHEMA_VERSION: Final[str] = "3.1.0"
 # 5.21 (aucun signal modifie) : parsing des bougies en un seul passage
 #   (BUG-01), suppression du garde-fou scanning inatteignable (BUG-02),
 #   hash du signal_id recalcule par le validateur.
+#   Audit mandate (lecture seule) : A6 frontiere du compte dans _handle
+#   (un bug de serialisation ne perd plus le scan), E1 invariant
+#   UI == JSON (exports filtres sur les signaux valides), E2 pairs_failed
+#   ne compte que failed. Aucun signal emis modifie.
 # r11 (sorties modifiees -> nouveau RULE_VERSION, signal_id tous changes) :
 #   R11-1 Fenetre de detection DERIVEE de TF_STATUT (Aged + 2). Avant, la
 #         fenetre (H1 5, H4 5, D1 3, W 3) etait plus courte que le seuil
@@ -1012,7 +1016,7 @@ def _scan_one_inner(inst: str, tf: str, gran: str, cache_bust: int,
         if exc.code == 401:
             n = control.record_auth_failure()
             _log(logging.ERROR, "oanda_auth_failure", instrument=inst,
-                 granularity=tf, count=n)
+                 granularity=gran, count=n)
             return UnitOutcome(inst, tf, kind="aborted",
                                detail=f"auth 401 #{n}")
         return UnitOutcome(inst, tf, kind="failed",
@@ -1021,12 +1025,12 @@ def _scan_one_inner(inst: str, tf: str, gran: str, cache_bust: int,
         return UnitOutcome(inst, tf, kind="aborted")
     except requests.RequestException as exc:
         _log(logging.ERROR, "oanda_network_failure", instrument=inst,
-             granularity=tf, err=str(exc))
+             granularity=gran, err=str(exc))
         return UnitOutcome(inst, tf, kind="failed",
                            detail=f"failed:net:{type(exc).__name__}")
     except InsufficientDataError as exc:
         _log(logging.WARNING, "oanda_insufficient_data", instrument=inst,
-             granularity=tf, err=str(exc))
+             granularity=gran, err=str(exc))
         return UnitOutcome(inst, tf, kind="no_data", detail="no_data")
     if control.is_cancelled():
         return UnitOutcome(inst, tf, kind="aborted")
@@ -1041,7 +1045,7 @@ def _scan_one(inst: str, tf: str, gran: str, cache_bust: int,
         return _scan_one_inner(inst, tf, gran, cache_bust, creds, control)
     except Exception as exc:  # noqa: BLE001 — frontiere defensive
         _log(logging.ERROR, "scan_one_unexpected", instrument=inst,
-             granularity=tf, err=repr(exc))
+             granularity=gran, err=repr(exc))
         return UnitOutcome(inst, tf, kind="failed",
                            detail=f"failed:unexpected:{type(exc).__name__}")
 
@@ -1057,9 +1061,9 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
          instruments=len(INSTRUMENTS), timeframes=len(TIMEFRAMES))
 
     executor = _get_scan_executor()
-    futures: dict[Future[UnitOutcome], tuple[str, str]] = {
+    futures: dict[Future[UnitOutcome], tuple[str, str, str]] = {
         executor.submit(_scan_one, inst, tf, gran, cache_bust, creds,
-                        control): (inst, tf)
+                        control): (inst, tf, gran)
         for inst in INSTRUMENTS
         for tf, gran in TIMEFRAMES.items()
     }
@@ -1090,8 +1094,20 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
                 counts["ok_no_signal"] += 1
             else:
                 counts[o.kind] += 1
-                if o.detail:
+                # E2 : errors (-> pairs_failed) ne concerne que failed.
+                # Avant, no_data et aborted-401 y etaient aussi ajoutes,
+                # et un meme evenement etait compte 2 fois sous 2 noms.
+                if o.kind == "failed" and o.detail:
                     errors.append(f"{o.inst}/{o.tf}: {o.detail}")
+        except Exception as exc:  # noqa: BLE001 — frontiere du compte
+            # A6 : un bug dans signal_to_row/signal_to_payload ne doit
+            # JAMAIS perdre le scan entier. L'unite est comptee en failed.
+            gran = futures.get(fut, (o.inst, o.tf, o.tf))[2]
+            _log(logging.ERROR, "handle_unexpected", instrument=o.inst,
+                 granularity=gran, err=repr(exc))
+            counts["failed"] += 1
+            errors.append(
+                f"{o.inst}/{o.tf}: failed:handle:{type(exc).__name__}")
         finally:
             if progress_callback is not None:
                 progress_callback(o.inst, o.tf)
@@ -1479,6 +1495,22 @@ def _build_stored_scan(result: ScanResult) -> StoredScan:
     except (RuntimeError, TypeError, ValueError) as exc:
         json_error = str(exc)
         _log(logging.ERROR, "pipeline_json_failed", err=json_error)
+    # E1 : invariant UI == JSON. Les EXPORTS (CSV/PDF/PNG) doivent
+    # contenir EXACTEMENT les signaux valides du pipeline JSON. Avant,
+    # df_export filtrait seulement sur Statut : un signal rejete par le
+    # contrat (Invalidated) y restait, brisant l'invariant.
+    # NB : les signaux Stale restent affiches dans le tableau (visibles,
+    # non emis) — comportement documente l.1627-1630 preserve.
+    if json_bytes is not None and doc is not None and not df.empty:
+        invalid_ids = {s.split(":", 1)[0]
+                       for s in doc["meta"]["invalid_signals"]}
+        n_before = len(df)
+        df = df[~df["signal_id"].isin(invalid_ids)].reset_index(drop=True)
+        n_dropped = n_before - len(df)
+        if n_dropped:
+            _log(logging.WARNING, "ui_json_desync",
+                 dropped=n_dropped,
+                 raison="signaux rejetes par le contrat retires du tableau")
     return StoredScan(
         scan_time=result.scan_time, df=df, json_bytes=json_bytes, doc=doc,
         json_error=json_error, errors=list(result.errors),
@@ -1577,7 +1609,14 @@ def _render_results(scan: StoredScan) -> None:
                    f"{'; '.join(scan.errors[:5])}")
 
     df_all = scan.df
-    df_export = df_all[df_all["Statut"].isin(EMITTED_STATUSES)]
+    # E1 : les exports ne contiennent que les signaux VALIDES du pipeline
+    # JSON (plus le filtre Statut historique, qui reste vrai par
+    # construction : les payloads valides sont tous dans EMITTED_STATUSES).
+    if scan.doc is not None:
+        valid_ids = {s["signal_id"] for s in scan.doc["signals"]}
+        df_export = df_all[df_all["signal_id"].isin(valid_ids)]
+    else:
+        df_export = df_all[df_all["Statut"].isin(EMITTED_STATUSES)]
     _render_downloads(scan, df_export)
 
     if scan.doc is not None:
