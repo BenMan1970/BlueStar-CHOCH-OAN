@@ -1,14 +1,14 @@
-# CHoCH Scanner v5.21 - production dependencies (pinned)
+# CHoCH Scanner v5.22 - production dependencies (pinned)
 # Exact versions validated by the forensic audit (2026-09-21) against OANDA practice.
 # NOTE: requests==2.32.4 is REQUIRED - versions >= 2.34 raise SSLEOFError
 # (UNEXPECTED_EOF_WHILE_READING) against api-fxpractice.oanda.com.
 # urllib3 is pinned explicitly: the SSLEOFError is raised from urllib3's TLS
 # layer (see urllib3 issue #3360); pinning requests alone does not lock the
 # transitive urllib3 version, so a resolver upgrade could reintroduce it.
-# NOTE: Python >= 3.12 is REQUIRED (numpy 2.5.3) - concurrent.futures.TimeoutError
-# is an alias of the builtin only since 3.11 (app.py, dans run_scan).
-# Les numeros de ligne ne sont pas figes : chercher "except TimeoutError"
-# dans la fonction run_scan.
+# NOTE: Python >= 3.12 is REQUIRED (numpy 2.5.3). On Streamlit Community
+# Cloud the Python version is set in the app's advanced settings, not here.
+# run_scan catches concurrent.futures.TimeoutError explicitly
+# (FuturesTimeoutError), so it is also safe on Python < 3.11 code paths.
 streamlit==1.64.0
 pandas==3.0.6
 numpy==2.5.3
@@ -18,3 +18,4 @@ matplotlib==3.11.2
 requests==2.32.4
 urllib3==2.8.0
 Pillow==12.3.0
+tzdata
