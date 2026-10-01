@@ -27,6 +27,9 @@ Invariants :
       seuls champs du payload.
     - Couverture : somme des compteurs exclusifs == 132, et
       pairs_failed == failed, sinon echec bruyant.
+    - Coupure as-of : toute bougie dont la cloture est posterieure a
+      scan_time est ecartee avant detection (cf. 5.25), de sorte qu'un
+      signal emis ne peut jamais avoir confirmation_time > generated_at.
     - Le pool de threads et le cache des bougies sont partages entre
       sessions Streamlit (ressources globales, par construction).
       Deux scans concurrents peuvent donc se attendre mutuellement.
@@ -81,9 +84,23 @@ from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer, Table,
 # SECTION 1 — CONSTANTES & REGISTRE DES REGLES
 # =====================================================================
 
-SCANNER_VERSION: Final[str] = "5.24"
+SCANNER_VERSION: Final[str] = "5.25"
 RULE_VERSION: Final[str] = "choch.v58.r12"
 SCHEMA_VERSION: Final[str] = "3.2.0"
+# 5.25 (regles inchangees : RULE_VERSION r12 et signal_id identiques a 5.24 ;
+#   schema et colonnes inchanges ; sorties identiques hors cas ci-dessous) :
+#   H1 Coupure as-of (trim_to_asof) : scan_time est pris au debut du scan
+#      mais les bougies sont lues plus tard. Une bougie qui se cloturait
+#      entre les deux etait retenue (complete=True) alors que sa
+#      confirmation_time depassait generated_at : signal legitime rejete
+#      par le validateur (invalid_contract). Ces bougies sont desormais
+#      ecartees AVANT detection ; le signal apparait au scan suivant.
+#      Seul effet : scans lances juste avant une cloture de bougie.
+#   H2 Section 9 encapsulee dans main() + garde __main__ : importer le
+#      module (tests) ne lance plus l'UI. `streamlit run` execute le
+#      script en tant que __main__ : usage inchange.
+#   H3 `assert prec is not None` (supprime par python -O) remplace par un
+#      controle explicite leve dans la frontiere du compte (_handle).
 # 5.24 (sorties modifiees -> nouveau RULE_VERSION r12, signal_id changes ;
 #   schema et colonnes inchanges) :
 #   R12-1 Invalidation sur CLOTURE et non plus sur simple meche : un signal
@@ -591,6 +608,29 @@ def confirmation_time(signal_time: datetime, tf: str) -> datetime:
 def age_minutes(signal_time: datetime, tf: str, scan_time: datetime) -> int:
     delta = (scan_time - confirmation_time(signal_time, tf)).total_seconds()
     return int(max(0.0, delta) // 60)
+
+
+def candle_close_time(open_time: datetime, tf: str) -> datetime:
+    """Cloture d'une bougie complete (meme definition que confirmation_time).
+    Repli sur ouverture + 1 barre si l'ouverture D1/Weekly est hors
+    alignement : le defaut d'alignement reste signale en aval, a la
+    construction du signal, jamais masque ici."""
+    try:
+        return confirmation_time(open_time, tf)
+    except AlignmentError:
+        return open_time + timedelta(seconds=BAR_SECONDS[tf])
+
+
+def trim_to_asof(df: pd.DataFrame, tf: str, as_of: datetime) -> pd.DataFrame:
+    """Coupure causale (5.25 H1) : ecarte les bougies dont la cloture est
+    posterieure a as_of (tz-aware UTC). Pure ; ne modifie pas df ; renvoie
+    df lui-meme (meme objet) si rien n'est ecarte. Seule la queue de la
+    serie peut etre concernee."""
+    keep = len(df)
+    while keep > 0 and candle_close_time(
+            df.index[keep - 1].to_pydatetime(), tf) > as_of:
+        keep -= 1
+    return df if keep == len(df) else df.iloc[:keep]
 
 
 # ---- 4.2 parsing des bougies ----------------------------------------------
@@ -1201,8 +1241,8 @@ class ScanResult:
 
 
 def _scan_one_inner(inst: str, tf: str, gran: str, cache_bust: int,
-                    creds: OandaCredentials,
-                    control: ScanControl) -> UnitOutcome:
+                    creds: OandaCredentials, control: ScanControl,
+                    as_of: datetime) -> UnitOutcome:
     if control.is_cancelled():
         return UnitOutcome(inst, tf, kind="aborted")
     try:
@@ -1232,15 +1272,26 @@ def _scan_one_inner(inst: str, tf: str, gran: str, cache_bust: int,
         return UnitOutcome(inst, tf, kind="no_data", detail="no_data")
     if control.is_cancelled():
         return UnitOutcome(inst, tf, kind="aborted")
+    n_raw = len(df)
+    df = trim_to_asof(df, tf, as_of)
+    if len(df) != n_raw:
+        _log(logging.INFO, "asof_trim", instrument=inst, granularity=gran,
+             dropped=n_raw - len(df))
+    if len(df) < MIN_CANDLES:
+        _log(logging.WARNING, "oanda_insufficient_data_asof",
+             instrument=inst, granularity=gran, n=len(df))
+        return UnitOutcome(inst, tf, kind="no_data", detail="no_data")
     sig = detect_choch(df, tf, inst)
     return UnitOutcome(inst, tf, sig=sig)
 
 
 def _scan_one(inst: str, tf: str, gran: str, cache_bust: int,
-              creds: OandaCredentials, control: ScanControl) -> UnitOutcome:
+              creds: OandaCredentials, control: ScanControl,
+              as_of: datetime) -> UnitOutcome:
     """Frontiere du worker : aucune exception ne remonte a fut.result()."""
     try:
-        return _scan_one_inner(inst, tf, gran, cache_bust, creds, control)
+        return _scan_one_inner(inst, tf, gran, cache_bust, creds, control,
+                               as_of)
     except Exception as exc:  # noqa: BLE001 — frontiere defensive
         _log(logging.ERROR, "scan_one_unexpected", instrument=inst,
              granularity=gran, err=repr(exc))
@@ -1285,7 +1336,8 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
                     progress_callback(inst, tf)
                 continue
             futures[executor.submit(_scan_one, inst, tf, gran, cache_bust,
-                                    creds, control)] = (inst, tf, gran)
+                                    creds, control,
+                                    scan_time)] = (inst, tf, gran)
 
     def _handle(fut: Future[UnitOutcome]) -> None:
         handled.add(fut)
@@ -1306,7 +1358,8 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
                 # signal_to_payload : si le payload levait, la row restait
                 # dans l'UI (comptee failed et absente du JSON).
                 prec = precision.get(o.inst)
-                assert prec is not None  # garanti a la soumission (fail-closed)
+                if prec is None:  # garanti a la soumission (fail-closed)
+                    raise RuntimeError("precision absente apres soumission")
                 row = signal_to_row(o.inst, o.tf, o.sig, prec)
                 if o.sig.statut in EMITTED_STATUSES:
                     payload = signal_to_payload(o.inst, o.tf, o.sig,
@@ -2008,28 +2061,34 @@ def _trigger_scan() -> None:
 # SECTION 9 — POINT D'ENTREE STREAMLIT
 # =====================================================================
 
-st.set_page_config(page_title=f"CHoCH Scanner v{SCANNER_VERSION}",
-                   layout="wide")
-st.title(f"Scanner Change of Character (CHoCH) — v{SCANNER_VERSION} "
-         f"({RULE_VERSION})")
-_init_session_state()
+def main() -> None:
+    """Point d'entree Streamlit (5.25 H2)."""
+    st.set_page_config(page_title=f"CHoCH Scanner v{SCANNER_VERSION}",
+                       layout="wide")
+    st.title(f"Scanner Change of Character (CHoCH) — v{SCANNER_VERSION} "
+             f"({RULE_VERSION})")
+    _init_session_state()
 
-col_a, col_b = st.columns([3, 1])
-with col_a:
-    scan_clicked = st.button("Lancer le Scan", type="primary",
-                             width="stretch", key="btn_scan")
-with col_b:
-    force_refresh = st.button("Force refresh (bust cache)", width="stretch",
-                              key="btn_force_refresh")
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        scan_clicked = st.button("Lancer le Scan", type="primary",
+                                 width="stretch", key="btn_scan")
+    with col_b:
+        force_refresh = st.button("Force refresh (bust cache)", width="stretch",
+                                  key="btn_force_refresh")
 
-if force_refresh:
-    # Nouvelle cle de cache pour CETTE session ; n'efface pas le cache des
-    # autres sessions (pas de get_candles_cached.clear() global).
-    st.session_state.cache_bust += 1
-    st.toast("Le prochain scan rechargera les bougies depuis OANDA.")
+    if force_refresh:
+        # Nouvelle cle de cache pour CETTE session ; n'efface pas le cache des
+        # autres sessions (pas de get_candles_cached.clear() global).
+        st.session_state.cache_bust += 1
+        st.toast("Le prochain scan rechargera les bougies depuis OANDA.")
 
-if scan_clicked:
-    _trigger_scan()
+    if scan_clicked:
+        _trigger_scan()
 
-if st.session_state.scan is not None:
-    _render_results(st.session_state.scan)
+    if st.session_state.scan is not None:
+        _render_results(st.session_state.scan)
+
+
+if __name__ == "__main__":
+    main()
