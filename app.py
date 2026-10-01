@@ -78,9 +78,26 @@ from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer, Table,
 # SECTION 1 — CONSTANTES & REGISTRE DES REGLES
 # =====================================================================
 
-SCANNER_VERSION: Final[str] = "5.22"
+SCANNER_VERSION: Final[str] = "5.23"
 RULE_VERSION: Final[str] = "choch.v58.r11"
-SCHEMA_VERSION: Final[str] = "3.1.0"
+SCHEMA_VERSION: Final[str] = "3.2.0"
+# 5.23 (regles inchangees : RULE_VERSION et signal_id identiques a 5.22) :
+#   T1 validateur : bb_width_pct doit etre arrondi a 2 decimales (m2).
+#   T2 bougie retenue seulement si complete is True (bool strict).
+#   T3 cle de cache : empreinte SHA-256 tronquee du token (jamais le token).
+#   T4 precision : AccountInstruments.displayPrecision, repli EXPLICITE
+#      sur la table figee (politique CHOCH_PRECISION_POLICY), trace en meta.
+#   T5 validateur : prix representables a la precision de l'instrument.
+#   T6 validateur : generated_at du payload == meta.generated_at.
+#   T7 confirmation_time D1/Weekly : prochaine frontiere 17:00
+#      America/New_York (zoneinfo) ; avant : +86400/+604800 s, faux d'1 h
+#      aux transitions DST. signal_id/score/statut non affectes.
+#   T8 OANDA_MAX_ATTEMPTS documente (= retries + 1) ; nombre inchange.
+#   T9 _handle : robuste a une exception de fut.result().
+# schema 3.2.0 (additif) : meta.environment, meta.precision.
+# PROVENANCE C1 : la justification n=509 n'est PAS reproductible a partir
+#   des artefacts du depot (audit 2026-09-30, M2). Comportement conserve
+#   tel quel ; statut empirique : NON VERIFIE.
 # CHANGELOG
 # 5.22 (regles inchangees : RULE_VERSION et signal_id identiques a 5.21) :
 #   F1 as_completed leve concurrent.futures.TimeoutError, qui n'est l'alias
@@ -212,6 +229,14 @@ CANDLES_CACHE_TTL_SECONDS: Final[int] = 60
 MAX_AUTH_FAILURES: Final[int] = 3
 OANDA_MAX_RETRIES: Final[int] = 2
 OANDA_BACKOFF_BASE: Final[float] = 0.25
+# m3 : OANDA_MAX_RETRIES compte les REESSAIS ; tentatives totales = +1.
+OANDA_MAX_ATTEMPTS: Final[int] = OANDA_MAX_RETRIES + 1
+# T7 : alignement explicite = valeurs par defaut documentees par OANDA.
+OANDA_ALIGNMENT_TZ: Final[str] = "America/New_York"
+OANDA_DAILY_ALIGNMENT: Final[int] = 17
+OANDA_WEEKLY_ALIGNMENT: Final[str] = "Friday"
+PRECISION_CACHE_TTL_SECONDS: Final[int] = 3600
+PINNED_PRECISION_SOURCE: Final[str] = "pinned:2026-09-25"
 PNG_ROWS_PER_PAGE: Final[int] = 40
 
 DISPLAY_COLS: Final[tuple[str, ...]] = (
@@ -520,9 +545,26 @@ def status_for_elapsed(candles_elapsed: int, tf: str) -> StatusT:
     return "Stale"
 
 
+class AlignmentError(Exception):
+    """Bougie D1/Weekly non alignee sur 17:00 America/New_York."""
+
+
 def confirmation_time(signal_time: datetime, tf: str) -> datetime:
-    """Cloture de la bougie de cassure = ouverture + 1 barre."""
-    return signal_time + timedelta(seconds=BAR_SECONDS[tf])
+    """Cloture de la bougie de cassure. H1/H4 : ouverture + 1 barre.
+    D1/Weekly : prochaine frontiere 17:00 New York (DST-correct). Fail-closed
+    si l'ouverture n'est pas sur la frontiere attendue."""
+    if tf in ("H1", "H4"):
+        return signal_time + timedelta(seconds=BAR_SECONDS[tf])
+    ny = _tz(OANDA_ALIGNMENT_TZ)
+    local = signal_time.astimezone(ny)
+    if (local.hour, local.minute, local.second) != (
+            OANDA_DAILY_ALIGNMENT, 0, 0):
+        raise AlignmentError(
+            f"{tf} ouverture {signal_time.isoformat()} hors alignement")
+    days = 1 if tf == "D1" else 7
+    nxt = datetime.combine(local.date() + timedelta(days=days),
+                           local.time().replace(tzinfo=None), tzinfo=ny)
+    return nxt.astimezone(timezone.utc)
 
 
 def age_minutes(signal_time: datetime, tf: str, scan_time: datetime) -> int:
@@ -858,8 +900,7 @@ class _Published:
     current_distance_pct: Optional[float]
 
 
-def _published(inst: str, sig: SignalCore) -> _Published:
-    prec = instrument_precision(inst)
+def _published(inst: str, sig: SignalCore, prec: int) -> _Published:
     level = round(sig.level, prec)
     close_p = round(sig.close_price, prec)
     current_p = round(sig.current_price, prec)
@@ -870,8 +911,9 @@ def _published(inst: str, sig: SignalCore) -> _Published:
     )
 
 
-def signal_to_row(inst: str, tf: str, sig: SignalCore) -> dict[str, Any]:
-    pub = _published(inst, sig)
+def signal_to_row(inst: str, tf: str, sig: SignalCore,
+                       prec: int) -> dict[str, Any]:
+    pub = _published(inst, sig, prec)
     return {
         "Instrument": inst.replace("_", "/"),
         "Timeframe": tf,
@@ -897,8 +939,9 @@ def signal_to_row(inst: str, tf: str, sig: SignalCore) -> dict[str, Any]:
 
 
 def signal_to_payload(inst: str, tf: str, sig: SignalCore,
-                      scan_time: datetime) -> dict[str, Any]:
-    pub = _published(inst, sig)
+                      scan_time: datetime,
+                      prec: int) -> dict[str, Any]:
+    pub = _published(inst, sig, prec)
     return {
         "signal_id": _signal_id(inst, tf, sig),
         "scanner_version": SCANNER_VERSION,
@@ -952,12 +995,90 @@ class ScanCancelled(Exception):
 
 def _fetch_candles_raw(inst: str, gran: str,
                        creds: OandaCredentials) -> list[dict[str, Any]]:
-    req = instruments.InstrumentsCandles(
-        instrument=inst,
-        params={"count": GRAN_COUNT[gran], "granularity": gran, "price": "M"},
-    )
+    params: dict[str, Any] = {"count": GRAN_COUNT[gran],
+                               "granularity": gran, "price": "M",
+                               "alignmentTimezone": OANDA_ALIGNMENT_TZ,
+                               "dailyAlignment": OANDA_DAILY_ALIGNMENT}
+    if gran == "W":
+        params["weeklyAlignment"] = OANDA_WEEKLY_ALIGNMENT
+    req = instruments.InstrumentsCandles(instrument=inst, params=params)
     _get_oanda_api(creds).request(req)
-    return [c for c in req.response.get("candles", []) if c.get("complete")]
+    resp = req.response if isinstance(req.response, dict) else {}
+    candles = resp.get("candles", [])
+    if not isinstance(candles, list):
+        return []
+    return [c for c in candles
+            if isinstance(c, dict) and c.get("complete") is True]
+
+
+def _token_fingerprint(creds: OandaCredentials) -> str:
+    return hashlib.sha256(creds.token.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class PrecisionSnapshot:
+    source: str                       # "api" | PINNED_PRECISION_SOURCE | "none"
+    values: Mapping[str, int]
+    drift: tuple[str, ...]            # instruments ou api != table figee
+    error: Optional[str]
+
+    def get(self, inst: str) -> Optional[int]:
+        return self.values.get(inst)
+
+
+@st.cache_data(ttl=PRECISION_CACHE_TTL_SECONDS, show_spinner=False,
+               max_entries=8)
+def _fetch_precisions(env: str, token_fp: str, cache_bust: int,
+                      _creds: OandaCredentials) -> dict[str, int]:
+    """Lecture seule : AccountList (si OANDA_ACCOUNT_ID absent) puis
+    AccountInstruments. Leve en cas d'echec (non mis en cache)."""
+    from oandapyV20.endpoints import accounts
+    api = _get_oanda_api(_creds)
+    acc_id = (os.environ.get("OANDA_ACCOUNT_ID")
+              or _secret("OANDA_ACCOUNT_ID"))
+    if not acc_id:
+        r_list = accounts.AccountList()
+        api.request(r_list)
+        accs = r_list.response.get("accounts", [])
+        if not accs:
+            raise ConfigError("aucun compte pour ce token")
+        acc_id = str(accs[0]["id"])
+    req = accounts.AccountInstruments(
+        accountID=acc_id, params={"instruments": ",".join(INSTRUMENTS)})
+    api.request(req)
+    out: dict[str, int] = {}
+    for item in req.response.get("instruments", []):
+        name, prec = item.get("name"), item.get("displayPrecision")
+        if isinstance(name, str) and _is_int(prec) and 0 <= prec <= 10:
+            out[name] = prec
+    return out
+
+
+def resolve_precision(creds: OandaCredentials,
+                      cache_bust: int) -> PrecisionSnapshot:
+    """Politique (CHOCH_PRECISION_POLICY) :
+      pinned_fallback (defaut, zero regression) : API sinon table figee,
+        source tracee en meta ;
+      strict : API obligatoire ; sinon AUCUNE precision -> unites failed."""
+    policy = (os.environ.get("CHOCH_PRECISION_POLICY")
+              or "pinned_fallback").strip().lower()
+    pinned = {i: instrument_precision(i) for i in INSTRUMENTS}
+    try:
+        api_vals = _fetch_precisions(creds.env, _token_fingerprint(creds),
+                                     cache_bust, _creds=creds)
+    except Exception as exc:  # noqa: BLE001 - repli explicite
+        err = f"{type(exc).__name__}"
+        _log(logging.WARNING, "precision_api_unavailable", err=err,
+             policy=policy, env=creds.env)
+        if policy == "strict":
+            return PrecisionSnapshot("none", {}, (), err)
+        return PrecisionSnapshot(PINNED_PRECISION_SOURCE, pinned, (), err)
+    drift = tuple(sorted(i for i in INSTRUMENTS
+                         if i in api_vals and api_vals[i] != pinned[i]))
+    if drift:
+        _log(logging.WARNING, "precision_drift", instruments=list(drift))
+    vals = {i: api_vals[i] for i in INSTRUMENTS if i in api_vals}
+    return PrecisionSnapshot("api", vals, drift, None)
 
 
 def _fetch_with_retry(inst: str, gran: str, creds: OandaCredentials,
@@ -988,13 +1109,13 @@ def _fetch_with_retry(inst: str, gran: str, creds: OandaCredentials,
 
 @st.cache_data(ttl=CANDLES_CACHE_TTL_SECONDS, show_spinner=False,
                max_entries=512)
-def get_candles_cached(inst: str, gran: str, env: str, cache_bust: int,
-                       _creds: OandaCredentials,
+def get_candles_cached(inst: str, gran: str, env: str, token_fp: str,
+                       cache_bust: int, _creds: OandaCredentials,
                        _cancel_event: threading.Event) -> pd.DataFrame:
-    """Cle de cache : (inst, gran, env, cache_bust). Les arguments prefixes
-    par _ ne sont pas hashes (credentials, Event). Ne renvoie jamais None :
-    toute panne ou reponse insuffisante LEVE (les exceptions ne sont pas
-    mises en cache)."""
+    """Cle de cache : (inst, gran, env, token_fp, cache_bust). Les arguments
+    prefixes par _ ne sont pas hashes (credentials, Event). Ne renvoie jamais
+    None : toute panne ou reponse insuffisante LEVE (les exceptions ne sont
+    pas mises en cache)."""
     return _candles_to_df(
         _fetch_with_retry(inst, gran, _creds, _cancel_event), inst, gran)
 
@@ -1051,6 +1172,8 @@ class ScanResult:
     auth_aborted: bool
     # Compteurs EXCLUSIFS ; somme == 132 (verifiee par serialize_pipeline)
     coverage_counts: dict[str, int]
+    env: str = "practice"
+    precision: Optional[PrecisionSnapshot] = None
 
 
 def _scan_one_inner(inst: str, tf: str, gran: str, cache_bust: int,
@@ -1059,7 +1182,8 @@ def _scan_one_inner(inst: str, tf: str, gran: str, cache_bust: int,
     if control.is_cancelled():
         return UnitOutcome(inst, tf, kind="aborted")
     try:
-        df = get_candles_cached(inst, gran, creds.env, cache_bust,
+        df = get_candles_cached(inst, gran, creds.env,
+                                _token_fingerprint(creds), cache_bust,
                                 _creds=creds,
                                 _cancel_event=control.cancel_event)
     except V20Error as exc:
@@ -1108,15 +1232,23 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
     control = ScanControl()
     t0 = time.perf_counter()
     _log(logging.INFO, "scan_start", correlation_id=correlation_id,
+         env=creds.env, scanner_version=SCANNER_VERSION,
+         rule_version=RULE_VERSION, schema_version=SCHEMA_VERSION,
          instruments=len(INSTRUMENTS), timeframes=len(TIMEFRAMES))
+    precision = resolve_precision(creds, cache_bust)
 
     executor = _get_scan_executor()
-    futures: dict[Future[UnitOutcome], tuple[str, str, str]] = {
-        executor.submit(_scan_one, inst, tf, gran, cache_bust, creds,
-                        control): (inst, tf, gran)
-        for inst in INSTRUMENTS
-        for tf, gran in TIMEFRAMES.items()
-    }
+    futures: dict[Future[UnitOutcome], tuple[str, str, str]] = {}
+    for inst in INSTRUMENTS:
+        for tf, gran in TIMEFRAMES.items():
+            if precision.get(inst) is None:   # fail-closed, aucun appel
+                counts["failed"] += 1
+                errors.append(f"{inst}/{tf}: failed:precision_unknown")
+                if progress_callback is not None:
+                    progress_callback(inst, tf)
+                continue
+            futures[executor.submit(_scan_one, inst, tf, gran, cache_bust,
+                                    creds, control)] = (inst, tf, gran)
 
     rows: list[dict[str, Any]] = []
     payloads: list[dict[str, Any]] = []
@@ -1130,7 +1262,15 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
 
     def _handle(fut: Future[UnitOutcome]) -> None:
         handled.add(fut)
-        o = fut.result()
+        inst, tf, gran = futures[fut]
+        try:
+            o = fut.result()
+        except Exception as exc:  # noqa: BLE001 - T9
+            counts["failed"] += 1
+            errors.append(f"{inst}/{tf}: failed:result:{type(exc).__name__}")
+            if progress_callback is not None:
+                progress_callback(inst, tf)
+            return
         try:
             if o.sig is not None:
                 # AUD-04 : atomicite row+payload. On construit les DEUX
@@ -1138,9 +1278,12 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
                 # fois les deux reussies. Avant, rows.append precedait
                 # signal_to_payload : si le payload levait, la row restait
                 # dans l'UI (comptee failed et absente du JSON).
-                row = signal_to_row(o.inst, o.tf, o.sig)
+                prec = precision.get(o.inst)
+                assert prec is not None  # garanti a la soumission (fail-closed)
+                row = signal_to_row(o.inst, o.tf, o.sig, prec)
                 if o.sig.statut in EMITTED_STATUSES:
-                    payload = signal_to_payload(o.inst, o.tf, o.sig, scan_time)
+                    payload = signal_to_payload(o.inst, o.tf, o.sig,
+                                                scan_time, prec)
                     rows.append(row)
                     payloads.append(payload)
                     counts["ok_signal"] += 1
@@ -1160,12 +1303,12 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
         except Exception as exc:  # noqa: BLE001 — frontiere du compte
             # A6 : un bug dans signal_to_row/signal_to_payload ne doit
             # JAMAIS perdre le scan entier. L'unite est comptee en failed.
-            gran = futures[fut][2]
             _log(logging.ERROR, "handle_unexpected", instrument=o.inst,
                  granularity=gran, err=repr(exc))
             counts["failed"] += 1
-            errors.append(
-                f"{o.inst}/{o.tf}: failed:handle:{type(exc).__name__}")
+            kind = ("alignment" if isinstance(exc, AlignmentError)
+                    else f"handle:{type(exc).__name__}")
+            errors.append(f"{o.inst}/{o.tf}: failed:{kind}")
         finally:
             if progress_callback is not None:
                 progress_callback(o.inst, o.tf)
@@ -1188,12 +1331,15 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
             counts["timed_out"] += 1
 
     _log(logging.INFO, "scan_end", correlation_id=correlation_id,
-         signals=len(rows), pipeline=len(payloads), errors=len(errors),
-         timed_out=counts["timed_out"], auth_aborted=control.auth_aborted,
+         env=creds.env, signals=len(rows), pipeline=len(payloads),
+         errors=len(errors), timed_out=counts["timed_out"],
+         auth_aborted=control.auth_aborted, precision_source=precision.source,
+         precision_drift=list(precision.drift), counts=counts,
          total_ms=round((time.perf_counter() - t0) * 1000, 1))
     return ScanResult(rows=rows, payloads=payloads, errors=errors,
                       scan_time=scan_time, auth_aborted=control.auth_aborted,
-                      coverage_counts=counts)
+                      coverage_counts=counts, env=creds.env,
+                      precision=precision)
 
 
 # =====================================================================
@@ -1237,7 +1383,10 @@ def _is_num(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
+def _validate_signal(s: Mapping[str, Any],
+                         precision: Optional[Mapping[str, int]] = None,
+                         expected_generated_at: Optional[str] = None
+                         ) -> Optional[str]:
     """Contrat d'un signal. Renvoie la raison du rejet, ou None."""
     try:
         extra = set(s) - set(_SIGNAL_REQUIRED)
@@ -1279,6 +1428,15 @@ def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
         for k in ("level", "close_price", "current_price", "atr"):
             if not _is_num(s[k]) or not (math.isfinite(s[k]) and s[k] > 0):
                 return f"{k}: valeur invalide"
+        if precision is not None:
+            prec = precision.get(s["pair_oanda"])
+            if not _is_int(prec):
+                return "precision instrument inconnue"
+            for k in ("level", "close_price", "current_price"):
+                if round(s[k], prec) != s[k]:
+                    return f"{k} non represente a displayPrecision={prec}"
+            if round(s["atr"], prec + 2) != s["atr"]:
+                return "atr non arrondi a precision+2"
         dam = s["distance_atr_multiple"]
         if not _is_num(dam) or not (0.0 <= dam <= ATR_DIST_MULT):
             return "distance_atr_multiple invalide ou hors borne"
@@ -1309,6 +1467,8 @@ def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
         if bb is not None:
             if not (_is_num(bb) and math.isfinite(bb)):
                 return "bb_width_pct invalide"
+            if round(bb, 2) != bb:
+                return "bb_width_pct non arrondi a 2 decimales"
             expected_regime = ("Squeeze" if bb <= -25 else
                                "Expansion" if bb >= 25 else "Normal")
             if s["bb_regime"] != expected_regime:
@@ -1333,6 +1493,9 @@ def _validate_signal(s: Mapping[str, Any]) -> Optional[str]:
         for k in ("generated_at", "signal_time", "confirmation_time"):
             if not _RE_ISO_UTC.match(str(s[k])):
                 return f"{k}: pas ISO 8601 UTC"
+        if (expected_generated_at is not None
+                and s["generated_at"] != expected_generated_at):
+            return "generated_at != meta.generated_at"
         sig_t = datetime.fromisoformat(s["signal_time"])
         conf_t = datetime.fromisoformat(s["confirmation_time"])
         gen_t = datetime.fromisoformat(s["generated_at"])
@@ -1400,14 +1563,18 @@ _COVERAGE_KEYS: Final[tuple[str, ...]] = (
 
 
 def serialize_pipeline(payloads: Sequence[Mapping[str, Any]],
-                       scan_time: datetime, errors: Sequence[str],
-                       coverage_counts: Mapping[str, int]) -> bytes:
+                          scan_time: datetime, errors: Sequence[str],
+                          coverage_counts: Mapping[str, int],
+                          precision: Optional[PrecisionSnapshot] = None,
+                          env: Optional[str] = None) -> bytes:
     """Document JSON du pipeline. Fail-closed par signal (rejete + trace),
     fail-loud sur les invariants du document (RuntimeError)."""
     valid: list[Mapping[str, Any]] = []
     invalid: list[str] = []
     for p in payloads:
-        reason = _validate_signal(p)
+        reason = _validate_signal(
+            p, None if precision is None else precision.values,
+            scan_time.isoformat())
         if reason is None:
             valid.append(p)
         else:
@@ -1457,6 +1624,11 @@ def serialize_pipeline(payloads: Sequence[Mapping[str, Any]],
             "schema_version": SCHEMA_VERSION,
             "scanner_version": SCANNER_VERSION,
             "rule_version": RULE_VERSION,
+            "environment": env,
+            "precision": (None if precision is None else {
+                "source": precision.source,
+                "drift": list(precision.drift),
+                "error": precision.error}),
             "generated_at": scan_time.isoformat(),
             "signal_count": len(valid),
             "status_counts": {
@@ -1594,7 +1766,8 @@ def _build_stored_scan(result: ScanResult) -> StoredScan:
     try:
         json_bytes = serialize_pipeline(result.payloads, result.scan_time,
                                         result.errors,
-                                        result.coverage_counts)
+                                        result.coverage_counts,
+                                        result.precision, result.env)
         doc = json.loads(json_bytes)
     except (RuntimeError, TypeError, ValueError) as exc:
         json_error = str(exc)
@@ -1718,6 +1891,11 @@ def _render_results(scan: StoredScan) -> None:
     if scan.errors:
         st.warning(f"{len(scan.errors)} erreur(s) : "
                    f"{'; '.join(scan.errors[:5])}")
+    if scan.doc is not None:
+        env = scan.doc["meta"].get("environment")
+        src = (scan.doc["meta"].get("precision") or {}).get("source")
+        (st.error if env == "live" else st.info)(
+            f"Environnement OANDA : {env} | precision : {src}")
 
     df_all = scan.df
     # E1 : les exports ne contiennent que les signaux VALIDES du pipeline
