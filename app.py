@@ -1,5 +1,5 @@
 """
-CHoCH Scanner v5.22 — build de production.
+CHoCH Scanner — build de production (version : voir SCANNER_VERSION).
 
 Fichier unique (compatible Streamlit Cloud), organise en couches strictes :
     1. Constantes et registre des regles (figes, versionnes)
@@ -15,13 +15,16 @@ Fichier unique (compatible Streamlit Cloud), organise en couches strictes :
 
 Invariants :
     - Une seule source de verite par champ de signal (UI == JSON).
+    - Une seule source de verite pour la version : SCANNER_VERSION (le
+      docstring ne porte volontairement aucun numero).
     - signal_id deterministe et reproductible.
     - Tout payload emis est auto-coherent : score, distances, session,
       statut, confirmation_time et age_minutes sont RECALCULABLES depuis
       le payload lui-meme et verifies par le validateur (fail-closed).
       Note : le statut Invalidated depend des bougies completes
-      posterieures a la detection ; il est coherent mais n'est pas
-      recalculable depuis les seuls champs du payload.
+      posterieures a la detection (CLOTURE au-dela du niveau + marge ATR,
+      cf. r12) ; il est coherent mais n'est pas recalculable depuis les
+      seuls champs du payload.
     - Couverture : somme des compteurs exclusifs == 132, et
       pairs_failed == failed, sinon echec bruyant.
     - Le pool de threads et le cache des bougies sont partages entre
@@ -78,9 +81,22 @@ from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer, Table,
 # SECTION 1 — CONSTANTES & REGISTRE DES REGLES
 # =====================================================================
 
-SCANNER_VERSION: Final[str] = "5.23"
-RULE_VERSION: Final[str] = "choch.v58.r11"
+SCANNER_VERSION: Final[str] = "5.24"
+RULE_VERSION: Final[str] = "choch.v58.r12"
 SCHEMA_VERSION: Final[str] = "3.2.0"
+# 5.24 (sorties modifiees -> nouveau RULE_VERSION r12, signal_id changes ;
+#   schema et colonnes inchanges) :
+#   R12-1 Invalidation sur CLOTURE et non plus sur simple meche : un signal
+#         n'est invalide que si une bougie complete posterieure CLOTURE
+#         au-dela du niveau casse + INVALIDATION_BUFFER_ATR x ATR. Une meche
+#         qui revient clore du bon cote (sweep / retest) n'est plus un echec.
+#         Mettre INVALIDATION_BUFFER_ATR = 0.0 pour une cloture stricte.
+#   F5  run_scan : counts/errors/rows/payloads/handled etaient utilises
+#       dans la boucle de soumission AVANT d'etre definis (UnboundLocalError
+#       des qu'un instrument n'avait pas de precision connue : API
+#       partielle ou politique strict). Declares avant la boucle.
+#   F6  Version : le docstring portait "v5.22" alors que la constante
+#       valait 5.23. Le docstring ne porte plus de numero.
 # 5.23 (regles inchangees : RULE_VERSION et signal_id identiques a 5.22) :
 #   T1 validateur : bb_width_pct doit etre arrondi a 2 decimales (m2).
 #   T2 bougie retenue seulement si complete is True (bool strict).
@@ -123,6 +139,7 @@ SCHEMA_VERSION: Final[str] = "3.2.0"
 #   C1 valide empiriquement : le plafond BOS D1/Weekly a 60 (< MIN_SCORE)
 #   est une DECISION DE REGLE, pas un bug. Backtest causal n=509.
 #   Aucun signal emis modifie.
+# r12 : invalidation sur cloture + marge ATR (cf. 5.24 / R12-1).
 # r11 (sorties modifiees -> nouveau RULE_VERSION, signal_id tous changes) :
 #   R11-1 Fenetre de detection DERIVEE de TF_STATUT (Aged + 2). Avant, la
 #         fenetre (H1 5, H4 5, D1 3, W 3) etait plus courte que le seuil
@@ -221,6 +238,10 @@ SESSION_BONUS: Final[Mapping[str, int]] = {
 }
 MIN_SCORE: Final[int] = 65
 ATR_DIST_MULT: Final[float] = 1.8
+# R12-1 : marge d'invalidation (en multiple d'ATR), meme valeur que la marge
+# du sweep. Un signal n'est invalide que si une bougie complete posterieure
+# CLOTURE au-dela de niveau -/+ marge. 0.0 = cloture stricte.
+INVALIDATION_BUFFER_ATR: Final[float] = 0.25
 
 SCAN_GLOBAL_TIMEOUT: Final[int] = 180
 SCAN_MAX_WORKERS: Final[int] = 6
@@ -810,13 +831,16 @@ def _evaluate_candle(*, idx: int, df: pd.DataFrame, ohlc: _Ohlc,
 
     n = ohlc.close.size
     elapsed = (n - 1) - idx
-    # Invalidation : niveau franchi APRES la confirmation (bougies idx+1..).
-    #  Bullish : ancienne resistance cassee ; echec si low < level.
-    #  Bearish : ancien support casse ; echec si high > level.
+    # R12-1 — Invalidation sur CLOTURE (et non sur simple meche) : niveau
+    # perdu APRES la confirmation (bougies idx+1..), avec une marge ATR.
+    #  Bullish : ancienne resistance cassee ; echec si une cloture < level - marge.
+    #  Bearish : ancien support casse ; echec si une cloture > level + marge.
+    # Une meche qui revient clore du bon cote (sweep / retest) n'invalide pas.
+    buf = INVALIDATION_BUFFER_ATR * atr_val
     if direction == "Bullish":
-        invalidated = bool((ohlc.low[idx + 1:] < level).any())
+        invalidated = bool((ohlc.close[idx + 1:] < level - buf).any())
     else:
-        invalidated = bool((ohlc.high[idx + 1:] > level).any())
+        invalidated = bool((ohlc.close[idx + 1:] > level + buf).any())
     base_status = status_for_elapsed(elapsed, tf)
     # R11-2 : Stale prioritaire (un signal expire n'est jamais emis)
     statut: StatusT = ("Invalidated"
@@ -1237,6 +1261,19 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
          instruments=len(INSTRUMENTS), timeframes=len(TIMEFRAMES))
     precision = resolve_precision(creds, cache_bust)
 
+    # F5 : tous les accumulateurs sont declares AVANT la boucle de
+    # soumission (qui incremente counts/errors pour les unites sans
+    # precision connue).
+    rows: list[dict[str, Any]] = []
+    payloads: list[dict[str, Any]] = []
+    errors: list[str] = []
+    counts: dict[str, int] = {
+        "ok_signal": 0, "ok_no_signal": 0, "ok_not_emitted": 0,
+        "invalid_contract": 0, "no_data": 0, "failed": 0, "aborted": 0,
+        "timed_out": 0,
+    }
+    handled: set[Future[UnitOutcome]] = set()
+
     executor = _get_scan_executor()
     futures: dict[Future[UnitOutcome], tuple[str, str, str]] = {}
     for inst in INSTRUMENTS:
@@ -1249,16 +1286,6 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
                 continue
             futures[executor.submit(_scan_one, inst, tf, gran, cache_bust,
                                     creds, control)] = (inst, tf, gran)
-
-    rows: list[dict[str, Any]] = []
-    payloads: list[dict[str, Any]] = []
-    errors: list[str] = []
-    counts: dict[str, int] = {
-        "ok_signal": 0, "ok_no_signal": 0, "ok_not_emitted": 0,
-        "invalid_contract": 0, "no_data": 0, "failed": 0, "aborted": 0,
-        "timed_out": 0,
-    }
-    handled: set[Future[UnitOutcome]] = set()
 
     def _handle(fut: Future[UnitOutcome]) -> None:
         handled.add(fut)
