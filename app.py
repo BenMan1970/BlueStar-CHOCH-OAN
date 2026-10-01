@@ -1891,12 +1891,6 @@ def _render_results(scan: StoredScan) -> None:
     if scan.errors:
         st.warning(f"{len(scan.errors)} erreur(s) : "
                    f"{'; '.join(scan.errors[:5])}")
-    if scan.doc is not None:
-        env = scan.doc["meta"].get("environment")
-        src = (scan.doc["meta"].get("precision") or {}).get("source")
-        (st.error if env == "live" else st.info)(
-            f"Environnement OANDA : {env} | precision : {src}")
-
     df_all = scan.df
     # E1 : les exports ne contiennent que les signaux VALIDES du pipeline
     # JSON. AUD-03/m3 : si le JSON a echoue (doc is None), on n'exporte
