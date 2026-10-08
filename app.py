@@ -84,9 +84,37 @@ from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer, Table,
 # SECTION 1 — CONSTANTES & REGISTRE DES REGLES
 # =====================================================================
 
-SCANNER_VERSION: Final[str] = "5.25"
-RULE_VERSION: Final[str] = "choch.v58.r12"
+SCANNER_VERSION: Final[str] = "5.26"
+RULE_VERSION: Final[str] = "choch.v58.r13"
 SCHEMA_VERSION: Final[str] = "3.2.0"
+# 5.26 (sorties modifiees -> nouveau RULE_VERSION r13, signal_id changes ;
+#   schema et colonnes inchanges) :
+#   R13-1 BUG (audit remarque #4) : dist_atr etait calcule par le domaine avec
+#      l'ATR brut, alors que le validateur le recalcule depuis l'ATR publie
+#      (arrondi a precision+2). Mesure sur OANDA practice (33 instruments x 4
+#      timeframes, 5728 candidats structurels) : ~0,07 % (4/5728) etaient
+#      emis puis REJETES par le contrat (invalid_contract) sur un ecart de
+#      0,01 ATR : un signal valide etait perdu silencieusement. dist_atr est
+#      desormais calcule depuis les valeurs PUBLIEES ; domaine et validateur
+#      trouvent exactement la meme valeur. Filtre 1,8 ATR, bonus de score et
+#      MIN_SCORE s'appliquent sur cette valeur publique : zero rejet
+#      contractuel possible, zero signal valide perdu.
+#   R13-2 BUG (audit remarque #5) : deux pivots au plus haut (ou plus bas)
+#      STRICTEMENT egal, espaces de <= lookback barres, formaient deux
+#      swings distincts : le second etait etiquete LH/LL sans aucun mouvement
+#      de prix, pouvant fausser la tendance (mesure : 12/132 unites
+#      concernees, tendance changee dans 1 cas ; 0 signal emis modifie).
+#      Deduplication : un seul swing, le premier (etablissement du niveau).
+#   F7 BUG (audit remarque #7) : le label BB affichait l'entier tronque
+#      (ex. "-25%_Normal") alors que le regime est calcule sur l'arrondi a 2
+#      decimales : ~1 % des labels contredisaient le regime affiche. Le label
+#      affiche desormais la valeur publiee a 2 decimales.
+#   DOC (audit remarques #2, #3, #6) : le commentaire C1 n'affirme plus un
+#      backtest n=509 non reproductible depuis le depot (statut NON VERIFIE ;
+#      la decision de regle est CONSERVEE) ; Force et Volatilite sont
+#      documentes pour ce qu'ils mesurent ; les seuils non backtestes sont
+#      signales explicitement dans le code.
+#   AUDIT : pyflakes + analyse AST : zero code mort, zero import inutilise.
 # 5.25 (regles inchangees : RULE_VERSION r12 et signal_id identiques a 5.24 ;
 #   schema et colonnes inchanges ; sorties identiques hors cas ci-dessous) :
 #   H1 Coupure as-of (trim_to_asof) : scan_time est pris au debut du scan
@@ -233,17 +261,19 @@ DETECTION_LOOKBACK: Final[Mapping[str, int]] = {
 EMITTED_STATUSES: Final[tuple[str, ...]] = ("Fresh", "Aged", "Invalidated")
 
 # Bareme de confluence (max 25+10+20+15+15 = 85)
-# DECISION DE REGLE C1 ( validee empiriquement, ne pas "corriger" ) :
-#   Sous DailyClose (D1/Weekly, session forcee l.444) un BOS plafonne a
-#   25+10+10+15 = 60 < MIN_SCORE -> les BOS D1/Weekly ne sont JAMAIS emis.
-#   Ce plafond est INTENTIONNEL. Backtest causal (33 instruments,
-#   D1 ~2 ans + Weekly ~5 ans, n=509 BOS D1/W) : les BOS D1/W ne sont pas
-#   de mauvais signaux (win rate comparable aux CHoCH emis, MFE legerement
-#   superieur), mais la non-inferiorite n'est pas etablie de facon robuste
-#   (2/5 definitions de "win" l'infirment, IC95 large), et les emettre
-#   ajouterait ~1.4x de signaux D1/W sans gain de qualite prouve.
-#   Verdict : GARDER FILTRE. Pour reouvrir : n>=1000 + non-inferiorite
-#   robuste sur >=3 definitions de win.
+# DECISION DE REGLE C1 — GARDER FILTRE : sous DailyClose (D1/Weekly, session
+#   forcee cf. get_session) un BOS plafonne a 25+10+10+15 = 60 < MIN_SCORE ->
+#   les BOS D1/Weekly ne sont JAMAIS emis. Ce plafond est INTENTIONNEL et
+#   CONSERVE.
+#   HONNETETE (audit M2, remarque #2) : la justification historique
+#   "backtest causal n=509" n'est PAS reproductible a partir des artefacts du
+#   depot : son statut empirique est NON VERIFIE. Il ne faut donc PAS lire ce
+#   commentaire comme une preuve. C'est une decision de regle conservative
+#   (ne pas emettre de BOS D1/Weekly) dont les consequences sur les signaux
+#   emis sont exactement nulles (le filtre ne retire que des signaux qui
+#   n'atteignent pas MIN_SCORE).
+#   Pour reouvrir : backtest causal n>=1000 + non-inferiorite robuste sur
+#   >=3 definitions de win, artefacts versionnes dans le depot.
 SCORE_BASE: Final[int] = 25
 SCORE_TYPE_BONUS: Final[int] = 10          # CHoCH et BOS (D7-a)
 SCORE_DIST_BONUS: Final[int] = 15
@@ -259,6 +289,12 @@ ATR_DIST_MULT: Final[float] = 1.8
 # du sweep. Un signal n'est invalide que si une bougie complete posterieure
 # CLOTURE au-dela de niveau -/+ marge. 0.0 = cloture stricte.
 INVALIDATION_BUFFER_ATR: Final[float] = 0.25
+# STATUT EMPIRIQUE DES SEUILS (audit, remarque #3) : BB +/-25, corps 0.40 /
+#   0.60, ATR_DIST_MULT 1.8, INVALIDATION_BUFFER_ATR 0.25, TF_STATUT et
+#   MIN_SCORE ne sont PAS etablis par un backtest versionne dans le depot.
+#   Ces valeurs sont raisonnables et stables, mais NON PROUVEES : toute
+#   modification doit etre precedee d'un backtest causal (cf. C1 pour la
+#   methodologie). Ne pas modifier sans artefacts.
 
 SCAN_GLOBAL_TIMEOUT: Final[int] = 180
 SCAN_MAX_WORKERS: Final[int] = 6
@@ -453,10 +489,17 @@ class SignalCore:
     current_price: float
     has_sweep: bool
     atr_val: float
-    volatilite: str
+    volatilite: str            # regime d'ATR : atr / mediane des True Range
+                               # des 100 dernieres barres de la MEME paire
+                               # et timeframe (cf. calc_atr_bundle). Ce n'est
+                               # ni la volatilite implicite, ni un volume.
     trend: TrendT
-    force: Literal["Fort", "Moyen"]
-    dist_atr: float            # arrondi a 2 decimales (R11-3)
+    force: Literal["Fort", "Moyen"]  # ratio corps/range de la BOUGIE DE
+                               # SIGNAL (>= 0.60 = Fort). Mesure la
+                               # conviction de la bougie de cassure, PAS la
+                               # robustesse de la cassure structurelle.
+    dist_atr: float            # arrondi a 2 decimales ; calcule depuis les
+                               # valeurs PUBLIEES (R13-1)
     score: int
     bb_width_pct: Optional[float]
     bb_regime: str
@@ -725,7 +768,23 @@ def detect_swing_points(data: pd.DataFrame, tf: str) -> list[SwingDict]:
         elif l_mask[i]:
             # un index a la fois max ET min (plat degenere) -> high seul
             pivots.append((i, float(low_arr[i]), "L"))
-    return _classify_swings(pivots)
+    # R13-2 : deux bougies au plus haut (ou plus bas) STRICTEMENT egal,
+    # espacees de <= lookback barres, forment UN SEUL swing : meme niveau de
+    # liquidite teste deux fois. Sans cette deduplication, le second pivot
+    # etait etiquete LH/LL sans aucun mouvement de prix, pouvant fausser la
+    # tendance (mesure OANDA practice : 12/132 unites concernees, tendance
+    # changee dans 1 cas ; 0 signal emis modifie). On garde le PREMIER
+    # (etablissement du niveau).
+    kept: list[tuple[int, float, str]] = []
+    last_of_kind: dict[str, tuple[int, float, str]] = {}
+    for piv in pivots:
+        prev = last_of_kind.get(piv[2])
+        if prev is not None and prev[1] == piv[1] \
+                and piv[0] - prev[0] <= lookback:
+            continue
+        kept.append(piv)
+        last_of_kind[piv[2]] = piv
+    return _classify_swings(kept)
 
 
 def get_structural_trend(swings: Sequence[SwingDict]) -> TrendT:
@@ -824,9 +883,15 @@ def compute_bb_width(data: pd.DataFrame, length: int = 20,
 
 
 def format_bb_width(pct: Optional[float], regime: str) -> str:
+    """F7 : affiche la valeur PUBLIEE (arrondie a 2 decimales, exactement
+    celle du payload) et non l'entier tronque. Avant, un pct brut de -24,97
+    s'affichait "-25%_Normal" alors que le regime (calcule sur l'arrondi a 2
+    decimales, cf. compute_bb_width) est Normal : le label contredisait le
+    regime qu'il affichait lui-meme (mesure : ~1 % des signaux)."""
     if pct is None:
         return "N/A"
-    return f"{'+' if pct >= 0 else ''}{pct:.0f}%_{regime}"
+    published = round(pct, 2)
+    return f"{published:+.2f}%_{regime}"
 
 
 # ---- 4.6 construction du SignalCore ---------------------------------------
@@ -842,7 +907,7 @@ class _Ohlc:
 def _evaluate_candle(*, idx: int, df: pd.DataFrame, ohlc: _Ohlc,
                      swings: Sequence[SwingDict], atr_val: float,
                      atr_regime: str, trend: TrendT,
-                     tf: str) -> Optional[SignalCore]:
+                     tf: str, prec: int) -> Optional[SignalCore]:
     sig_type, direction, level = _resolve_signal(trend, ohlc.close, idx,
                                                  swings)
     if sig_type is None or direction is None or level is None:
@@ -856,8 +921,19 @@ def _evaluate_candle(*, idx: int, df: pd.DataFrame, ohlc: _Ohlc,
         return None
     force: Literal["Fort", "Moyen"] = "Fort" if body_ratio >= 0.60 else "Moyen"
 
-    # R11-3 : arrondi AVANT filtre et score -> recalculable depuis le payload
-    dist_atr = round(abs(ohlc.close[idx] - level) / atr_val, 2)
+    # R13-1 : dist_atr (pilote le filtre 1,8 ATR, le bonus de score et donc
+    # MIN_SCORE) est calcule depuis les valeurs PUBLIEES : prix arrondis a
+    # displayPrecision et ATR arrondi a precision+2, exactement ce que le
+    # validateur recalcule depuis le payload. Avant (R11-3), le domaine
+    # utilisait l'ATR brut alors que le validateur utilisait l'ATR publie :
+    # ~0,07 % des candidats (4/5728 mesures) etaient emis puis REJETES par le
+    # contrat sur un ecart de 0,01 ATR (signal valide perdu silencieusement).
+    # Les prix OANDA mid etant deja a displayPrecision, ce calcul est en
+    # pratique identique au brut ; seules les frontieres d'arrondi changent.
+    close_pub = round(float(ohlc.close[idx]), prec)
+    level_pub = round(float(level), prec)
+    atr_pub = round(atr_val, prec + 2)
+    dist_atr = round(abs(close_pub - level_pub) / atr_pub, 2)
     if dist_atr > ATR_DIST_MULT:
         return None
 
@@ -903,10 +979,15 @@ def _evaluate_candle(*, idx: int, df: pd.DataFrame, ohlc: _Ohlc,
     )
 
 
-def detect_choch(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalCore]:
+def detect_choch(df: pd.DataFrame, tf: str, inst: str,
+                 prec: int) -> Optional[SignalCore]:
     """Detection causale par offset : pour chaque idx, pivots, tendance et
     ATR ne voient que les donnees confirmees a idx. Le premier match (le
-    plus recent) gagne."""
+    plus recent) gagne.
+
+    `prec` (displayPrecision OANDA) n'est utilise que pour le calcul de
+    dist_atr (R13-1) : c'est la precision de PUBLICATION, qui doit etre la
+    meme dans le domaine et dans le validateur."""
     swings = detect_swing_points(df, tf)
     if not swings:
         return None
@@ -932,7 +1013,8 @@ def detect_choch(df: pd.DataFrame, tf: str, inst: str) -> Optional[SignalCore]:
             continue
         sig = _evaluate_candle(idx=idx, df=df, ohlc=ohlc,
                                swings=prev_swings, atr_val=atr_val,
-                               atr_regime=atr_regime, trend=trend, tf=tf)
+                               atr_regime=atr_regime, trend=trend, tf=tf,
+                               prec=prec)
         if sig is not None:
             return sig
     return None
@@ -1242,7 +1324,7 @@ class ScanResult:
 
 def _scan_one_inner(inst: str, tf: str, gran: str, cache_bust: int,
                     creds: OandaCredentials, control: ScanControl,
-                    as_of: datetime) -> UnitOutcome:
+                    as_of: datetime, prec: int) -> UnitOutcome:
     if control.is_cancelled():
         return UnitOutcome(inst, tf, kind="aborted")
     try:
@@ -1281,17 +1363,17 @@ def _scan_one_inner(inst: str, tf: str, gran: str, cache_bust: int,
         _log(logging.WARNING, "oanda_insufficient_data_asof",
              instrument=inst, granularity=gran, n=len(df))
         return UnitOutcome(inst, tf, kind="no_data", detail="no_data")
-    sig = detect_choch(df, tf, inst)
+    sig = detect_choch(df, tf, inst, prec)
     return UnitOutcome(inst, tf, sig=sig)
 
 
 def _scan_one(inst: str, tf: str, gran: str, cache_bust: int,
               creds: OandaCredentials, control: ScanControl,
-              as_of: datetime) -> UnitOutcome:
+              as_of: datetime, prec: int) -> UnitOutcome:
     """Frontiere du worker : aucune exception ne remonte a fut.result()."""
     try:
         return _scan_one_inner(inst, tf, gran, cache_bust, creds, control,
-                               as_of)
+                               as_of, prec)
     except Exception as exc:  # noqa: BLE001 — frontiere defensive
         _log(logging.ERROR, "scan_one_unexpected", instrument=inst,
              granularity=gran, err=repr(exc))
@@ -1336,8 +1418,8 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
                     progress_callback(inst, tf)
                 continue
             futures[executor.submit(_scan_one, inst, tf, gran, cache_bust,
-                                    creds, control,
-                                    scan_time)] = (inst, tf, gran)
+                                    creds, control, scan_time,
+                                    precision.get(inst))] = (inst, tf, gran)
 
     def _handle(fut: Future[UnitOutcome]) -> None:
         handled.add(fut)
@@ -2009,6 +2091,18 @@ def _render_results(scan: StoredScan) -> None:
     if n_stale:
         st.info(f"{n_stale} signal(s) Stale visible(s) dans le tableau — "
                 "exclus des exports et du pipeline JSON.")
+    with st.expander("Définitions des colonnes"):
+        st.caption(
+            "**Force** : ratio corps/range de la bougie de signal (≥ 0,60 = "
+            "Fort) — conviction de la bougie, pas la robustesse de la "
+            "cassure. **Volatilité** : régime d'ATR (ATR / médiane des True "
+            "Range des 100 dernières barres de la même paire et timeframe). "
+            "**BB_Width** : largeur des bandes de Bollinger en % vs sa "
+            "moyenne mobile 20 (Squeeze ≤ -25 %, Expansion ≥ +25 %). "
+            "**Score** : barème de confluence (base + type + session + "
+            "proximité ≤ 1 ATR + sweep). **Statut** : Fresh/Aged/Stale selon "
+            "l'âge en bougies complètes ; Invalidated sur clôture au-delà du "
+            "niveau ± 0,25 ATR.")
     _render_dataframe(df_all)
     if scan.doc is not None and scan.doc["signals"]:
         with st.expander("Aperçu JSON Pipeline (premier signal)"):
