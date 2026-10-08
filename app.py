@@ -84,9 +84,30 @@ from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer, Table,
 # SECTION 1 — CONSTANTES & REGISTRE DES REGLES
 # =====================================================================
 
-SCANNER_VERSION: Final[str] = "5.26"
+SCANNER_VERSION: Final[str] = "5.27"
 RULE_VERSION: Final[str] = "choch.v58.r13"
 SCHEMA_VERSION: Final[str] = "3.2.0"
+# 5.27 (AUDIT LEDGER phase 4 : documentation et cosmetique ; AUCUN changement
+#   de regle -> RULE_VERSION r13 et signal_id IDENTIQUES a 5.26 ; signaux et
+#   payloads inchanges, prouves par la non-regression) :
+#   A1 docstring compute_bb_width : "affichage UI inchange" etait FAUX depuis
+#      F7 (format_bb_width affiche 2 decimales).
+#   A2 docstring detect_swing_points : "dedup par INDEX (jamais par prix)"
+#      etait inexact depuis R13-2 (fusion sur egalite de prix).
+#   A3 doublon du commentaire C1 supprime : version complete conservee.
+#   A4 commentaire _PDF_WIDTHS : 801,89 pt exactement -> mise a l'echelle
+#      proportionnelle a chaque fois (~0,14 %, inoffensif).
+#   A5 commentaire _fetch_with_retry : pourquoi le 401 n'est pas journalise
+#      (delegue a _scan_one_inner / ScanControl).
+#   A6 expander Definitions des colonnes : bonus sweep CHoCH-only ;
+#      Stale prioritaire sur Invalidated (R11-2).
+#   B1 format_bb_width : fini le label "-0.00%" (zero negatif, 6.2.13).
+#   B2 _build_stored_scan : si doc is None, le tableau UI est vide (aligne
+#      sur les exports deja vides) -> invariant UI==JSON (6.2.12).
+#   B3 run_scan : rows/payloads tries a la source -> output determine quel
+#      que soit l'ordre de fin des workers.
+#   CODE MORT retire : OANDA_MAX_ATTEMPTS (jamais lu) ; parametre inst de
+#      _published (jamais utilise).
 # 5.26 (sorties modifiees -> nouveau RULE_VERSION r13, signal_id changes ;
 #   schema et colonnes inchanges) :
 #   R13-1 BUG (audit remarque #4) : dist_atr etait calcule par le domaine avec
@@ -153,12 +174,9 @@ SCHEMA_VERSION: Final[str] = "3.2.0"
 #   T7 confirmation_time D1/Weekly : prochaine frontiere 17:00
 #      America/New_York (zoneinfo) ; avant : +86400/+604800 s, faux d'1 h
 #      aux transitions DST. signal_id/score/statut non affectes.
-#   T8 OANDA_MAX_ATTEMPTS documente (= retries + 1) ; nombre inchange.
+#   T8 OANDA_MAX_ATTEMPTS (jamais lu) : retire, code mort.
 #   T9 _handle : robuste a une exception de fut.result().
 # schema 3.2.0 (additif) : meta.environment, meta.precision.
-# PROVENANCE C1 : la justification n=509 n'est PAS reproductible a partir
-#   des artefacts du depot (audit 2026-09-30, M2). Comportement conserve
-#   tel quel ; statut empirique : NON VERIFIE.
 # CHANGELOG
 # 5.22 (regles inchangees : RULE_VERSION et signal_id identiques a 5.21) :
 #   F1 as_completed leve concurrent.futures.TimeoutError, qui n'est l'alias
@@ -304,7 +322,7 @@ MAX_AUTH_FAILURES: Final[int] = 3
 OANDA_MAX_RETRIES: Final[int] = 2
 OANDA_BACKOFF_BASE: Final[float] = 0.25
 # m3 : OANDA_MAX_RETRIES compte les REESSAIS ; tentatives totales = +1.
-OANDA_MAX_ATTEMPTS: Final[int] = OANDA_MAX_RETRIES + 1
+#   (OANDA_MAX_ATTEMPTS a ete retire : constante jamais lue, code mort.)
 # T7 : alignement explicite = valeurs par defaut documentees par OANDA.
 OANDA_ALIGNMENT_TZ: Final[str] = "America/New_York"
 OANDA_DAILY_ALIGNMENT: Final[int] = 17
@@ -739,7 +757,9 @@ def _classify_swings(
 
 
 def detect_swing_points(data: pd.DataFrame, tf: str) -> list[SwingDict]:
-    """Pivots sur fenetre centree ; dedup par INDEX (jamais par prix).
+    """Pivots sur fenetre centree ; dedup par INDEX, puis R13-2 : fusion des
+    pivots de meme type au prix STRICTEMENT egal espaces de <= lookback
+    barres (on garde le plus ancien, cf. la boucle de fusion ci-dessous).
 
     Residu documente (C-5) : ``start`` est ancre sur n, pas sur l'idx du
     signal ; les etiquettes HH/HL/LL de pivots anciens peuvent differer
@@ -862,7 +882,9 @@ def compute_bb_width(data: pd.DataFrame, length: int = 20,
     """(pct brut, regime). F3 : le regime est calcule sur la valeur arrondie
     a 2 decimales, exactement celle publiee dans le payload, pour que le
     validateur retrouve le meme regime. Le pct renvoye reste la valeur
-    brute (l'affichage UI est donc inchange)."""
+    BRUTE : le label UI est formate separement par format_bb_width (F7),
+    qui arrondit elle-meme a 2 decimales (l'affichage UI n'est donc PAS
+    la valeur brute)."""
     close = data["close"]
     if len(close) < length * 2:
         return None, "N/A"
@@ -890,7 +912,10 @@ def format_bb_width(pct: Optional[float], regime: str) -> str:
     regime qu'il affichait lui-meme (mesure : ~1 % des signaux)."""
     if pct is None:
         return "N/A"
-    published = round(pct, 2)
+    # + 0.0 normalise le zero negatif : round(-0.001, 2) == -0.0 aurait donne
+    # un label trompeur "-0.00%_Normal" ; en IEEE 754, -0.0 + 0.0 == +0.0
+    # (defaut 6.2.13 de l'audit).
+    published = round(pct, 2) + 0.0
     return f"{published:+.2f}%_{regime}"
 
 
@@ -1046,7 +1071,7 @@ class _Published:
     current_distance_pct: Optional[float]
 
 
-def _published(inst: str, sig: SignalCore, prec: int) -> _Published:
+def _published(sig: SignalCore, prec: int) -> _Published:
     level = round(sig.level, prec)
     close_p = round(sig.close_price, prec)
     current_p = round(sig.current_price, prec)
@@ -1059,7 +1084,7 @@ def _published(inst: str, sig: SignalCore, prec: int) -> _Published:
 
 def signal_to_row(inst: str, tf: str, sig: SignalCore,
                        prec: int) -> dict[str, Any]:
-    pub = _published(inst, sig, prec)
+    pub = _published(sig, prec)
     return {
         "Instrument": inst.replace("_", "/"),
         "Timeframe": tf,
@@ -1087,7 +1112,7 @@ def signal_to_row(inst: str, tf: str, sig: SignalCore,
 def signal_to_payload(inst: str, tf: str, sig: SignalCore,
                       scan_time: datetime,
                       prec: int) -> dict[str, Any]:
-    pub = _published(inst, sig, prec)
+    pub = _published(sig, prec)
     return {
         "signal_id": _signal_id(inst, tf, sig),
         "scanner_version": SCANNER_VERSION,
@@ -1238,6 +1263,9 @@ def _fetch_with_retry(inst: str, gran: str, creds: OandaCredentials,
         except V20Error as exc:
             retryable = exc.code == 429 or 500 <= exc.code < 600
             if not retryable or attempt >= OANDA_MAX_RETRIES:
+                # 401 n'est pas journalise ici : l'echec d'auth est logge en
+                # amont par _scan_one_inner (oanda_auth_failure), qui compte
+                # les echecs et peut annuler le scan (ScanControl).
                 if exc.code != 401:
                     _log(logging.WARNING, "oanda_v20_error", instrument=inst,
                          granularity=gran, code=exc.code, err=str(exc))
@@ -1498,6 +1526,13 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
          auth_aborted=control.auth_aborted, precision_source=precision.source,
          precision_drift=list(precision.drift), counts=counts,
          total_ms=round((time.perf_counter() - t0) * 1000, 1))
+    # B3 : determinisme de l'output. L'ordre de rows/payloads depend de
+    # l'ordre de completion des workers (as_completed) ; on trie a la source
+    # pour qu'un consommateur de ScanResult ait un output stable. L'UI
+    # re-trie elle-meme (mergesort) et serialize_pipeline trie par signal_id
+    # : aucun changement pour elles.
+    rows.sort(key=lambda r: (r["Instrument"], r["Timeframe"], r["signal_id"]))
+    payloads.sort(key=lambda p: p["signal_id"])
     return ScanResult(rows=rows, payloads=payloads, errors=errors,
                       scan_time=scan_time, auth_aborted=control.auth_aborted,
                       coverage_counts=counts, env=creds.env,
@@ -1806,9 +1841,11 @@ def serialize_pipeline(payloads: Sequence[Mapping[str, Any]],
                       default=_json_default, allow_nan=False).encode("utf-8")
 
 
-# PDF : largeurs calibrees pour 802 pt (A4 paysage 842 - 2 x 20 de marge),
-# police 6.5 pt, toutes les cellules en Paragraph (retour a la ligne,
-# splitLongWords pour signal_id).
+# PDF : largeurs calibrees pour ~802 pt (_PDF_USABLE_WIDTH = 801,89 pt
+# exactement, A4 paysage 842 - 2 x 20 de marge, donc la mise a l'echelle
+# proportionnelle s'active a chaque fois : ~0,14 %, inoffensif), police 6.5
+# pt, toutes les cellules en Paragraph (retour a la ligne, splitLongWords
+# pour signal_id).
 _PDF_WIDTHS: Final[Mapping[str, float]] = {
     "Instrument": 44, "Timeframe": 34, "Type": 32, "Ordre": 32,
     "Signal": 44, "Niveau": 44, "Distance%": 36, "Distance actuelle %": 40,
@@ -1954,6 +1991,12 @@ def _build_stored_scan(result: ScanResult) -> StoredScan:
             _log(logging.WARNING, "ui_json_desync",
                  dropped=n_dropped,
                  raison="signaux rejetes par le contrat retires du tableau")
+    elif doc is None:
+        # Invariant UI==JSON : sans document contractuel, rien ne garantit
+        # que les rows sont valides. _render_results exporte deja un contenu
+        # vide (df_export = df_all.iloc[0:0]) ; on aligne le tableau UI pour
+        # ne pas afficher des lignes non validees (defaut 6.2.12).
+        df = df.iloc[0:0].reset_index(drop=True)
     return StoredScan(
         scan_time=result.scan_time, df=df, json_bytes=json_bytes, doc=doc,
         json_error=json_error, errors=list(result.errors),
@@ -2100,9 +2143,11 @@ def _render_results(scan: StoredScan) -> None:
             "**BB_Width** : largeur des bandes de Bollinger en % vs sa "
             "moyenne mobile 20 (Squeeze ≤ -25 %, Expansion ≥ +25 %). "
             "**Score** : barème de confluence (base + type + session + "
-            "proximité ≤ 1 ATR + sweep). **Statut** : Fresh/Aged/Stale selon "
-            "l'âge en bougies complètes ; Invalidated sur clôture au-delà du "
-            "niveau ± 0,25 ATR.")
+            "proximité ≤ 1 ATR + sweep, ce dernier bonus étant réservé aux "
+            "CHoCH). **Statut** : Fresh/Aged/Stale selon l'âge en bougies "
+            "complètes ; un signal expiré (Stale) n'est jamais émis, même "
+            "invalidé (priorité Stale > Invalidated, R11-2) ; Invalidated sur "
+            "clôture au-delà du niveau ± 0,25 ATR.")
     _render_dataframe(df_all)
     if scan.doc is not None and scan.doc["signals"]:
         with st.expander("Aperçu JSON Pipeline (premier signal)"):
