@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import (Any, Callable, Final, Literal, Mapping, Optional,
-                    Sequence, TypedDict)
+                    Sequence, TypedDict, cast)
 from xml.sax.saxutils import escape as _xml_escape
 from zoneinfo import ZoneInfo
 
@@ -84,9 +84,28 @@ from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer, Table,
 # SECTION 1 — CONSTANTES & REGISTRE DES REGLES
 # =====================================================================
 
-SCANNER_VERSION: Final[str] = "5.27"
+SCANNER_VERSION: Final[str] = "5.28"
 RULE_VERSION: Final[str] = "choch.v58.r13"
 SCHEMA_VERSION: Final[str] = "3.2.0"
+# 5.28 (relecture experte du rapport final ; corrections de classe A/B ;
+#   AUCUN changement de regle -> RULE_VERSION r13 et signal_id identiques) :
+#   B4 message UI : si le pipeline JSON a echoue (tableau vide par B2),
+#      _render_results n'affiche plus "Aucun signal CHoCH/BOS qualifie"
+#      (inexact) mais un message renvoyant vers json_error.
+#   B5 payload : normalisation du zero negatif de bb_width_pct (aligne sur
+#      le label UI de B1) : round(x, 2) + 0.0 -> 0.0 au lieu de -0.0.
+#   A7a historique : le changelog 5.21 affirmait "C1 valide empiriquement,
+#      backtest n=509" SANS reserve -> reserve NON VERIFIE AJOUTEE (le
+#      texte d'origine est conserve : c'est une addition, pas une reecriture).
+#   A7b historique : l'entree T8 de la 5.23 avait ete REECRITE pour annoncer
+#      le retrait de la constante -> RESTAUREE a son texte d'origine (on ne
+#      reecrit pas l'historique ; le retrait est documente en 5.27).
+#   G9 typage : 4 erreurs mypy 2.3.1 corrigees sans changer la logique
+#      (cast Literal apres le garde OANDA_ENV ; extraction de prec_inst
+#      dans run_scan, ce qui supprime un doublon de precision.get() ;
+#      narrowing de prec dans le validateur). mypy : "Success".
+#      Note : mypy crash en UNC (cache SQLite verrouille) -> --cache-dir
+#      local necessaire.
 # 5.27 (AUDIT LEDGER phase 4 : documentation et cosmetique ; AUCUN changement
 #   de regle -> RULE_VERSION r13 et signal_id IDENTIQUES a 5.26 ; signaux et
 #   payloads inchanges, prouves par la non-regression) :
@@ -174,7 +193,7 @@ SCHEMA_VERSION: Final[str] = "3.2.0"
 #   T7 confirmation_time D1/Weekly : prochaine frontiere 17:00
 #      America/New_York (zoneinfo) ; avant : +86400/+604800 s, faux d'1 h
 #      aux transitions DST. signal_id/score/statut non affectes.
-#   T8 OANDA_MAX_ATTEMPTS (jamais lu) : retire, code mort.
+#   T8 OANDA_MAX_ATTEMPTS documente (= retries + 1) ; nombre inchange.
 #   T9 _handle : robuste a une exception de fut.result().
 # schema 3.2.0 (additif) : meta.environment, meta.precision.
 # CHANGELOG
@@ -201,6 +220,9 @@ SCHEMA_VERSION: Final[str] = "3.2.0"
 #   ne compte que failed. Aucun signal emis modifie.
 #   C1 valide empiriquement : le plafond BOS D1/Weekly a 60 (< MIN_SCORE)
 #   est une DECISION DE REGLE, pas un bug. Backtest causal n=509.
+#   [reserve ajoutee en 5.28 sur relecture experte : ce backtest n'est PAS
+#   reproductible a partir des artefacts du depot -> statut NON VERIFIE (cf.
+#   le bareme C1 et le bloc 5.26). Le plafond reste une decision de regle.]
 #   Aucun signal emis modifie.
 # r12 : invalidation sur cloture + marge ATR (cf. 5.24 / R12-1).
 # r11 (sorties modifiees -> nouveau RULE_VERSION, signal_id tous changes) :
@@ -436,6 +458,9 @@ def resolve_credentials() -> OandaCredentials:
     if env not in ("practice", "live"):
         raise ConfigError(
             f"OANDA_ENV invalide : {env!r} (attendu practice|live)")
+    # mypy : le garde ci-dessus garantit practice|live mais ne restreint
+    # pas le type de env ; on le restreint explicitement (G9, v5.28).
+    env_typed = cast(Literal["practice", "live"], env)
     test_token = os.environ.get("CHOCH_TEST_TOKEN")
     if test_token:
         if env == "live":
@@ -444,11 +469,11 @@ def resolve_credentials() -> OandaCredentials:
                 "test ne doit jamais atteindre le compte reel")
         _log(logging.WARNING, "test_token_actif",
              detail="CHOCH_TEST_TOKEN remplace OANDA_ACCESS_TOKEN")
-        return OandaCredentials(test_token, env, "CHOCH_TEST_TOKEN")
+        return OandaCredentials(test_token, env_typed, "CHOCH_TEST_TOKEN")
     token = _secret("OANDA_ACCESS_TOKEN")
     if not token:
         raise ConfigError("Clé API OANDA manquante (OANDA_ACCESS_TOKEN).")
-    return OandaCredentials(token, env, "OANDA_ACCESS_TOKEN")
+    return OandaCredentials(token, env_typed, "OANDA_ACCESS_TOKEN")
 
 
 @lru_cache(maxsize=8)
@@ -1137,8 +1162,10 @@ def signal_to_payload(inst: str, tf: str, sig: SignalCore,
         "distance_atr_multiple": sig.dist_atr,
         "volatility": sig.volatilite,
         "force": sig.force,
+        # B5 (v5.28) : + 0.0 normalise le zero negatif (cf. B1) pour que le
+        # payload JSON et le label UI disent la meme chose (0.0, pas -0.0).
         "bb_width_pct": (None if sig.bb_width_pct is None
-                         else round(sig.bb_width_pct, 2)),
+                         else round(sig.bb_width_pct, 2) + 0.0),
         "bb_regime": sig.bb_regime,
         "session": sig.session,
         "signal_time": sig.signal_time_utc.isoformat(),
@@ -1439,7 +1466,8 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
     futures: dict[Future[UnitOutcome], tuple[str, str, str]] = {}
     for inst in INSTRUMENTS:
         for tf, gran in TIMEFRAMES.items():
-            if precision.get(inst) is None:   # fail-closed, aucun appel
+            prec_inst = precision.get(inst)
+            if prec_inst is None:   # fail-closed, aucun appel reseau
                 counts["failed"] += 1
                 errors.append(f"{inst}/{tf}: failed:precision_unknown")
                 if progress_callback is not None:
@@ -1447,7 +1475,7 @@ def run_scan(creds: OandaCredentials, cache_bust: int,
                 continue
             futures[executor.submit(_scan_one, inst, tf, gran, cache_bust,
                                     creds, control, scan_time,
-                                    precision.get(inst))] = (inst, tf, gran)
+                                    prec_inst)] = (inst, tf, gran)
 
     def _handle(fut: Future[UnitOutcome]) -> None:
         handled.add(fut)
@@ -1629,6 +1657,9 @@ def _validate_signal(s: Mapping[str, Any],
             prec = precision.get(s["pair_oanda"])
             if not _is_int(prec):
                 return "precision instrument inconnue"
+            # mypy : _is_int est un garde mais ne restreint pas le type ;
+            # prec est un int ici (rejette les bool, cf. _is_int).
+            assert isinstance(prec, int)
             for k in ("level", "close_price", "current_price"):
                 if round(s[k], prec) != s[k]:
                     return f"{k} non represente a displayPrecision={prec}"
@@ -2128,7 +2159,15 @@ def _render_results(scan: StoredScan) -> None:
         )
 
     if df_all.empty:
-        st.info(f"Aucun signal CHoCH/BOS qualifié (Score ≥ {MIN_SCORE}).")
+        if scan.json_error:
+            # B4 (v5.28) : le tableau est vide parce que le pipeline JSON a
+            # echoue (B2 a vide df pour preserver l'invariant UI==JSON). Ce
+            # ne sont PAS des signaux absents : ils n'ont pas ete valides.
+            st.info("Tableau suspendu — le pipeline JSON n'a pas pu être "
+                    f"validé ({scan.json_error}). Les signaux non validés "
+                    "ne sont ni affichés ni exportés.")
+        else:
+            st.info(f"Aucun signal CHoCH/BOS qualifié (Score ≥ {MIN_SCORE}).")
         return
     n_stale = int((df_all["Statut"] == "Stale").sum())
     if n_stale:

@@ -1,4 +1,4 @@
-# CHoCH Scanner v5.27 - production dependencies (pinned)
+# CHoCH Scanner v5.28 - production dependencies (pinned)
 # Exact versions validated by the forensic audit (2026-09-21) against OANDA practice.
 # NOTE: requests==2.32.4 is REQUIRED - versions >= 2.34 raise SSLEOFError
 # (UNEXPECTED_EOF_WHILE_READING) against api-fxpractice.oanda.com.
